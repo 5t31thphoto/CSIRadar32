@@ -1,0 +1,67 @@
+name: unpack
+
+on:
+  push:
+    paths:
+      - '*.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    # Only run for human commits, never for the bot's own commit — else infinite loop
+    if: "!contains(github.event.head_commit.message, '🤖 unpack')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find and extract any top-level .zip
+        run: |
+          set -e
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No zip at repo root — nothing to do"
+            exit 0
+          fi
+          for z in "${zips[@]}"; do
+            echo "── Extracting $z ──"
+            # Extract to a temp dir first so we can flatten a single
+            # top-level folder if the zip has one (like CSI-Radar-S3/*).
+            tmp=$(mktemp -d)
+            unzip -q "$z" -d "$tmp"
+            # If the zip contained exactly one top-level directory,
+            # move its contents up so we don't nest CSI-Radar-S3/CSI-Radar-S3/...
+            entries=("$tmp"/*)
+            if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+              echo "Flattening single top-level dir: $(basename "${entries[0]}")"
+              # Move contents (including dotfiles like .github) into repo root
+              shopt -s dotglob
+              mv "${entries[0]}"/* ./ 2>/dev/null || true
+              shopt -u dotglob
+            else
+              shopt -s dotglob
+              mv "$tmp"/* ./ 2>/dev/null || true
+              shopt -u dotglob
+            fi
+            rm -rf "$tmp"
+            rm -f "$z"
+          done
+
+      - name: Commit unpacked contents
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed after extraction"
+            exit 0
+          fi
+          # The 🤖 emoji in the commit message is the sentinel that prevents
+          # this workflow from re-triggering on its own commit.
+          git commit -m "🤖 unpack $(ls -la | grep -oP 'v\d+\.\d+' | head -1 || echo 'zip')"
+          git push
