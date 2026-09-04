@@ -311,6 +311,17 @@ enum CalRxRole : uint8_t {
     CAL_ROLE_PROBE,
 };
 
+// User override of the auto MAC-based cal-role tiebreaker.  Toggled
+// from settings row 4.  AUTO uses lower MAC = ANCHOR; the FORCE_*
+// options let the user pin this unit's role when the auto-pick gets
+// confused (e.g. both units end up trying to be ANCHOR after a
+// discovery hiccup).  Persists per-boot only.
+enum RoleOverride : uint8_t {
+    RO_AUTO,
+    RO_FORCE_PROBE,
+    RO_FORCE_ANCHOR,
+};
+
 // Landmarks the walk visits.  Positions computed from the beacon
 // geometry during cal_begin (they're not fixed here).
 enum LandmarkId : uint8_t {
@@ -404,6 +415,11 @@ struct BeaconState {
     uint32_t last_cal_frame;
     uint32_t last_proc_frame;
 
+    // v0.4: rate inference — EMA of inter-arrival delta in ms, updated
+    // on each frame ingest.  UI translates the number into a mode label
+    // (e.g. <30ms → "50Hz normal"; >100ms → "5Hz+sleep extended").
+    float    inter_arrival_ms_ema;
+
     // Nominal position in normalized geometry frame (set during cal).
     // Beacons are placed such that their triangle centroid is at origin
     // and the triangle inscribes roughly into [-1, +1].
@@ -452,6 +468,11 @@ struct PeerState {
 
     // Cal ceremony role — set during ST_CAL_INTRO transition.
     CalRxRole cal_role;
+
+    // User-picked override for the MAC-based tiebreaker.  RO_AUTO is
+    // the default; the FORCE_* variants pin this unit's role.  Toggled
+    // from Settings.  Not persisted across reboots.
+    RoleOverride role_override;
 };
 
 // Peer packet formats (POD, magic-word demuxed).
