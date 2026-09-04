@@ -779,6 +779,39 @@ static void draw_view_radar() {
     g.setTextColor(mode_col, COL_BG);
     g.setCursor(4, status_y);
     g.print(mode_lbl);
+
+    // v0.4: RX-side beacon rate inference.  Averages the inter-arrival
+    // EMA across active beacons, converts to Hz, picks a mode label:
+    //   >30Hz → "50Hz"           (beacons in normal fast mode)
+    //   4-15Hz → "5Hz+sleep"     (beacons in extended feature envelope)
+    //   otherwise → raw Hz shown so the user sees what's actually happening
+    int n_active = 0;
+    float sum_ms = 0;
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        const BeaconState &b = g_app.beacon[i];
+        if (b.active && b.inter_arrival_ms_ema > 0) {
+            sum_ms += b.inter_arrival_ms_ema;
+            n_active++;
+        }
+    }
+    char rbuf[24];
+    if (n_active > 0) {
+        float avg_ms = sum_ms / n_active;
+        float hz     = 1000.0f / avg_ms;
+        const char *tag;
+        uint16_t rcol;
+        if (hz >= 30.0f)       { tag = "50Hz";        rcol = COL_ACCENT; }
+        else if (hz >= 4.0f && hz <= 15.0f)
+                               { tag = "5Hz+sleep";   rcol = COL_MS_LIME; }
+        else                   { tag = nullptr;       rcol = COL_MUTED; }
+        if (tag) snprintf(rbuf, sizeof(rbuf), "%dB %s", n_active, tag);
+        else     snprintf(rbuf, sizeof(rbuf), "%dB %.0fHz", n_active, (double)hz);
+        g.setTextColor(rcol, COL_BG);
+        int mw = g.textWidth(mode_lbl);
+        g.setCursor(4 + mw + 8, status_y);
+        g.print(rbuf);
+    }
+
     // Confidence % — pulled from primary scene track (was g_app.tracker,
     // now owned by scene module).  Zero if no active track.
     const TargetTrack *tr0 = scene_get_track(0);
@@ -1210,12 +1243,13 @@ void ui_settings(int selected_row) {
     auto &g = gfx();
     g.setFont(&fonts::Font2);
 
-    const int rows = 5;
+    const int rows = 6;
     const char *labels[rows] = {
         "Sensitivity",
-        "Recalibrate baseline",
-        "Redo walk-cal",
+        "Redo full cal",           // wipes kernel + baseline, walk again
+        "Redo baseline only",      // keep kernel, only re-do empty room
         "Change mode",
+        "Cal role",                // AUTO / force PROBE / force ANCHOR
         "Exit",
     };
     char values[rows][24] = {};
@@ -1224,7 +1258,9 @@ void ui_settings(int selected_row) {
     strcpy(values[2], "");
     const char *mode_names[] = {"none", "1-tripwire", "2-line", "3-triangle"};
     snprintf(values[3], 24, "%s", mode_names[g_app.mode]);
-    strcpy(values[4], "");
+    const char *ro_names[] = {"AUTO", "PROBE", "ANCHOR"};
+    snprintf(values[4], 24, "%s", ro_names[g_app.peer.role_override]);
+    strcpy(values[5], "");
 
     int y = CONTENT_Y + 10;
     for (int i = 0; i < rows; i++) {
@@ -2092,24 +2128,51 @@ void ui_cal_landmark_walk() {
     int map_h = 96;
     draw_mini_landmark_map(4, map_y, SCREEN_W - 8, map_h, highlight, next);
 
-    // Timer / status line right above footer
-    uint32_t elapsed = wizard_step_elapsed_ms();
-    uint32_t min_rem = wizard_step_min_remaining_ms();
+    // Timer / status line right above footer — driven by wizard phase.
+    WizardPhase phase = wizard_current_phase();
+    uint32_t hold_rem = wizard_hold_remaining_ms();
+    uint32_t elapsed  = wizard_step_elapsed_ms();
     char tbuf[24];
-    if (min_rem > 0) {
-        snprintf(tbuf, sizeof(tbuf), "hold %.1fs", (double)min_rem / 1000.0);
-        g.setTextColor(COL_MS_WARN, COL_BG);
-    } else {
-        snprintf(tbuf, sizeof(tbuf), "ready %.1fs", (double)elapsed / 1000.0);
-        g.setTextColor(COL_MS_LIME, COL_BG);
+    const char *rlabel = "next";
+
+    switch (step->kind) {
+        case STEP_WALK:
+            if (phase == WP_ARM) {
+                snprintf(tbuf, sizeof(tbuf), "press BEGIN");
+                g.setTextColor(COL_MS_LIME, COL_BG);
+                rlabel = "begin";
+            } else {  // WP_CAPTURE
+                snprintf(tbuf, sizeof(tbuf), "walking %.1fs",
+                         (double)elapsed / 1000.0);
+                g.setTextColor(COL_MS_WARN, COL_BG);
+                rlabel = "arrived";
+            }
+            break;
+        case STEP_STAND:
+        case STEP_ROTATE:
+            if (phase == WP_CAPTURE && hold_rem > 0) {
+                snprintf(tbuf, sizeof(tbuf), "hold %.1fs",
+                         (double)hold_rem / 1000.0);
+                g.setTextColor(COL_MS_WARN, COL_BG);
+                rlabel = "wait";
+            } else {
+                snprintf(tbuf, sizeof(tbuf), "ready");
+                g.setTextColor(COL_MS_LIME, COL_BG);
+                rlabel = "next";
+            }
+            break;
+        case STEP_INTRO:
+        default:
+            snprintf(tbuf, sizeof(tbuf), "ready");
+            g.setTextColor(COL_MS_LIME, COL_BG);
+            rlabel = "begin";
+            break;
     }
     g.setFont(&fonts::Font2);
     int ttw = g.textWidth(tbuf);
     g.setCursor((SCREEN_W - ttw) / 2, map_y + map_h + 2);
     g.print(tbuf);
 
-    const char *rlabel = (min_rem > 0) ? "wait" : "next";
-    if (step->kind == STEP_INTRO) rlabel = "begin";
     draw_footer("redo", rlabel);
     flush();
 }
