@@ -119,8 +119,20 @@ static void IRAM_ATTR csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
         b.phase[i]     = 0.0f;
     }
 
+    // v0.4: inter-arrival EMA for RX-side beacon rate inference.
+    // First frame just seeds last_frame_ms; from the second onward we
+    // fold (now - last) into the EMA.  Alpha=0.15 tracks ~7 frames.
+    uint32_t now_ms = millis();
+    if (b.last_frame_ms != 0) {
+        float delta = (float)(now_ms - b.last_frame_ms);
+        if (b.inter_arrival_ms_ema == 0) {
+            b.inter_arrival_ms_ema = delta;
+        } else {
+            b.inter_arrival_ms_ema += 0.15f * (delta - b.inter_arrival_ms_ema);
+        }
+    }
     b.frames++;
-    b.last_frame_ms = millis();
+    b.last_frame_ms = now_ms;
     b.dirty = true;
     g_app.total_csi_frames++;
 }
@@ -303,8 +315,11 @@ void csi_engine_end() {
 int csi_get_beacon_count() { return g_app.beacon_count; }
 
 void csi_reset_discovery() {
-    for (int i = 0; i < MAX_BEACONS; i++)
+    for (int i = 0; i < MAX_BEACONS; i++) {
         g_app.beacon[i].active = false;
+        g_app.beacon[i].last_frame_ms = 0;
+        g_app.beacon[i].inter_arrival_ms_ema = 0;
+    }
     g_app.beacon_count = 0;
     g_app.total_csi_frames = 0;
 }
