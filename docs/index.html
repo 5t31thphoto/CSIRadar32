@@ -5,63 +5,40 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex, nofollow">
 <title>MantisSec CSI-Radar-S3 — Web Flasher</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23050510'/><circle cx='16' cy='11' r='4' fill='none' stroke='%2300A5A5' stroke-width='1.5'/><circle cx='11' cy='9' r='1.3' fill='%23A8FF00'/><circle cx='21' cy='9' r='1.3' fill='%23A8FF00'/><path d='M16 15v11M11 18l-5 4M21 18l5 4M14 25l-3 4M18 25l3 4' stroke='%235D005D' stroke-width='1.5' fill='none' stroke-linecap='round'/></svg>">
+<link rel="icon" type="image/png" href="assets/favicon.png">
 <link rel="stylesheet" href="style.css">
-<!-- ESP Web Tools — provides <esp-web-install-button> custom element -->
-<script type="module" src="https://unpkg.com/esp-web-tools@10.1.0/dist/web/install-button.js?module"></script>
+<!-- ESP Web Tools — provides <esp-web-install-button> custom element.
+     v10.1.0 pinned; version bump requires manual verification against
+     the chip ROM stubs the library ships with. -->
+<script type="module"
+        src="https://unpkg.com/esp-web-tools@10.1.0/dist/web/install-button.js?module"></script>
 </head>
 <body>
 <div class="page">
 
     <!-- ═══ Header ═══ -->
     <header class="header">
-        <svg class="header-mark" viewBox="0 0 64 64" fill="none">
-            <!-- MantisSec mark: stylized mantis head + antennae + posed forelimbs -->
-            <defs>
-                <linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%"   stop-color="#00A5A5"/>
-                    <stop offset="100%" stop-color="#5D005D"/>
-                </linearGradient>
-            </defs>
-            <!-- Body core -->
-            <ellipse cx="32" cy="22" rx="7" ry="9" fill="none"
-                     stroke="url(#glow)" stroke-width="1.8"/>
-            <!-- Compound eyes -->
-            <circle cx="27" cy="19" r="2.2" fill="#A8FF00" opacity="0.9"/>
-            <circle cx="37" cy="19" r="2.2" fill="#A8FF00" opacity="0.9"/>
-            <circle cx="27" cy="19" r="0.8" fill="#050510"/>
-            <circle cx="37" cy="19" r="0.8" fill="#050510"/>
-            <!-- Antennae -->
-            <path d="M28 12 Q24 6 22 3" stroke="#00A5A5"
-                  stroke-width="1.2" fill="none" stroke-linecap="round">
-                <animate attributeName="d"
-                    values="M28 12 Q24 6 22 3;
-                            M28 12 Q23 5 21 4;
-                            M28 12 Q24 6 22 3"
-                    dur="3s" repeatCount="indefinite"/>
-            </path>
-            <path d="M36 12 Q40 6 42 3" stroke="#00A5A5"
-                  stroke-width="1.2" fill="none" stroke-linecap="round">
-                <animate attributeName="d"
-                    values="M36 12 Q40 6 42 3;
-                            M36 12 Q41 5 43 4;
-                            M36 12 Q40 6 42 3"
-                    dur="3.2s" repeatCount="indefinite"/>
-            </path>
-            <!-- Thorax + abdomen taper -->
-            <path d="M32 30 L32 52" stroke="url(#glow)"
-                  stroke-width="1.8" fill="none"/>
-            <!-- Raptorial forelimbs (the classic mantis pose) -->
-            <path d="M25 25 L18 30 L20 38 L26 36" stroke="#5D005D"
-                  stroke-width="1.8" fill="none" stroke-linejoin="round"/>
-            <path d="M39 25 L46 30 L44 38 L38 36" stroke="#5D005D"
-                  stroke-width="1.8" fill="none" stroke-linejoin="round"/>
-            <!-- Rear legs -->
-            <path d="M28 42 L22 50 M28 46 L20 56" stroke="#00A5A5"
-                  stroke-width="1.2" fill="none" stroke-linecap="round"/>
-            <path d="M36 42 L42 50 M36 46 L44 56" stroke="#00A5A5"
-                  stroke-width="1.2" fill="none" stroke-linecap="round"/>
-        </svg>
+        <!-- Splash mantis — raster image dropped into docs/assets/.
+             Fallback SVG glyph shown if the PNG is missing so the page
+             still looks intentional in dev. -->
+        <picture class="header-mark">
+            <source srcset="assets/mantis-splash.png" type="image/png">
+            <img src="assets/mantis-splash.png"
+                 alt="MantisSec mark"
+                 width="72" height="72"
+                 onerror="this.replaceWith(document.getElementById('mantis-fallback').content.cloneNode(true))">
+        </picture>
+        <template id="mantis-fallback">
+            <svg class="header-mark" viewBox="0 0 64 64" fill="none">
+                <ellipse cx="32" cy="22" rx="7" ry="9" fill="none"
+                         stroke="#00A5A5" stroke-width="1.8"/>
+                <circle cx="27" cy="19" r="2.2" fill="#A8FF00"/>
+                <circle cx="37" cy="19" r="2.2" fill="#A8FF00"/>
+                <path d="M32 30 L32 52" stroke="#5D005D" stroke-width="1.8"/>
+                <path d="M25 25 L18 30 L20 38 L26 36 M39 25 L46 30 L44 38 L38 36"
+                      stroke="#5D005D" stroke-width="1.8" fill="none"/>
+            </svg>
+        </template>
         <div class="header-title">
             <h1><span class="brand">MantisSec</span> · CSI-Radar-S3</h1>
             <div class="subtitle">Firmware · Web Flasher</div>
@@ -118,37 +95,130 @@
 
     </section>
 
-    <!-- ═══ Instructions ═══ -->
+    <!-- ═══ Quick directions ═══ -->
     <section class="panel">
         <div class="instructions">
-            <h3>How this works</h3>
+            <h3>Flash flow</h3>
             <ol>
-                <li>Plug the device into your computer with a
-                    <span class="accent">good USB data cable</span>
-                    (not a charge-only cable).</li>
-                <li>Pick <span class="accent">what you're flashing</span>
-                    and which <span class="accent">board</span> you have.</li>
-                <li>Click <span class="accent">Connect &amp; Flash</span>.
-                    Your browser will show a port picker — usually one
-                    entry labelled something like
-                    <span class="accent">USB JTAG/serial</span> or
-                    <span class="accent">CP210x</span> or
-                    <span class="accent">CH340</span>.</li>
-                <li>Pick that port and wait. The firmware will erase,
-                    write, and verify. Takes 20–60 seconds.</li>
-                <li>When done, unplug and re-plug the device to boot the
-                    new firmware.</li>
+                <li>Plug in with a <span class="accent">USB data cable</span>
+                    (not charge-only).</li>
+                <li>Pick device role &amp; board above.</li>
+                <li>Click <span class="accent">Connect &amp; Flash</span>,
+                    pick the port in the browser dialog.</li>
+                <li>Wait 20-60 s. When done, unplug + re-plug to boot.</li>
             </ol>
             <h3 style="margin-top: 18px;">If a device won't connect</h3>
             <ol>
-                <li>Hold the <span class="accent">BOOT</span> button while
-                    plugging in the USB cable (this forces flash mode).</li>
-                <li>Try a different USB cable — many "charging" cables
-                    have no data lines.</li>
-                <li>On XIAO boards: press <span class="accent">RESET</span>
-                    while holding <span class="accent">BOOT</span>, then
-                    release <span class="accent">RESET</span> first.</li>
+                <li>Hold <span class="accent">BOOT</span> while plugging in
+                    to force flash mode.</li>
+                <li>Try a different USB cable — many "charging" cables have
+                    no data lines.</li>
+                <li>XIAO: hold BOOT + tap RESET, release RESET first.</li>
             </ol>
+        </div>
+    </section>
+
+    <!-- ═══ Beacon &amp; receiver layout ═══ -->
+    <!-- Two image slots — drop raster PNG diagrams into docs/assets/
+         to populate.  Room-agnostic: just shows relative positions of
+         the boards / walk path.  See docs/assets/README.md for how to
+         generate them if the files are missing. -->
+    <section class="panel">
+        <div class="instructions">
+            <h3>How to place the boards</h3>
+
+            <h4 class="layout-mode-label">Tripwire (1 beacon)</h4>
+            <div class="layout-figure">
+                <img src="assets/layout-tripwire.png"
+                     alt="Tripwire layout: 1 receiver, 1 beacon, watch zone between them"
+                     class="layout-image"
+                     onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'layout-missing',textContent:'[tripwire layout image — drop assets/layout-tripwire.png]'}))">
+            </div>
+            <ul class="layout-notes">
+                <li>Receiver and beacon <span class="accent">1&ndash;5 m apart</span>,
+                    at similar height.</li>
+                <li>Anything crossing the line between them will register.</li>
+                <li>Skip walk-cal — tripwire mode goes straight from empty-room
+                    baseline to running.</li>
+            </ul>
+
+            <h4 class="layout-mode-label">Full mode (2 receivers + 3 beacons)</h4>
+            <div class="layout-figure">
+                <img src="assets/layout-full.png"
+                     alt="Full layout: 2 receivers on 6cm bar (anchor + probe), 3 beacons spread out, dotted walk path connecting all landmarks"
+                     class="layout-image"
+                     onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'layout-missing',textContent:'[full layout image — drop assets/layout-full.png]'}))">
+            </div>
+            <ul class="layout-notes">
+                <li>Beacons <span class="accent">roughly triangular</span>,
+                    similar height, 1&ndash;3 m spacing between them.</li>
+                <li>Receivers on a <span class="accent">6 cm bar</span> — anchor
+                    stays there for cal, probe walks with you.</li>
+                <li>During cal you'll visit each beacon, the centroid, three
+                    edge midpoints, and a point behind the receiver bar.
+                    The device tells you what to do at each stop.</li>
+            </ul>
+        </div>
+    </section>
+
+    <!-- ═══ Supported hardware / affiliate links ═══ -->
+    <section class="panel">
+        <div class="instructions">
+            <h3>Supported hardware</h3>
+            <p class="hw-blurb">
+                These are the exact boards this firmware targets. Buying
+                through the links below sends a small kickback our way at
+                no cost to you &mdash; it's how we keep this project going.
+                Thanks for the support.
+            </p>
+
+            <div class="hw-item">
+                <div class="hw-name">
+                    LilyGo T-Display-S3
+                    <span class="hw-role">receiver &times; 1&ndash;2</span>
+                </div>
+                <div class="hw-detail">
+                    ESP32-S3 with a 1.9&Prime; ST7789 display. You'll want
+                    two of these for full stereo mode, or one for solo.
+                </div>
+                <!-- TODO: user drops their affiliate URL here -->
+                <a class="hw-link" href="AFFILIATE_LINK_TDISPLAY_S3"
+                   target="_blank" rel="noopener sponsored">
+                    Buy T-Display-S3 &rarr;
+                </a>
+            </div>
+
+            <div class="hw-item">
+                <div class="hw-name">
+                    Seeed Studio XIAO ESP32-C3
+                    <span class="hw-role">beacon &times; 3</span>
+                </div>
+                <div class="hw-detail">
+                    Small, cheap, low-power. Three of these become the
+                    beacons whose signals the receivers listen to.
+                </div>
+                <!-- TODO: user drops their affiliate URL here -->
+                <a class="hw-link" href="AFFILIATE_LINK_XIAO_ESP32C3"
+                   target="_blank" rel="noopener sponsored">
+                    Buy XIAO ESP32-C3 &rarr;
+                </a>
+            </div>
+
+            <div class="hw-item">
+                <div class="hw-name">
+                    Seeed Studio XIAO ESP32-S3
+                    <span class="hw-role">beacon alternate</span>
+                </div>
+                <div class="hw-detail">
+                    Works too if you already have S3 XIAOs sitting around.
+                    C3 is what we recommend by default (cheaper, lower power).
+                </div>
+                <!-- TODO: user drops their affiliate URL here -->
+                <a class="hw-link" href="AFFILIATE_LINK_XIAO_ESP32S3"
+                   target="_blank" rel="noopener sponsored">
+                    Buy XIAO ESP32-S3 &rarr;
+                </a>
+            </div>
         </div>
     </section>
 
