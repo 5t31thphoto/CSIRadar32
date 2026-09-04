@@ -779,36 +779,40 @@ static void draw_view_radar() {
     g.setTextColor(mode_col, COL_BG);
     g.setCursor(4, status_y);
     g.print(mode_lbl);
-    // Confidence %
+    // Confidence % — pulled from primary scene track (was g_app.tracker,
+    // now owned by scene module).  Zero if no active track.
+    const TargetTrack *tr0 = scene_get_track(0);
+    float track_conf = (tr0 && tr0->active) ? tr0->confidence : 0.0f;
     char cbuf[16];
-    snprintf(cbuf, sizeof(cbuf), "%3d%%",
-             (int)(g_app.tracker.confidence * 100.0f));
+    snprintf(cbuf, sizeof(cbuf), "%3d%%", (int)(track_conf * 100.0f));
     int cw = g.textWidth(cbuf);
-    uint16_t cc = g_app.tracker.confidence > 0.5f ? COL_FG
-                : g_app.tracker.confidence > 0.2f ? COL_WARN : COL_MUTED;
+    uint16_t cc = track_conf > 0.5f ? COL_FG
+                : track_conf > 0.2f ? COL_WARN : COL_MUTED;
     g.setTextColor(cc, COL_BG);
     g.setCursor(SCREEN_W - cw - 4, status_y);
     g.print(cbuf);
 
     // ── Radar map ──
+    // Room extent in cm — used for beacon coords (which are stored in cm)
+    // and for scaling normalized scene positions to display pixels.
+    const float ROOM_HALF_CM = 200.0f;   // 4m × 4m room
     const int cx = SCREEN_W / 2;
     const int cy = map_y + map_h / 2;
-    // Fit the room half-extent into the smaller of (map width/2, map height/2)
-    const int usable = (SCREEN_W / 2) - 6;   // leave 6 px padding
+    const int usable = (SCREEN_W / 2) - 6;
     const int usable_v = (map_h / 2) - 6;
     const int R = (usable < usable_v) ? usable : usable_v;
-    const float pix_per_cm = (float)R / TRACKER_ROOM_HALF_CM;
+    const float pix_per_cm = (float)R / ROOM_HALF_CM;
+    // Scene module works in normalized units (±SCENE_EXTENT = room bounds).
+    // Convert to cm on read: cm = norm * ROOM_HALF_CM / SCENE_EXTENT.
+    const float norm_to_cm = ROOM_HALF_CM / SCENE_EXTENT;
 
-    // Map frame + range rings
     g.drawRect(0, map_y, SCREEN_W, map_h, COL_GRID_DARK);
-    for (int r_cm = 100; r_cm <= (int)TRACKER_ROOM_HALF_CM; r_cm += 100) {
+    for (int r_cm = 100; r_cm <= (int)ROOM_HALF_CM; r_cm += 100) {
         int rp = (int)(r_cm * pix_per_cm);
         g.drawCircle(cx, cy, rp, COL_GRID_DARK);
     }
-    // Axes
     g.drawFastHLine(cx - R, cy, 2 * R, COL_GRID_DARK);
     g.drawFastVLine(cx, cy - R, 2 * R, COL_GRID_DARK);
-    // North label ("forward" from the RX bar in stereo)
     g.setTextColor(COL_DIM, COL_BG);
     g.setCursor(cx + 2, cy - R + 1);
     g.print("N");
@@ -875,21 +879,21 @@ static void draw_view_radar() {
         g.fillRect(cx - 3, cy - 3, 6, 7, COL_ACCENT);
     }
 
-    // ── Trail (fading) ──
-    if (g_app.tracker.trail_count > 0) {
+    // ── Trail (fading) ── from primary scene track
+    if (tr0 && tr0->active && tr0->trail_count > 0) {
         uint32_t now = millis();
-        int start = g_app.tracker.trail_head;
-        int total = g_app.tracker.trail_count;
+        int start = tr0->trail_head;
+        int total = tr0->trail_count;
         for (int k = 0; k < total; k++) {
             // Walk from oldest to newest
-            int idx = (start + TRACKER_TRAIL_LEN - total + k) % TRACKER_TRAIL_LEN;
-            auto &p = g_app.tracker.trail[idx];
+            int idx = (start + TRACK_TRAIL_LEN - total + k) % TRACK_TRAIL_LEN;
+            const TargetTrack::TrailPoint &p = tr0->trail[idx];
             if (p.t_ms == 0) continue;
             uint32_t age = now - p.t_ms;
             if (age > 3000) continue;
-            int px = cx + (int)(p.x_cm * pix_per_cm);
-            int py = cy - (int)(p.y_cm * pix_per_cm);
-            // Age fade: newest = warm color, oldest = dim
+            // Convert normalized position to cm, then to pixels
+            int px = cx + (int)(p.pos[0] * norm_to_cm * pix_per_cm);
+            int py = cy - (int)(p.pos[1] * norm_to_cm * pix_per_cm);
             uint16_t tc = (age < 500)  ? COL_WARN
                         : (age < 1500) ? COL_DIM
                                        : COL_GRID_DARK;
@@ -898,17 +902,19 @@ static void draw_view_radar() {
         }
     }
 
-    // ── Target + confidence ellipse ──
-    if (g_app.tracker.valid && g_app.tracker.confidence > 0.05f) {
-        int tx = cx + (int)(g_app.tracker.x_cm * pix_per_cm);
-        int ty = cy - (int)(g_app.tracker.y_cm * pix_per_cm);
-        uint16_t tcol = g_app.tracker.confidence > 0.5f ? COL_ALERT : COL_WARN;
-        draw_confidence_ellipse(tx, ty, pix_per_cm,
-                                g_app.tracker.cov_xx,
-                                g_app.tracker.cov_yy,
-                                g_app.tracker.cov_xy,
+    // ── Target + confidence ellipse ── from primary scene track
+    if (tr0 && tr0->active && tr0->confidence > 0.05f) {
+        int tx = cx + (int)(tr0->pos[0] * norm_to_cm * pix_per_cm);
+        int ty = cy - (int)(tr0->pos[1] * norm_to_cm * pix_per_cm);
+        uint16_t tcol = tr0->confidence > 0.5f ? COL_ALERT : COL_WARN;
+        // Covariance is in normalized-units² — convert scaling for ellipse:
+        // one-sigma pixel radius = sqrt(cov) * norm_to_cm * pix_per_cm
+        float cov_scale = norm_to_cm * pix_per_cm;
+        draw_confidence_ellipse(tx, ty, cov_scale,
+                                tr0->cov_xx,
+                                tr0->cov_yy,
+                                tr0->cov_xy,
                                 COL_DIM);
-        // Concentric target rings — makes the dot pop even at low conf
         g.drawCircle(tx, ty, 6, tcol);
         g.drawCircle(tx, ty, 3, tcol);
         g.fillCircle(tx, ty, 2, COL_TEXT);
