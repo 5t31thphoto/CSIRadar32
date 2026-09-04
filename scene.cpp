@@ -290,6 +290,18 @@ void scene_cal_ack_empty_room() {
     Serial.println("[scene] empty-room baseline acknowledged");
 }
 
+// v0.4 tripwire shortcut — no walk cal, no kernel to build.  With one
+// beacon the runtime falls back to per-beacon amplitude thresholding
+// against the just-captured empty-room baseline (classic v0.1 tripwire
+// semantics).  This function just flips the flags so scene_cal_complete()
+// returns true and the main loop begins running scene_update().
+void scene_cal_tripwire_finalize() {
+    s_cal_active   = false;
+    s_cal_complete = true;
+    s_empty_room_ready = true;
+    Serial.println("[scene] tripwire finalize (no walk cal, no kernel)");
+}
+
 // Called by wizard when it enters/exits a step so PROBE-side outgoing
 // packets can carry real step/landmark provenance (v0.3 first-cut sent
 // 0 / 0xFF placeholders).  Both PROBE and ANCHOR track this locally.
