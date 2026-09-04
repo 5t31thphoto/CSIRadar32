@@ -108,7 +108,8 @@ static AliasPair s_alias_pairs[CAL_MAX_ALIAS_PAIRS] = {};
 // ═══════════════════════════════════════════════════════════════
 //  UTILITY
 // ═══════════════════════════════════════════════════════════════
-static inline float sq(float x) { return x * x; }
+// Note: sq() is provided by Arduino.h as a macro `((x)*(x))` — don't
+// redefine it here or the macro will mangle our definition into garbage.
 static inline float wrap_pi(float x) {
     while (x >  (float)M_PI) x -= 2.0f * (float)M_PI;
     while (x < -(float)M_PI) x += 2.0f * (float)M_PI;
@@ -1989,5 +1990,3 @@ const KernelSample *scene_kernel_sample(int idx) {
     return &s_kernel[idx];
 }
 float scene_novelty_score() { return s_novelty; }
-
-
