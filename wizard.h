@@ -1,58 +1,79 @@
 // ═══════════════════════════════════════════════════════════════
-//  wizard.h — data-driven cal ceremony state machine.
+//  wizard.h — cal ceremony state machine (v0.4)
 //
-//  A calibration walk is a script of WizardStep entries the user
-//  walks through.  Each step has a kind (STAND / WALK / ROTATE /
-//  intro / empty-room), a landmark reference or pair, timing bounds,
-//  and text shown on the PROBE screen.  Wizard advances through the
-//  script based on time + button presses; on entering / leaving each
-//  step it calls the appropriate scene_begin_*_capture / end_capture
-//  hooks so the scene module builds its kernel.
+//  A calibration walk is a script of WizardStep entries.  Each step
+//  has a kind (STAND / WALK / ROTATE / INTRO / END), landmark refs,
+//  timing bounds, and text shown on the PROBE screen.
 //
-//  Kept as pure data + a small step-index integer so behavior is
-//  easy to reason about, easy to test, easy to modify by editing
-//  the script table.
+//  v0.4 change from v0.3:
+//    Each step has a sub-phase (WP_ARM → WP_CAPTURE → WP_READY).
+//    WALK  : WP_ARM (waiting for BEGIN press)
+//          → WP_CAPTURE (transit capture running, waiting for ARRIVED)
+//          → advances immediately (no WP_READY).
+//    STAND : WP_CAPTURE (landmark capture running with countdown)
+//          → WP_READY (countdown done, waiting for NEXT press).
+//    ROTATE: same as STAND.
+//    INTRO : WP_READY only (waiting for NEXT press).
+//
+//    No auto-advance from max_duration_ms anymore — every advance is
+//    a button press.  Countdown timers only gate WHEN the button is
+//    accepted (during STAND/ROTATE hold-still window).
 // ═══════════════════════════════════════════════════════════════
 #pragma once
 #include "config.h"
+
+// Sub-phase inside the current step (see file header for the state
+// machine per step kind).
+enum WizardPhase : uint8_t {
+    WP_ARM,        // waiting for user to press BEGIN (WALK only)
+    WP_CAPTURE,    // capture window open, waiting for the "ok" press
+    WP_READY,      // capture closed / not needed; waiting to advance
+};
 
 struct WizardStep {
     StepKind    kind;
     LandmarkId  landmark_a;
     LandmarkId  landmark_b;       // WALK only, else = landmark_a
-    uint16_t    min_duration_ms;  // 0 = press-to-advance immediately allowed
-    uint16_t    max_duration_ms;  // 0 = no auto-advance
+    uint16_t    hold_ms;          // STAND/ROTATE: countdown length before
+                                  //   NEXT is accepted (was min_duration).
+                                  //   Ignored for WALK/INTRO.
     const char *title;
-    const char *instruction;
+    const char *instruction;      // shown during WP_CAPTURE / WP_ARM
+    const char *ready_prompt;     // shown during WP_READY (STAND/ROTATE
+                                  //   after countdown; INTRO always)
 };
 
 // Lifecycle
-void wizard_begin(CalMode mode);           // start at step 0 for the given mode
+void wizard_begin(CalMode mode);
 void wizard_abort();
 bool wizard_active();
 bool wizard_finished();
 
-// Called from the main loop while ST_CAL_LANDMARK_WALK is active.
-// Consumes button state (via input.h globals) and time to drive the
-// step-by-step progression.  Invokes scene::begin/end hooks as needed.
+// Called from main loop while ST_CAL_LANDMARK_WALK is active.
+// Reads button edges via input.h and drives the sub-phase / step
+// progression, calling scene_begin/end hooks as it goes.
 void wizard_tick();
 
-// Try to advance to the next step (called on button press or timer).
-// Returns true if advance succeeded, false if step blocks advance
-// (still waiting for min_duration).
+// Programmatic advance (used by peer step-sync).  Advances one step;
+// returns true on success.  Respects WP_CAPTURE end for the current
+// step so we don't drop a half-open capture window.
 bool wizard_try_advance();
 
-// Accessors for the UI to render the current step.
+// Accessors for the UI.
 const WizardStep *wizard_current_step();
 int  wizard_current_index();
 int  wizard_total_steps();
 uint32_t wizard_step_elapsed_ms();
-uint32_t wizard_step_min_remaining_ms();
+WizardPhase wizard_current_phase();
 
-// Progress fraction 0..1 across the whole script (for a top progress bar).
+// For countdown display: how much of hold_ms remains during WP_CAPTURE
+// on STAND/ROTATE.  Returns 0 during WP_ARM/WP_READY.
+uint32_t wizard_hold_remaining_ms();
+
+// Progress fraction 0..1 across the whole script.
 float wizard_overall_progress();
 
-// Force-jump to a specific step index (used by ANCHOR to follow PROBE's
-// step hints via peer commands).  Skips button/timing checks; performs
-// the same exit_step/enter_step housekeeping wizard_try_advance would.
+// Force-jump to a specific step index (used by ANCHOR to follow PROBE).
+// Skips button/timing checks; performs entry/exit housekeeping.  Always
+// lands the ANCHOR in the equivalent phase of the target step.
 void wizard_jump_to_step(int idx);
