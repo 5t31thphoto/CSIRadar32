@@ -146,6 +146,26 @@ jobs:
           pattern: beacon-*-merged
           path: dl/beacons
           merge-multiple: true
+      - name: Write QR generator script
+        run: |
+          mkdir -p .ci
+          cat > .ci/make_qr.py <<'PYEOF'
+          import qrcode, qrcode.image.svg, sys
+          url = sys.argv[1]
+          out = sys.argv[2]
+          qr = qrcode.QRCode(
+              version=None,
+              error_correction=qrcode.constants.ERROR_CORRECT_M,
+              box_size=10, border=4,
+          )
+          qr.add_data(url)
+          qr.make(fit=True)
+          img = qr.make_image(
+              image_factory=qrcode.image.svg.SvgPathImage,
+              fill_color="#050510", back_color="#ffffff",
+          )
+          img.save(out)
+          PYEOF
       - name: Assemble site
         run: |
           set -e
@@ -155,15 +175,7 @@ jobs:
           cp dl/receiver/csi-radar-s3-merged.bin site/bins/
           cp dl/beacons/csi-beacon-*-merged.bin site/bins/
           python3 -m pip install --quiet 'qrcode[pil]'
-          python3 - <<'PY'
-          import qrcode, qrcode.image.svg
-          url = "https://5t31thphoto.github.io/CSIRadar32/"
-          qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=4)
-          qr.add_data(url)
-          qr.make(fit=True)
-          img = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage, fill_color="#050510", back_color="#ffffff")
-          img.save("site/qr.svg")
-          PY
+          python3 .ci/make_qr.py "https://5t31thphoto.github.io/CSIRadar32/" site/qr.svg
           SHORT_SHA="${{ needs.build-receiver.outputs.short_sha }}"
           BUILD_DATE=$(date -u +%Y-%m-%d)
           sed -i "s|{{SHORT_SHA}}|${SHORT_SHA}|g" site/index.html
@@ -182,4 +194,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
