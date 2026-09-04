@@ -1,3 +1,16 @@
+# ═══════════════════════════════════════════════════════════════
+#  CSI-Radar-S3 / MantisSec — Build + Web Flasher workflow
+#
+#  On every push:
+#    (1) Compile the receiver (T-Display-S3, ESP32-S3)                  → 1 bin
+#    (2) Compile the beacon 6× via matrix                                → 6 bins
+#          IDs 1/2/3 × chips {XIAO ESP32-C3, XIAO ESP32-S3}
+#    (3) Assemble the docs/ web flasher with all 7 merged bins into a
+#        Pages artifact and deploy it to https://<owner>.github.io/<repo>/
+#
+#  Tagged pushes (v*) additionally create a GitHub Release with the
+#  merged binaries attached.
+# ═══════════════════════════════════════════════════════════════
 name: build
 
 on:
@@ -9,9 +22,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: write        # for releases
+  pages: write           # for pages deployment
+  id-token: write        # for pages deployment (OIDC)
 
 concurrency:
   group: pages-${{ github.ref }}
@@ -20,10 +33,19 @@ concurrency:
 env:
   ESP32_CORE:    esp32:esp32@3.0.7
   LOVYANGFX_VER: 1.2.0
-  RX_SKETCH:    CSI-Radar-S3
+
+  # Receiver — LilyGo T-Display-S3
+  RX_SKETCH:   CSI-Radar-S3
+  RX_FQBN:     esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=default_16MB,DebugLevel=none,PSRAM=disabled,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default
+  RX_CHIP:     esp32s3
+  RX_FLASHSZ:  16MB
+
   BEACON_SKETCH: CSI-Beacon-Extended
 
 jobs:
+  # ─────────────────────────────────────────────────────────────
+  #  RECEIVER (1 binary)
+  # ─────────────────────────────────────────────────────────────
   build-receiver:
     name: Build receiver (T-Display-S3)
     runs-on: ubuntu-latest
@@ -31,104 +53,158 @@ jobs:
       short_sha: ${{ steps.sha.outputs.short_sha }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: arduino/setup-arduino-cli@v2
+        with: { version: 1.0.4 }
+
+      - name: Configure Arduino CLI
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
       - name: Install ESP32 core
         run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install ${{ env.ESP32_CORE }}
+
       - name: Install LovyanGFX
         run: arduino-cli lib install "LovyanGFX@${{ env.LOVYANGFX_VER }}"
+
+      - name: Install esptool
+        run: python3 -m pip install --upgrade esptool
+
       - name: Short SHA
         id: sha
         run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-      - name: Prep receiver sketch directory
-        run: |
-          if [ -f "CSI-Radar-S3.ino" ] && [ ! -d "CSI-Radar-S3" ]; then
-            mkdir -p CSI-Radar-S3
-            shopt -s nullglob
-            for f in *.ino *.h *.cpp; do
-              [ -f "$f" ] && mv "$f" CSI-Radar-S3/
-            done
-          fi
-          ls CSI-Radar-S3/
+
       - name: Compile
         run: |
           mkdir -p build/rx
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32s3 \
+            --fqbn "${{ env.RX_FQBN }}" \
             --output-dir build/rx \
+            --warnings default \
+            --verbose \
             "${{ env.RX_SKETCH }}"
-      - name: Merge into single .bin
+
+      - name: Merge (bootloader + partitions + app → merged.bin)
         run: |
-          pip install esptool
-          BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -1)
           cd build/rx
-          python -m esptool --chip esp32s3 merge_bin \
+          BOOT="${{ env.RX_SKETCH }}.ino.bootloader.bin"
+          PART="${{ env.RX_SKETCH }}.ino.partitions.bin"
+          APP="${{ env.RX_SKETCH }}.ino.bin"
+          OTA_ARG=""
+          BOOT_APP0=$(find "$HOME/.arduino15/packages/esp32" -name boot_app0.bin -print -quit 2>/dev/null || true)
+          if [ -n "$BOOT_APP0" ] && grep -q "otadata" "${{ env.RX_SKETCH }}.ino.partitions.csv" 2>/dev/null; then
+            OTA_ARG="0xe000 $BOOT_APP0"
+          fi
+          esptool.py --chip ${{ env.RX_CHIP }} merge_bin \
             -o csi-radar-s3-merged.bin \
-            --flash_mode keep --flash_freq keep --flash_size keep \
-            0x0     ${{ env.RX_SKETCH }}.ino.bootloader.bin \
-            0x8000  ${{ env.RX_SKETCH }}.ino.partitions.bin \
-            0xe000  "$BOOT_APP0" \
-            0x10000 ${{ env.RX_SKETCH }}.ino.bin
-      - uses: actions/upload-artifact@v4
+            --flash_mode qio \
+            --flash_size ${{ env.RX_FLASHSZ }} \
+            0x0     "$BOOT" \
+            0x8000  "$PART" \
+            $OTA_ARG \
+            0x10000 "$APP"
+          ls -la csi-radar-s3-merged.bin
+          echo "Merged size: $(stat -c%s csi-radar-s3-merged.bin) bytes"
+
+      - name: Upload receiver artifact
+        uses: actions/upload-artifact@v4
         with:
           name: receiver-merged
           path: build/rx/csi-radar-s3-merged.bin
           retention-days: 30
 
+      - name: Upload receiver debug artifacts (elf/map)
+        uses: actions/upload-artifact@v4
+        with:
+          name: receiver-debug-${{ steps.sha.outputs.short_sha }}
+          path: |
+            build/rx/*.elf
+            build/rx/*.map
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────
+  #  BEACON (6 binaries: 2 chips × 3 IDs)
+  # ─────────────────────────────────────────────────────────────
   build-beacon:
     name: Build beacon ${{ matrix.chip }} id ${{ matrix.id }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        id:   [1, 2, 3]
-        chip: [c3, s3]
+        id: [1, 2, 3]
         include:
           - chip: c3
             chip_family: esp32c3
-            fqbn: esp32:esp32:XIAO_ESP32C3
+            fqbn: esp32:esp32:XIAO_ESP32C3:CDCOnBoot=default,PartitionScheme=huge_app,CPUFreq=160,FlashMode=qio,FlashFreq=80,FlashSize=4M,DebugLevel=none,EraseFlash=none
+            flashsz: 4MB
+            boot_addr: "0x0"
           - chip: s3
             chip_family: esp32s3
-            fqbn: esp32:esp32:XIAO_ESP32S3
+            fqbn: esp32:esp32:XIAO_ESP32S3:USBMode=default,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=disabled,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default
+            flashsz: 8MB
+            boot_addr: "0x0"
     steps:
       - uses: actions/checkout@v4
+
       - uses: arduino/setup-arduino-cli@v2
+        with: { version: 1.0.4 }
+
+      - name: Configure Arduino CLI
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
       - name: Install ESP32 core
         run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install ${{ env.ESP32_CORE }}
+
+      - name: Install esptool
+        run: python3 -m pip install --upgrade esptool
+
       - name: Compile beacon (id=${{ matrix.id }}, chip=${{ matrix.chip }})
         run: |
           mkdir -p build/beacon
           arduino-cli compile \
-            --fqbn ${{ matrix.fqbn }} \
+            --fqbn "${{ matrix.fqbn }}" \
             --output-dir build/beacon \
-            --build-property "compiler.cpp.extra_flags=-DBEACON_ID_DEFAULT=${{ matrix.id }}" \
+            --warnings default \
+            --build-property "build.extra_flags=-DBEACON_ID_DEFAULT=${{ matrix.id }}" \
+            --verbose \
             "${{ env.BEACON_SKETCH }}"
-      - name: Merge into single .bin
+
+      - name: Merge (bootloader + partitions + app → merged.bin)
         run: |
-          pip install esptool
-          BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -1)
           cd build/beacon
+          BOOT="${{ env.BEACON_SKETCH }}.ino.bootloader.bin"
+          PART="${{ env.BEACON_SKETCH }}.ino.partitions.bin"
+          APP="${{ env.BEACON_SKETCH }}.ino.bin"
           OUT="csi-beacon-${{ matrix.chip }}-id${{ matrix.id }}-merged.bin"
-          python -m esptool --chip ${{ matrix.chip_family }} merge_bin \
+          esptool.py --chip ${{ matrix.chip_family }} merge_bin \
             -o "$OUT" \
-            --flash_mode keep --flash_freq keep --flash_size keep \
-            0x0     ${{ env.BEACON_SKETCH }}.ino.bootloader.bin \
-            0x8000  ${{ env.BEACON_SKETCH }}.ino.partitions.bin \
-            0xe000  "$BOOT_APP0" \
-            0x10000 ${{ env.BEACON_SKETCH }}.ino.bin
-      - uses: actions/upload-artifact@v4
+            --flash_mode qio \
+            --flash_size ${{ matrix.flashsz }} \
+            ${{ matrix.boot_addr }} "$BOOT" \
+            0x8000     "$PART" \
+            0x10000    "$APP"
+          ls -la "$OUT"
+          echo "Merged size: $(stat -c%s $OUT) bytes"
+
+      - name: Upload beacon artifact
+        uses: actions/upload-artifact@v4
         with:
           name: beacon-${{ matrix.chip }}-id${{ matrix.id }}-merged
           path: build/beacon/csi-beacon-${{ matrix.chip }}-id${{ matrix.id }}-merged.bin
           retention-days: 30
 
+  # ─────────────────────────────────────────────────────────────
+  #  ASSEMBLE PAGES SITE (web flasher + all 7 bins)
+  # ─────────────────────────────────────────────────────────────
   build-pages:
     name: Assemble web flasher
     needs: [build-receiver, build-beacon]
@@ -137,22 +213,39 @@ jobs:
       short_sha: ${{ needs.build-receiver.outputs.short_sha }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+
+      - name: Download receiver bin
+        uses: actions/download-artifact@v4
         with:
           name: receiver-merged
           path: dl/receiver
-      - uses: actions/download-artifact@v4
+
+      - name: Download beacon bins
+        uses: actions/download-artifact@v4
         with:
           pattern: beacon-*-merged
           path: dl/beacons
           merge-multiple: true
-      - name: Write QR generator script
+
+      - name: Assemble Pages site
         run: |
-          mkdir -p .ci
-          cat > .ci/make_qr.py <<'PYEOF'
-          import qrcode, qrcode.image.svg, sys
-          url = sys.argv[1]
-          out = sys.argv[2]
+          set -e
+          # Start from docs/ (checked-in web flasher source), then copy
+          # the actual firmware bins in and stamp version/SHA into the
+          # generated manifests.
+          mkdir -p site
+          cp -r docs/. site/
+          mkdir -p site/bins
+          cp dl/receiver/csi-radar-s3-merged.bin  site/bins/
+          cp dl/beacons/csi-beacon-*-merged.bin   site/bins/
+
+          # Regenerate QR code from Pages URL using the canonical
+          # qrcode PyPI package (safer than the hand-rolled fallback
+          # checked into docs/qr.svg).
+          python3 -m pip install --quiet 'qrcode[pil]'
+          python3 - <<'PY'
+          import qrcode, qrcode.image.svg
+          url = "https://5t31thphoto.github.io/CSIRadar32/"
           qr = qrcode.QRCode(
               version=None,
               error_correction=qrcode.constants.ERROR_CORRECT_M,
@@ -160,33 +253,45 @@ jobs:
           )
           qr.add_data(url)
           qr.make(fit=True)
-          img = qr.make_image(
-              image_factory=qrcode.image.svg.SvgPathImage,
-              fill_color="#050510", back_color="#ffffff",
-          )
-          img.save(out)
-          PYEOF
-      - name: Assemble site
-        run: |
-          set -e
-          mkdir -p site
-          cp -r docs/. site/
-          mkdir -p site/bins
-          cp dl/receiver/csi-radar-s3-merged.bin site/bins/
-          cp dl/beacons/csi-beacon-*-merged.bin site/bins/
-          python3 -m pip install --quiet 'qrcode[pil]'
-          python3 .ci/make_qr.py "https://5t31thphoto.github.io/CSIRadar32/" site/qr.svg
+          img = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage,
+                              fill_color="#050510", back_color="#ffffff")
+          img.save("site/qr.svg")
+          print(f"QR regenerated for {url}")
+          PY
+
+          # Stamp git sha + build date into index.html
           SHORT_SHA="${{ needs.build-receiver.outputs.short_sha }}"
           BUILD_DATE=$(date -u +%Y-%m-%d)
-          sed -i "s|{{SHORT_SHA}}|${SHORT_SHA}|g" site/index.html
+          sed -i "s|{{SHORT_SHA}}|${SHORT_SHA}|g"   site/index.html
           sed -i "s|{{BUILD_DATE}}|${BUILD_DATE}|g" site/index.html
+
+          # Prevent GitHub from applying Jekyll processing to the site.
           touch site/.nojekyll
-      - uses: actions/upload-pages-artifact@v3
+
+          # Sanity: manifest URLs are relative, so no substitution needed.
+          echo "── site/ contents ──"
+          find site -type f | sort
+          echo "── size totals ──"
+          du -sh site
+          du -sh site/bins
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
+      - name: Upload assembled site as workflow artifact (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pages-site-${{ needs.build-receiver.outputs.short_sha }}
+          path: site
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────
+  #  DEPLOY TO GITHUB PAGES (main branch only)
+  # ─────────────────────────────────────────────────────────────
   deploy-pages:
-    name: Deploy to Pages
+    name: Deploy web flasher to Pages
     needs: build-pages
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -194,6 +299,27 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
+      - id: deployment
         uses: actions/deploy-pages@v4
+
+  # ─────────────────────────────────────────────────────────────
+  #  RELEASE (tagged pushes only)
+  # ─────────────────────────────────────────────────────────────
+  release:
+    name: Publish release
+    needs: [build-receiver, build-beacon]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all merged bins
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-merged"
+          path: rel
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rel/*.bin
+          generate_release_notes: true
