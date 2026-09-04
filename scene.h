@@ -207,6 +207,14 @@ void scene_cal_transmit_probe_frame(const FrameObservation &obs);
 // the walk sequence completes.  Populates `report` with quality metrics.
 void scene_finalize_cal(CalReport &report);
 
+// v0.4: tripwire (1-beacon) shortcut finalize.  No walk cal is done —
+// beacon 1 pose is fixed by geometry alone, and the "kernel" is
+// stand-in / empty.  Marks the scene calibrated so runtime can begin.
+// Detection in tripwire mode falls back to bulk-amplitude thresholding
+// against the empty-room baseline (like v0.1 tripwire), which is what
+// the mode has always meant.
+void scene_cal_tripwire_finalize();
+
 // ═══════════════════════════════════════════════════════════════
 //  RUNTIME
 // ═══════════════════════════════════════════════════════════════
