@@ -1,0 +1,326 @@
+/* ═══════════════════════════════════════════════════════════════
+   MantisSec CSI-Radar-S3 web flasher — style
+   Dark cyber palette matching the device UI's paint pass.
+   ═══════════════════════════════════════════════════════════════ */
+
+:root {
+    --ms-bg:         #050510;
+    --ms-bg-panel:   #0b0b1a;
+    --ms-bg-elev:    #131328;
+    --ms-teal:       #007373;
+    --ms-teal-lo:    #00A5A5;
+    --ms-teal-hi:    #33d6d6;
+    --ms-violet:     #5D005D;
+    --ms-violet-lo:  #8F00A5;
+    --ms-violet-hi:  #c000e0;
+    --ms-lime:       #A8FF00;
+    --ms-lime-hi:    #d6ff66;
+    --ms-ink:        #E8E8F0;
+    --ms-ink-dim:    #8a8aa5;
+    --ms-warn:       #ffb020;
+    --ms-alert:      #FF2255;
+    --ms-good:       #33ff88;
+    --ms-border:     rgba(0, 165, 165, 0.25);
+    --ms-glow-teal:  rgba(0, 165, 165, 0.35);
+    --ms-glow-lime:  rgba(168, 255, 0, 0.35);
+
+    --ms-font-body:  ui-monospace, "SF Mono", "JetBrains Mono", "Consolas", "Courier New", monospace;
+    --ms-font-head:  system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--ms-bg);
+    color: var(--ms-ink);
+    font-family: var(--ms-font-body);
+    font-size: 14px;
+    line-height: 1.55;
+    min-height: 100vh;
+}
+
+/* Subtle scanline overlay for the cyber feel */
+body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 165, 165, 0.015) 0px,
+        rgba(0, 165, 165, 0.015) 1px,
+        transparent 1px,
+        transparent 3px
+    );
+    z-index: 1;
+}
+
+.page {
+    position: relative;
+    z-index: 2;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 24px 16px 48px;
+}
+
+/* ─── Header ─── */
+.header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 0 20px;
+    border-bottom: 1px solid var(--ms-border);
+    margin-bottom: 24px;
+}
+.header-mark {
+    width: 64px;
+    height: 64px;
+    flex-shrink: 0;
+}
+.header-title {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.header-title h1 {
+    margin: 0;
+    font-family: var(--ms-font-head);
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    color: var(--ms-ink);
+}
+.header-title .brand {
+    color: var(--ms-teal-lo);
+}
+.header-title .subtitle {
+    color: var(--ms-ink-dim);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+/* ─── Card / panel ─── */
+.panel {
+    background: var(--ms-bg-panel);
+    border: 1px solid var(--ms-border);
+    border-radius: 6px;
+    padding: 20px;
+    margin-bottom: 16px;
+    position: relative;
+    overflow: hidden;
+}
+.panel::before {
+    /* Faint teal corner accent */
+    content: "";
+    position: absolute;
+    top: 0; left: 0;
+    width: 20px; height: 20px;
+    border-top: 2px solid var(--ms-teal-lo);
+    border-left: 2px solid var(--ms-teal-lo);
+    opacity: 0.6;
+}
+.panel::after {
+    content: "";
+    position: absolute;
+    bottom: 0; right: 0;
+    width: 20px; height: 20px;
+    border-bottom: 2px solid var(--ms-violet-lo);
+    border-right: 2px solid var(--ms-violet-lo);
+    opacity: 0.6;
+}
+
+/* ─── Form controls ─── */
+.form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 18px;
+}
+.form-row label {
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ms-teal-lo);
+    font-weight: 500;
+}
+.form-row select {
+    background: var(--ms-bg-elev);
+    color: var(--ms-ink);
+    border: 1px solid var(--ms-border);
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-family: var(--ms-font-body);
+    font-size: 14px;
+    outline: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' stroke='%2300A5A5' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 32px;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+.form-row select:hover:not(:disabled) {
+    border-color: var(--ms-teal-lo);
+}
+.form-row select:focus:not(:disabled) {
+    border-color: var(--ms-teal-lo);
+    box-shadow: 0 0 0 3px var(--ms-glow-teal);
+}
+.form-row select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ─── Flash button ─── */
+.action-row {
+    margin-top: 24px;
+}
+.flash-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 14px 20px;
+    background: transparent;
+    border: 1.5px solid var(--ms-ink-dim);
+    color: var(--ms-ink-dim);
+    font-family: var(--ms-font-head);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    border-radius: 4px;
+    cursor: not-allowed;
+    transition: all 0.18s ease;
+}
+.flash-btn.ready {
+    border-color: var(--ms-lime);
+    color: var(--ms-lime);
+    cursor: pointer;
+    box-shadow: 0 0 0 0 var(--ms-glow-lime), inset 0 0 0 0 rgba(168, 255, 0, 0.05);
+}
+.flash-btn.ready:hover {
+    background: rgba(168, 255, 0, 0.08);
+    box-shadow: 0 0 20px var(--ms-glow-lime), inset 0 0 40px rgba(168, 255, 0, 0.05);
+}
+.flash-btn.ready:active {
+    transform: translateY(1px);
+}
+.flash-btn .icon {
+    width: 16px;
+    height: 16px;
+}
+
+/* Wrap esp-web-install-button transparently */
+esp-web-install-button {
+    display: block;
+    width: 100%;
+}
+esp-web-install-button[disabled] .flash-btn {
+    /* Keep our own not-ready look when the ewt component's own gate fires */
+    opacity: 0.5;
+}
+
+/* ─── Status area ─── */
+.status {
+    margin-top: 20px;
+    padding: 14px 16px;
+    background: var(--ms-bg-elev);
+    border-left: 3px solid var(--ms-teal);
+    border-radius: 3px;
+    font-size: 13px;
+    color: var(--ms-ink-dim);
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.status.info    { border-left-color: var(--ms-teal-lo); }
+.status.working { border-left-color: var(--ms-violet-lo); }
+.status.good    { border-left-color: var(--ms-good);  color: var(--ms-good); }
+.status.warn    { border-left-color: var(--ms-warn);  color: var(--ms-warn); }
+.status.error   { border-left-color: var(--ms-alert); color: var(--ms-alert); }
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 8px currentColor;
+    flex-shrink: 0;
+}
+.status.working .status-dot {
+    animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+    0%, 100% { opacity: 0.4; }
+    50%      { opacity: 1;   }
+}
+
+/* ─── Instructions ─── */
+.instructions {
+    font-size: 12px;
+    color: var(--ms-ink-dim);
+    line-height: 1.7;
+}
+.instructions h3 {
+    color: var(--ms-teal-lo);
+    font-family: var(--ms-font-head);
+    font-size: 13px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin: 0 0 8px;
+    font-weight: 600;
+}
+.instructions ol {
+    margin: 0;
+    padding-left: 20px;
+}
+.instructions li {
+    margin-bottom: 4px;
+}
+.instructions .accent { color: var(--ms-lime); }
+
+/* ─── Browser gate ─── */
+.browser-warn {
+    display: none;
+    background: rgba(255, 34, 85, 0.08);
+    border: 1px solid var(--ms-alert);
+    border-radius: 4px;
+    padding: 14px;
+    margin-bottom: 16px;
+    color: var(--ms-alert);
+    font-size: 13px;
+}
+.browser-warn.show { display: block; }
+
+/* ─── Footer ─── */
+.footer {
+    margin-top: 32px;
+    padding-top: 16px;
+    border-top: 1px solid var(--ms-border);
+    font-size: 11px;
+    color: var(--ms-ink-dim);
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.footer a {
+    color: var(--ms-teal-lo);
+    text-decoration: none;
+}
+.footer a:hover { color: var(--ms-teal-hi); }
+
+/* Mobile */
+@media (max-width: 480px) {
+    .page { padding: 16px 12px 36px; }
+    .header-title h1 { font-size: 18px; }
+    .header-mark { width: 48px; height: 48px; }
+    .panel { padding: 16px; }
+}
