@@ -1,0 +1,13 @@
+{
+  "name": "MantisSec CSI-Radar-S3 Receiver",
+  "version": "0.6.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "../bins/csi-radar-s3-merged.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

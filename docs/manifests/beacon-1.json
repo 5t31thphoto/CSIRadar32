@@ -1,0 +1,19 @@
+{
+  "name": "MantisSec CSI-Beacon 1",
+  "version": "0.6.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        { "path": "../bins/csi-beacon-c3-id1-merged.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "../bins/csi-beacon-s3-id1-merged.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
