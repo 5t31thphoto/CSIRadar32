@@ -57,25 +57,51 @@ static int s_settings_row = 0;
 static int  s_probe_last_hinted_idx = -1;
 static bool s_finalize_ran = false;
 
+// v0.4: baseline-only redo — set by settings row 2.  When true, the
+// next ST_CAL_EMPTY_ROOM completion skips the walk-cal wizard and
+// goes straight to finalize/results (kernel data preserved).
+static bool s_baseline_only_redo = false;
+
 // Cache for the finalize report so ui_cal_results can render it.
 static CalReport s_report = {};
 
-// ── PRIMARY→SECONDARY state broadcasting ──────────────────────
+// ── Bidirectional state broadcast (v0.4) ──────────────────────
+// Either unit may broadcast its state.  During cal, PROBE is the
+// user's hand so PROBE-initiated transitions (accept, redo, next
+// view, etc.) need to reach ANCHOR.  Outside cal, PRIMARY drives
+// (it owns the beacon-side rate switching etc.).  Both units always
+// FOLLOW peer state hints — the sender decides authority.
 static AppState s_last_broadcast_state = ST_SPLASH;
+static bool is_cal_state(AppState s) {
+    return s == ST_CAL_INTRO || s == ST_CAL_ANCHOR_PLACE
+        || s == ST_CAL_EMPTY_ROOM || s == ST_CAL_LANDMARK_WALK
+        || s == ST_CAL_FINALIZE  || s == ST_CAL_RESULTS
+        || s == ST_RX_ASSEMBLY;
+}
+static bool this_unit_is_broadcast_authority() {
+    // During cal, the PROBE drives (whichever role it is).
+    if (is_cal_state(g_app.state)) {
+        return g_app.peer.cal_role == CAL_ROLE_PROBE
+            || g_app.cal_mode == CAL_MODE_SOLO;
+    }
+    // Outside cal, PRIMARY drives.
+    return g_app.peer.role == ROLE_PRIMARY;
+}
 static void maybe_broadcast_state() {
-    if (g_app.peer.role != ROLE_PRIMARY) return;
+    if (!this_unit_is_broadcast_authority()) return;
     if (g_app.state == s_last_broadcast_state) return;
     peer_send_command(PEER_OP_STATE_HINT, (uint8_t)g_app.state);
     s_last_broadcast_state = g_app.state;
 }
 
-// ── SECONDARY: follow PRIMARY's state hints ───────────────────
-static void secondary_follow_primary() {
+// ── Follow peer's state hints ─────────────────────────────────
+// Both units listen; only the non-authority one actually transitions
+// (the authority ignores echoes of its own state).
+static void follow_peer_state() {
     uint8_t hint = g_app.peer.primary_state_hint;
     if (hint == 0) return;
     g_app.peer.primary_state_hint = 0;
-    // SECONDARY tracks PRIMARY through the cal ceremony 1-for-1 so
-    // both units are showing consistent screens to the user.
+    if (this_unit_is_broadcast_authority()) return;   // I'm the authority; ignore
     switch (hint) {
         case ST_CAL_INTRO:
         case ST_CAL_ANCHOR_PLACE:
@@ -96,17 +122,34 @@ static void secondary_follow_primary() {
 }
 
 // ── Cal role assignment (called on entering ST_CAL_INTRO) ─────
+// v0.4: honors g_app.peer.role_override so the user can force this
+// unit to be PROBE or ANCHOR from settings if the auto-pick chose
+// wrong (e.g. both units trying to be ANCHOR).
 static void assign_cal_roles() {
-    if (g_app.peer.role == ROLE_PRIMARY   && g_app.peer.peer_present) {
-        g_app.peer.cal_role = CAL_ROLE_ANCHOR;
-        g_app.cal_mode = CAL_MODE_STEREO;
-    } else if (g_app.peer.role == ROLE_SECONDARY && g_app.peer.peer_present) {
+    // Solo fallback: no peer, no choice.
+    if (!g_app.peer.peer_present) {
+        g_app.peer.cal_role = CAL_ROLE_PROBE;
+        g_app.cal_mode = CAL_MODE_SOLO;
+        return;
+    }
+    // User override wins.
+    if (g_app.peer.role_override == RO_FORCE_PROBE) {
         g_app.peer.cal_role = CAL_ROLE_PROBE;
         g_app.cal_mode = CAL_MODE_STEREO;
-    } else {
-        g_app.peer.cal_role = CAL_ROLE_PROBE;   // solo unit acts as PROBE
-        g_app.cal_mode = CAL_MODE_SOLO;
+        return;
     }
+    if (g_app.peer.role_override == RO_FORCE_ANCHOR) {
+        g_app.peer.cal_role = CAL_ROLE_ANCHOR;
+        g_app.cal_mode = CAL_MODE_STEREO;
+        return;
+    }
+    // AUTO: lower MAC = ANCHOR (PRIMARY).
+    if (g_app.peer.role == ROLE_PRIMARY) {
+        g_app.peer.cal_role = CAL_ROLE_ANCHOR;
+    } else {
+        g_app.peer.cal_role = CAL_ROLE_PROBE;
+    }
+    g_app.cal_mode = CAL_MODE_STEREO;
 }
 
 // Are we the unit driving the wizard UI (has user's buttons)?  YES for
@@ -259,7 +302,33 @@ static void state_cal_empty_room() {
     if (p >= 1.0f) {
         csi_baseline_finalize();
         scene_cal_ack_empty_room();
-        // Begin cal on scene, begin wizard walk
+
+        // v0.4 branch A: baseline-only redo (from settings).
+        // Keep existing kernel; just refresh the empty-room reference
+        // and jump to finalize/results.
+        if (s_baseline_only_redo) {
+            s_baseline_only_redo = false;
+            s_finalize_ran = true;   // no re-finalize needed
+            enter_state(ST_CAL_RESULTS);
+            return;
+        }
+
+        // v0.4 branch B: tripwire (1 beacon) — no walk cal is possible
+        // or needed.  Beacon 1 pose is fixed at (0, +D) from the RX.
+        // Fabricate a minimal report and go straight to results.
+        if (g_app.mode == RM_TRIPWIRE_1) {
+            scene_cal_begin(g_app.cal_mode);   // opens the cal scaffolding
+            scene_cal_tripwire_finalize();     // one-shot fill-in for 1-beacon
+            s_finalize_ran = true;
+            s_report.valid = true;
+            s_report.mode = g_app.cal_mode;
+            s_report.total_kernel_samples = 0;
+            ui_cal_stash_report(s_report);
+            enter_state(ST_CAL_RESULTS);
+            return;
+        }
+
+        // Normal path: run the full walk-cal wizard.
         scene_cal_begin(g_app.cal_mode);
         wizard_begin(g_app.cal_mode);
         s_probe_last_hinted_idx = -1;
@@ -378,7 +447,7 @@ static void state_dashboard() {
 static void state_settings() {
     ui_settings(s_settings_row);
     if (wasShortPressed(BTN_LEFT)) {
-        s_settings_row = (s_settings_row + 1) % 5;
+        s_settings_row = (s_settings_row + 1) % 6;
     }
     if (wasShortPressed(BTN_RIGHT)) {
         switch (s_settings_row) {
@@ -387,25 +456,27 @@ static void state_settings() {
                 if (g_app.sensitivity > 5.0f) g_app.sensitivity = 0.2f;
                 break;
             case 1:
-                // Re-cal: reset filters + start over at empty-room capture
+                // Full re-cal: wipe kernel + baseline, walk cal again.
                 csi_reset_filters(true);
                 scene_reset();
                 scene_begin();
                 scene_derive_landmarks_from_geometry();
-                if (g_app.peer.role == ROLE_PRIMARY)
+                s_baseline_only_redo = false;
+                if (this_unit_is_broadcast_authority())
                     peer_send_command(PEER_OP_RECALIBRATE);
                 assign_cal_roles();
                 enter_state(ST_CAL_INTRO);
                 return;
             case 2:
-                // Same as re-cal for now (walk-only re-cal not supported
-                // in v0.3 — the kernel needs a fresh empty-room reference).
-                csi_reset_filters(true);
-                scene_reset();
-                scene_begin();
-                scene_derive_landmarks_from_geometry();
-                assign_cal_roles();
-                enter_state(ST_CAL_INTRO);
+                // Baseline-only re-cal (v0.4): keep kernel, only redo
+                // the empty-room reference.  Sets a flag consumed by
+                // state_cal_empty_room's finish handler which then jumps
+                // straight to CAL_RESULTS instead of the walk cal.
+                csi_reset_filters(true);   // clears baseline (not kernel)
+                s_baseline_only_redo = true;
+                if (this_unit_is_broadcast_authority())
+                    peer_send_command(PEER_OP_STATE_HINT, (uint8_t)ST_CAL_EMPTY_ROOM);
+                enter_state(ST_CAL_EMPTY_ROOM);
                 return;
             case 3:
                 g_app.mode = (RadarMode)((g_app.mode % 3) + 1);
@@ -415,6 +486,13 @@ static void state_settings() {
                 scene_reset();   // beacon positions changed — model is stale
                 break;
             case 4:
+                // v0.4: cycle cal-role override (AUTO / force PROBE / force ANCHOR)
+                g_app.peer.role_override =
+                    (RoleOverride)((g_app.peer.role_override + 1) % 3);
+                // Re-run role assignment so change takes effect for future cal.
+                assign_cal_roles();
+                break;
+            case 5:
                 enter_state(ST_DASHBOARD);
                 return;
         }
@@ -477,6 +555,7 @@ void setup() {
     g_app.peer.peer_present        = false;
     g_app.peer.primary_state_hint  = 0;
     g_app.peer.cal_role            = CAL_ROLE_NONE;
+    g_app.peer.role_override       = RO_AUTO;
     g_app.cal_mode                 = CAL_MODE_UNKNOWN;
 
     rtc_gpio_deinit((gpio_num_t)PIN_BTN_LEFT);
@@ -511,8 +590,8 @@ void loop() {
     // Peer tick — heartbeats, timeouts
     if (g_app.state != ST_SPLASH) peer_tick();
 
-    // SECONDARY follows PRIMARY through the state ceremony
-    if (g_app.peer.role == ROLE_SECONDARY) secondary_follow_primary();
+    // Both units follow peer state hints; authority check is inside.
+    follow_peer_state();
 
     // Broadcast our current state so peer can follow
     maybe_broadcast_state();
