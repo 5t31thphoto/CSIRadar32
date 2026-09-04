@@ -1,11 +1,11 @@
-#name: build
+name: build
 
 on:
   push:
-    branches: [ "**" ]
+    #branches: [ "**" ]
     tags:     [ "v*" ]
   pull_request:
-    branches: [ main ]
+    #branches: [ main ]
   workflow_dispatch:
 
 permissions:
