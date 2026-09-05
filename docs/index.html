@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MantisSec — Wi-Fi Presence Sensing</title>
+<meta name="description" content="MantisSec CSI-Radar: open-source Wi-Fi channel state presence detection for arbitrary rooms. Flash it from your browser.">
+<link rel="icon" type="image/png" href="assets/favicon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     SWAPPABLE ASSETS — edit this block to replace any placeholder
+     graphic with your own photo.  Change the path, that's it.
+     Every <img data-asset="key"> gets its src from ASSETS[key];
+     every <a data-affiliate="key"> gets its href from AFFILIATE[key].
+     ═══════════════════════════════════════════════════════════════ -->
+<script>
+const ASSETS = {
+    // Hero diagram at the top of the page
+    hero:            "assets/landing-hero.png",
+
+    // The 3-panel "how it works" strip
+    how_it_works:    "assets/how-it-works.png",
+
+    // ═══ Device screencaps (portrait, T-Display S3 native 170x320) ═══
+    // Pixel-art approximations of what the receiver shows.
+    // Replace with real captures if you want.
+    observe_splash:  "assets/screencap-splash.png",
+    observe_cal:     "assets/screencap-cal.png",
+    observe_live:    "assets/screencap-live.png",
+
+    // ═══ Installation photos ═══
+    // Stand-in pixel-art graphics live here until you swap them for
+    // real photos.  Recommended aspect: 4:3 landscape, ~800px wide.
+    photo_hardware:  "assets/photo-hardware.png",
+    photo_mounted:   "assets/photo-mounted.png",
+    photo_room:      "assets/photo-room.png",
+};
+
+const AFFILIATE = {
+    tdisplay_s3: "https://www.amazon.com/dp/B0BRTT727Z/?tag=5t31th-20",
+    xiao_c3:     "https://www.amazon.com/dp/B0DGX3LSC7/?tag=5t31th-20",
+    xiao_s3:     "https://www.amazon.com/dp/B0DJ6NQFKX/?tag=5t31th-20",
+};
+</script>
+
+<div class="page landing">
+
+    <!-- ═══ Hero ═══ -->
+    <header class="lp-hero">
+        <img data-asset="hero" alt="MantisSec system schematic" class="lp-hero-img">
+        <div class="lp-hero-copy">
+            <div class="lp-brand"><span class="brand">MantisSec</span></div>
+            <h1 class="lp-tagline">See who's in the room. Without a camera.</h1>
+            <p class="lp-lede">
+                Open-source Wi-Fi <strong>channel-state presence sensing</strong>
+                for arbitrary rooms. Three tiny beacons, two little
+                receivers, one calibration walk &mdash; a live top-down
+                map of who's moving through the space.
+            </p>
+            <div class="lp-cta-row">
+                <a class="lp-cta-primary" href="flash.html">
+                    START HERE &nbsp;&rarr;&nbsp; Flash your hardware
+                </a>
+                <a class="lp-cta-secondary" href="#hardware">
+                    don't have the hardware yet?
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <!-- ═══ What it is ═══ -->
+    <section class="panel lp-section">
+        <div class="lp-section-head">
+            <span class="lp-section-num">// what</span>
+            <h2>What it is</h2>
+        </div>
+        <div class="instructions lp-prose">
+            <p>
+                Every Wi-Fi packet carries a <strong>channel state
+                information</strong> vector &mdash; a fingerprint of
+                the multipath between two radios. Move a body through
+                the room and that fingerprint deforms in predictable
+                ways.
+            </p>
+            <p>
+                MantisSec is the whole stack for building a room-scale
+                presence sensor out of that signal. Three <strong>ESP32-C3
+                beacons</strong> transmit at a known cadence. Two
+                <strong>ESP32-S3 receivers</strong> catch the beacons,
+                extract CSI, run an inverse sensor model, and paint a
+                live top-down map on a little screen.
+            </p>
+            <p>
+                All firmware is <strong>open source</strong>. All hardware
+                is <strong>off-the-shelf</strong>. Nothing calls home.
+                Nothing sees inside your walls. It's just wi-fi doing
+                what wi-fi does &mdash; with math on top.
+            </p>
+        </div>
+    </section>
+
+    <!-- ═══ How you set it up ═══ -->
+    <section class="panel lp-section">
+        <div class="lp-section-head">
+            <span class="lp-section-num">// how</span>
+            <h2>How you set it up</h2>
+        </div>
+        <img data-asset="how_it_works"
+             alt="Three-step process: flash, place, calibrate"
+             class="lp-fullwidth-img">
+        <div class="instructions lp-prose">
+            <ol class="lp-steps">
+                <li>
+                    <strong>Flash the firmware.</strong> Plug each board
+                    into any computer with Chrome or Edge, click one
+                    button per board.
+                    <a class="lp-inline-cta" href="flash.html">
+                        &rarr; go to the web flasher
+                    </a>
+                </li>
+                <li>
+                    <strong>Place the hardware.</strong> Put the three
+                    beacons around the room in a rough triangle. Put
+                    the receiver bar in the middle. No wiring, no room
+                    modelling.
+                </li>
+                <li>
+                    <strong>Walk the calibration.</strong> The device
+                    walks you through a one-time cal walk to each
+                    beacon and back. Takes about 90 seconds.
+                </li>
+                <li>
+                    <strong>Observe.</strong> Live top-down map on the
+                    receiver screen &mdash; see who moves through the
+                    room in real time.
+                </li>
+            </ol>
+        </div>
+    </section>
+
+    <!-- ═══ What you see (portrait screencaps) ═══ -->
+    <section class="panel lp-section">
+        <div class="lp-section-head">
+            <span class="lp-section-num">// observe</span>
+            <h2>What you see</h2>
+        </div>
+        <div class="lp-screencap-row">
+            <figure class="lp-screencap">
+                <img data-asset="observe_splash" alt="Splash screen">
+                <figcaption>Boot</figcaption>
+            </figure>
+            <figure class="lp-screencap">
+                <img data-asset="observe_cal" alt="Calibration walk">
+                <figcaption>Cal walk</figcaption>
+            </figure>
+            <figure class="lp-screencap">
+                <img data-asset="observe_live" alt="Live radar view">
+                <figcaption>Live map</figcaption>
+            </figure>
+        </div>
+
+        <div class="lp-photo-row">
+            <figure>
+                <img data-asset="photo_hardware" alt="Assembled hardware">
+                <figcaption>Assembled hardware</figcaption>
+            </figure>
+            <figure>
+                <img data-asset="photo_mounted" alt="Beacon mounted">
+                <figcaption>Beacon in the wild</figcaption>
+            </figure>
+            <figure>
+                <img data-asset="photo_room" alt="Real installation">
+                <figcaption>Installed in a room</figcaption>
+            </figure>
+        </div>
+    </section>
+
+    <!-- ═══ Get the hardware ═══ -->
+    <section class="panel lp-section" id="hardware">
+        <div class="lp-section-head">
+            <span class="lp-section-num">// hardware</span>
+            <h2>Get the hardware</h2>
+        </div>
+        <div class="instructions">
+            <p class="hw-blurb">
+                These are the exact boards the firmware targets. Ordering
+                through the links below sends a small kickback our way at
+                no cost to you &mdash; it's how the project keeps going.
+            </p>
+
+            <div class="hw-item">
+                <div class="hw-name">
+                    LilyGo T-Display-S3
+                    <span class="hw-role">receiver &times; 1&ndash;2</span>
+                </div>
+                <div class="hw-detail">
+                    ESP32-S3 with a 1.9&Prime; ST7789 display. Two for
+                    full stereo mode, one for solo tripwire.
+                </div>
+                <a class="hw-link" data-affiliate="tdisplay_s3"
+                   target="_blank" rel="noopener sponsored">
+                    Buy T-Display-S3 &rarr;
+                </a>
+            </div>
+
+            <div class="hw-item">
+                <div class="hw-name">
+                    Seeed Studio XIAO ESP32-C3
+                    <span class="hw-role">beacon &times; 3</span>
+                </div>
+                <div class="hw-detail">
+                    Small, cheap, low-power. Three of these become the
+                    beacons the receivers listen to.
+                </div>
+                <a class="hw-link" data-affiliate="xiao_c3"
+                   target="_blank" rel="noopener sponsored">
+                    Buy XIAO ESP32-C3 &rarr;
+                </a>
+            </div>
+
+            <div class="hw-item">
+                <div class="hw-name">
+                    Seeed Studio XIAO ESP32-S3
+                    <span class="hw-role">beacon alternate</span>
+                </div>
+                <div class="hw-detail">
+                    Works too if you already have S3 XIAOs sitting around.
+                    C3 is the default recommendation (cheaper, lower power).
+                </div>
+                <a class="hw-link" data-affiliate="xiao_s3"
+                   target="_blank" rel="noopener sponsored">
+                    Buy XIAO ESP32-S3 &rarr;
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <!-- ═══ Secondary CTA band ═══ -->
+    <section class="lp-cta-band">
+        <div class="lp-cta-band-inner">
+            <div class="lp-cta-band-copy">
+                <h3>Hardware in hand?</h3>
+                <p>Flash it from your browser. No toolchain, no drivers.</p>
+            </div>
+            <a class="lp-cta-primary lp-cta-large" href="flash.html">
+                START HERE &nbsp;&rarr;
+            </a>
+        </div>
+    </section>
+
+    <!-- ═══ Footer ═══ -->
+    <footer class="footer">
+        <span>MantisSec &middot; CSI-Radar &middot; open firmware</span>
+    </footer>
+
+</div>
+
+<!-- Wire up ASSETS/AFFILIATE constants -->
+<script>
+(function () {
+    document.querySelectorAll("img[data-asset]").forEach(img => {
+        const key = img.getAttribute("data-asset");
+        const path = ASSETS[key];
+        if (path && path.length > 0) img.src = path;
+    });
+    document.querySelectorAll("a[data-affiliate]").forEach(a => {
+        const key = a.getAttribute("data-affiliate");
+        const url = AFFILIATE[key];
+        if (url) a.href = url;
+    });
+})();
+</script>
+
+</body>
+</html>

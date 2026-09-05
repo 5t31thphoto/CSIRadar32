@@ -456,3 +456,352 @@ picture.header-mark img {
     background: rgba(168, 255, 0, 0.08);
     box-shadow: 0 0 12px var(--ms-glow-lime);
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   Landing page — MantisSec marketing funnel
+   ═══════════════════════════════════════════════════════════════ */
+
+.page.landing {
+    max-width: 960px;
+}
+
+/* Hero */
+.lp-hero {
+    position: relative;
+    padding: 24px 0 32px;
+    margin-bottom: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    border-bottom: 1px solid var(--ms-border);
+}
+.lp-hero-img {
+    display: block;
+    width: 100%;
+    max-width: 720px;
+    margin: 0 auto;
+    image-rendering: pixelated;
+    border: 1px solid var(--ms-border);
+    border-radius: 4px;
+    background: var(--ms-bg-panel);
+}
+.lp-hero-copy {
+    text-align: center;
+    padding: 0 12px;
+}
+.lp-brand {
+    font-family: var(--ms-font-head);
+    font-size: 12px;
+    letter-spacing: 0.24em;
+    color: var(--ms-teal-lo);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+.lp-brand .brand { color: var(--ms-lime); }
+.lp-tagline {
+    font-family: var(--ms-font-head);
+    font-size: 32px;
+    font-weight: 700;
+    line-height: 1.15;
+    color: var(--ms-ink);
+    margin: 4px 0 14px;
+    letter-spacing: -0.01em;
+}
+.lp-lede {
+    color: var(--ms-ink-dim);
+    font-size: 14px;
+    line-height: 1.65;
+    max-width: 560px;
+    margin: 0 auto 22px;
+}
+.lp-lede strong {
+    color: var(--ms-teal-hi);
+    font-weight: 600;
+}
+.lp-cta-row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+}
+
+/* Primary CTA: START HERE button */
+.lp-cta-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 28px;
+    background: transparent;
+    border: 2px solid var(--ms-lime);
+    color: var(--ms-lime);
+    font-family: var(--ms-font-head);
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    text-decoration: none;
+    border-radius: 4px;
+    box-shadow: 0 0 20px rgba(168, 255, 0, 0.15),
+                inset 0 0 20px rgba(168, 255, 0, 0.03);
+    transition: all 0.18s ease;
+    position: relative;
+}
+.lp-cta-primary::before,
+.lp-cta-primary::after {
+    content: "";
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    border-color: var(--ms-lime);
+    border-style: solid;
+}
+.lp-cta-primary::before {
+    top: -4px; left: -4px;
+    border-width: 2px 0 0 2px;
+}
+.lp-cta-primary::after {
+    bottom: -4px; right: -4px;
+    border-width: 0 2px 2px 0;
+}
+.lp-cta-primary:hover {
+    background: rgba(168, 255, 0, 0.08);
+    box-shadow: 0 0 32px rgba(168, 255, 0, 0.35),
+                inset 0 0 32px rgba(168, 255, 0, 0.05);
+    transform: translateY(-1px);
+}
+.lp-cta-primary:active {
+    transform: translateY(0);
+}
+.lp-cta-large {
+    padding: 20px 36px;
+    font-size: 16px;
+}
+
+.lp-cta-secondary {
+    color: var(--ms-teal-lo);
+    text-decoration: none;
+    font-size: 12px;
+    font-family: var(--ms-font-body);
+}
+.lp-cta-secondary:hover {
+    color: var(--ms-teal-hi);
+    text-decoration: underline;
+}
+
+/* Numbered section heads */
+.lp-section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--ms-border);
+}
+.lp-section-num {
+    color: var(--ms-lime);
+    font-family: var(--ms-font-body);
+    font-size: 12px;
+    letter-spacing: 0.1em;
+}
+.lp-section-head h2 {
+    font-family: var(--ms-font-head);
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--ms-ink);
+    margin: 0;
+    letter-spacing: -0.005em;
+}
+
+/* Prose */
+.lp-prose p {
+    color: var(--ms-ink-dim);
+    line-height: 1.7;
+    font-size: 13.5px;
+    margin: 0 0 12px;
+}
+.lp-prose p:last-child { margin-bottom: 0; }
+.lp-prose strong {
+    color: var(--ms-teal-hi);
+    font-weight: 600;
+}
+
+/* Full-width diagram inside a section (how-it-works strip) */
+.lp-fullwidth-img {
+    display: block;
+    width: 100%;
+    max-width: 720px;
+    margin: 8px auto 18px;
+    image-rendering: pixelated;
+    border: 1px solid var(--ms-border);
+    border-radius: 3px;
+}
+
+/* Numbered install steps */
+.lp-steps {
+    padding-left: 0;
+    list-style: none;
+    counter-reset: step;
+    margin: 0;
+}
+.lp-steps li {
+    counter-increment: step;
+    padding: 12px 0 12px 44px;
+    position: relative;
+    border-bottom: 1px dashed var(--ms-border);
+    color: var(--ms-ink-dim);
+    font-size: 13.5px;
+    line-height: 1.65;
+}
+.lp-steps li:last-child { border-bottom: none; }
+.lp-steps li::before {
+    content: counter(step, decimal-leading-zero);
+    position: absolute;
+    left: 0;
+    top: 12px;
+    color: var(--ms-teal-lo);
+    font-family: var(--ms-font-body);
+    font-size: 14px;
+    font-weight: 600;
+}
+.lp-steps li strong {
+    color: var(--ms-ink);
+    font-weight: 600;
+}
+
+/* Screencaps — portrait, three across */
+.lp-screencap-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+    max-width: 640px;
+    margin-left: auto;
+    margin-right: auto;
+}
+.lp-screencap {
+    margin: 0;
+    text-align: center;
+}
+.lp-screencap img {
+    display: block;
+    width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+    border-radius: 3px;
+    background: var(--ms-bg-panel);
+}
+.lp-screencap figcaption {
+    margin-top: 6px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ms-teal-lo);
+}
+
+/* Installation photos — landscape, three across */
+.lp-photo-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-top: 8px;
+}
+.lp-photo-row figure {
+    margin: 0;
+    background: var(--ms-bg-elev);
+    border: 1px solid var(--ms-border);
+    border-radius: 4px;
+    overflow: hidden;
+}
+.lp-photo-row img {
+    display: block;
+    width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+}
+.lp-photo-row figcaption {
+    padding: 8px 12px;
+    font-size: 11px;
+    color: var(--ms-ink-dim);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: var(--ms-bg-panel);
+    border-top: 1px solid var(--ms-border);
+}
+
+/* Inline CTA link inside a numbered step */
+.lp-inline-cta {
+    display: inline-block;
+    margin-top: 4px;
+    color: var(--ms-lime);
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+}
+.lp-inline-cta:hover { color: var(--ms-lime-hi); text-decoration: underline; }
+
+/* Retire the old gallery classes (replaced by screencap-row + photo-row) */
+.lp-gallery, .lp-photos-note, .lp-photo-slot-hint { display: none; }
+
+
+/* Bottom CTA band */
+.lp-cta-band {
+    background:
+        linear-gradient(135deg,
+            rgba(0, 165, 165, 0.06) 0%,
+            rgba(93, 0, 93, 0.08) 100%),
+        var(--ms-bg-panel);
+    border: 1px solid var(--ms-border);
+    border-radius: 6px;
+    padding: 28px 24px;
+    margin: 32px 0 20px;
+    position: relative;
+    overflow: hidden;
+}
+.lp-cta-band::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: repeating-linear-gradient(
+        0deg,
+        transparent, transparent 3px,
+        rgba(168, 255, 0, 0.015) 3px, rgba(168, 255, 0, 0.015) 4px);
+    pointer-events: none;
+}
+.lp-cta-band-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    flex-wrap: wrap;
+    position: relative;
+    z-index: 1;
+}
+.lp-cta-band-copy h3 {
+    font-family: var(--ms-font-head);
+    font-size: 20px;
+    color: var(--ms-ink);
+    margin: 0 0 4px;
+    font-weight: 600;
+}
+.lp-cta-band-copy p {
+    color: var(--ms-ink-dim);
+    font-size: 13px;
+    margin: 0;
+}
+
+/* Mobile */
+@media (max-width: 640px) {
+    .lp-tagline { font-size: 22px; }
+    .lp-lede { font-size: 13px; }
+    .lp-cta-band-inner {
+        flex-direction: column;
+        align-items: stretch;
+        text-align: center;
+    }
+    .lp-cta-large {
+        justify-content: center;
+        padding: 16px 24px;
+        font-size: 14px;
+    }
+}
