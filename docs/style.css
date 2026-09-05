@@ -39,7 +39,11 @@ html, body {
     font-size: 14px;
     line-height: 1.55;
     min-height: 100vh;
+    overflow-x: hidden;   /* nothing on the page should scroll sideways */
 }
+
+/* Every image on the page respects its container width by default */
+img { max-width: 100%; height: auto; }
 
 /* Subtle scanline overlay for the cyber feel */
 body::before {
@@ -479,11 +483,13 @@ picture.header-mark img {
     display: block;
     width: 100%;
     max-width: 720px;
+    height: auto;
     margin: 0 auto;
     image-rendering: pixelated;
     border: 1px solid var(--ms-border);
     border-radius: 4px;
     background: var(--ms-bg-panel);
+    box-sizing: border-box;
 }
 .lp-hero-copy {
     text-align: center;
@@ -630,10 +636,12 @@ picture.header-mark img {
     display: block;
     width: 100%;
     max-width: 720px;
+    height: auto;
     margin: 8px auto 18px;
     image-rendering: pixelated;
     border: 1px solid var(--ms-border);
     border-radius: 3px;
+    box-sizing: border-box;
 }
 
 /* Numbered install steps */
@@ -668,7 +676,7 @@ picture.header-mark img {
     font-weight: 600;
 }
 
-/* Screencaps — portrait, three across */
+/* Screencaps — portrait, three across on desktop, stacked or 3-thin on mobile */
 .lp-screencap-row {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -677,15 +685,19 @@ picture.header-mark img {
     max-width: 640px;
     margin-left: auto;
     margin-right: auto;
+    width: 100%;
+    box-sizing: border-box;
 }
 .lp-screencap {
     margin: 0;
     text-align: center;
+    min-width: 0;   /* let grid children shrink */
 }
 .lp-screencap img {
     display: block;
     width: 100%;
     height: auto;
+    max-width: 100%;
     image-rendering: pixelated;
     border-radius: 3px;
     background: var(--ms-bg-panel);
@@ -698,12 +710,14 @@ picture.header-mark img {
     color: var(--ms-teal-lo);
 }
 
-/* Installation photos — landscape, three across */
+/* Installation photos — landscape, three across, wrap on mobile */
 .lp-photo-row {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
     gap: 12px;
     margin-top: 8px;
+    width: 100%;
+    box-sizing: border-box;
 }
 .lp-photo-row figure {
     margin: 0;
@@ -711,11 +725,13 @@ picture.header-mark img {
     border: 1px solid var(--ms-border);
     border-radius: 4px;
     overflow: hidden;
+    min-width: 0;
 }
 .lp-photo-row img {
     display: block;
     width: 100%;
     height: auto;
+    max-width: 100%;
     image-rendering: pixelated;
 }
 .lp-photo-row figcaption {
