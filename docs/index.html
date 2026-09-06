@@ -44,6 +44,93 @@ const AFFILIATE = {
     xiao_c3:     "https://www.amazon.com/dp/B0DGX3LSC7/?tag=5t31th-20",
     xiao_s3:     "https://www.amazon.com/dp/B0DJ6NQFKX/?tag=5t31th-20",
 };
+// 2. The Animation System (Paste this right below the maps, before the closing </script>)
+document.addEventListener("DOMContentLoaded", () => {
+    // This finds your top hero banner image automatically via its CSS class
+    const heroImg = document.querySelector('.lp-hero-img');
+    if (heroImg) {
+        attachAnimationLayer(heroImg, drawHeroLayers);
+    }
+});
+
+function attachAnimationLayer(imgElement, drawRoutine) {
+    // Creates a hidden container structural box around your image
+    const container = document.createElement('div');
+    container.style.position = 'relative';
+    container.style.display = 'block';
+    container.style.width = '100%';
+    
+    imgElement.parentNode.insertBefore(container, imgElement);
+    container.appendChild(imgElement);
+
+    // Creates a transparent drawing canvas perfectly layered on top of your image
+    const canvas = document.createElement('canvas');
+    canvas.style.position = 'absolute';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+    canvas.style.pointerEvents = 'none'; // Users can still right-click or drag the image
+    container.appendChild(canvas);
+
+    const ctx = canvas.getContext('2d');
+    
+    // Automatically recalculates canvas coordinates if the browser window changes size
+    function syncSize() {
+        canvas.width = imgElement.clientWidth;
+        canvas.height = imgElement.clientHeight;
+    }
+    
+    window.addEventListener('resize', syncSize);
+    imgElement.addEventListener('load', syncSize);
+    syncSize();
+
+    let loopFrame = 0;
+    function renderLoop() {
+        loopFrame++;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawRoutine(ctx, canvas.width, canvas.height, loopFrame);
+        requestAnimationFrame(renderLoop);
+    }
+    requestAnimationFrame(renderLoop);
+}
+
+// This contains the pixel coordinates telling the system where your artwork elements live
+function drawHeroLayers(ctx, w, h, frame) {
+    ctx.globalCompositeOperation = 'screen'; // Makes lines look like neon light glows
+
+    // --- ANIMATION 1: Beacon 1 (Top Magenta Radar Ring) ---
+    let ringCycle = (frame % 140) / 140;
+    ctx.strokeStyle = `rgba(192, 0, 224, ${1 - ringCycle})`; // Fades out as it grows
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    // w * 0.43 is the horizontal percentage marker; h * 0.08 is the vertical height marker
+    ctx.arc(w * 0.432, h * 0.075, ringCycle * (w * 0.06), 0, Math.PI * 2);
+    ctx.stroke();
+
+    // --- ANIMATION 2: Traveling Signal Particle ---
+    let t = (frame % 180) / 180; // Reset movement loops smoothly
+    let startX = w * 0.432, startY = h * 0.075; // Beacon 1 location
+    let midX   = w * 0.612, midY   = h * 0.222; // Human target location
+    let endX   = w * 0.322, endY   = h * 0.328; // Receiver bar location
+
+    let currentX, currentY;
+    if (t < 0.5) {
+        let nT = t * 2;
+        currentX = startX + (midX - startX) * nT;
+        currentY = startY + (midY - startY) * nT;
+    } else {
+        let nT = (t - 0.5) * 2;
+        currentX = midX + (endX - midX) * nT;
+        currentY = midY + (endY - midY) * nT;
+    }
+
+    // Renders the bright lime signal particle moving along the path lines
+    ctx.fillStyle = '#A8FF00';
+    ctx.beginPath();
+    ctx.arc(currentX, currentY, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+}     
 </script>
 
 <div class="page landing">
