@@ -103,28 +103,28 @@ function initInteractiveOverlay(imgElement) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 3. PHYSICS PROCESSING ENGINE — Multipath Phase Distortions
+// 3. PHYSICS PROCESSING ENGINE — Multipath Phase Distortions (NEW PERSPECTIVE)
 // ═══════════════════════════════════════════════════════════════
 function drawHeroLayers(ctx, w, h, frame) {
     ctx.globalCompositeOperation = 'screen';
     
-    // Precise layout anchors tracked from your original schematic drawing
-    const rxX = w * 0.322, rxY = h * 0.328;       // Receivers (RX1/RX2)
-    const humanX = w * 0.612, humanY = h * 0.222; // Human target position
+    // Coordinates updated to track perfectly with your new image layout perspective
+    const rxX = w * 0.355, rxY = h * 0.690;       // Receivers (RX1/RX2 at the bottom-left layout cluster)
+    const humanX = w * 0.612, humanY = h * 0.445; // Human target position (Center hallway vector)
     
     const beacons = [
-        { x: w * 0.432, y: h * 0.075, color: 'rgba(255, 0, 255, ' },  // Beacon 1 (Magenta)
-        { x: w * 0.902, y: h * 0.118, color: 'rgba(160, 32, 240, ' }, // Beacon 2 (Purple)
-        { x: w * 0.880, y: h * 0.380, color: 'rgba(160, 32, 240, ' }  // Beacon 3 (Purple)
+        { x: w * 0.438, y: h * 0.115, color: 'rgba(255, 0, 255, ' },  // Beacon 1 (Top Center Magenta)
+        { x: w * 0.902, y: h * 0.178, color: 'rgba(160, 32, 240, ' }, // Beacon 2 (Far Right Top Purple)
+        { x: w * 0.875, y: h * 0.855, color: 'rgba(160, 32, 240, ' }  // Beacon 3 (Far Right Bottom Purple)
     ];
 
     // A. OMNIDIRECTIONAL FLOOD: Beacons radiating wide telemetry waves across the entire room
     beacons.forEach((beacon, index) => {
-        let waveCycle = ((frame + (index * 40)) % 140) / 140;
-        ctx.strokeStyle = `${beacon.color}${0.35 * (1 - waveCycle)})`;
+        let waveCycle = ((frame + (index * 45)) % 150) / 150;
+        ctx.strokeStyle = `${beacon.color}${0.32 * (1 - waveCycle)})`;
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.arc(beacon.x, beacon.y, waveCycle * (w * 0.35), 0, Math.PI * 2);
+        ctx.arc(beacon.x, beacon.y, waveCycle * (w * 0.38), 0, Math.PI * 2);
         ctx.stroke();
     });
 
@@ -138,12 +138,12 @@ function drawHeroLayers(ctx, w, h, frame) {
         ctx.lineTo(rxX, rxY);
         ctx.stroke();
 
-        // Perturbed Scatter Path flowing directly through the human coordinates
+        // Perturbed Scatter Path flowing directly through the new human coordinates
         ctx.strokeStyle = 'rgba(168, 255, 0, 0.35)'; // Phase perturbation line (--ms-lime)
         ctx.lineWidth = 1.2;
         ctx.beginPath();
         
-        let segments = 40;
+        let segments = 45;
         for (let i = 0; i <= segments; i++) {
             let percent = i / segments;
             let currX, currY;
@@ -159,8 +159,8 @@ function drawHeroLayers(ctx, w, h, frame) {
             }
             
             // Generate active sine wave distortion centered exactly over human body profile
-            let proximityToHuman = Math.max(0, 1 - (Math.abs(percent - 0.5) * 3.5)); 
-            let phaseDistortion = Math.sin(percent * 24 - (frame * 0.14)) * (5 * proximityToHuman);
+            let proximityToHuman = Math.max(0, 1 - (Math.abs(percent - 0.5) * 3.2)); 
+            let phaseDistortion = Math.sin(percent * 22 - (frame * 0.13)) * (4.5 * proximityToHuman);
             
             if (i === 0) ctx.moveTo(currX, currY + phaseDistortion);
             else ctx.lineTo(currX, currY + phaseDistortion);
@@ -169,19 +169,19 @@ function drawHeroLayers(ctx, w, h, frame) {
     });
 
     // C. PERTURBATION HALO: Active target footprint signature bloom
-    let glowRipple = Math.sin(frame * 0.05) * 3;
-    ctx.fillStyle = 'rgba(168, 255, 0, 0.06)'; // Soft luminous tracking layer
+    let glowRipple = Math.sin(frame * 0.05) * 2.5;
+    ctx.fillStyle = 'rgba(168, 255, 0, 0.05)'; // Soft luminous tracking layer
     ctx.beginPath();
-    ctx.arc(humanX, humanY, 15 + glowRipple, 0, Math.PI * 2);
+    ctx.arc(humanX, humanY, 14 + glowRipple, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.strokeStyle = 'rgba(168, 255, 0, 0.25)';
+    ctx.strokeStyle = 'rgba(168, 255, 0, 0.22)';
     ctx.lineWidth = 0.5;
     ctx.beginPath();
-    ctx.arc(humanX, humanY, 22 - glowRipple, 0, Math.PI * 2);
+    ctx.arc(humanX, humanY, 20 - glowRipple, 0, Math.PI * 2);
     ctx.stroke();
 }
-     
+
 </script>
 
 <div class="page landing">
