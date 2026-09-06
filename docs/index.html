@@ -218,13 +218,13 @@ function drawHeroLayers(ctx, w, h, frame) {
         <div class="instructions lp-prose">
             <p>
                 Every Wi-Fi packet carries a <strong>channel state
-                information</strong> vector &mdash; a fingerprint of
+                information</strong> vector, a fingerprint of
                 the multipath between two radios. Move a body through
                 the room and that fingerprint deforms in predictable
                 ways.
             </p>
             <p>
-                MantisSec is the whole stack for building a room-scale
+                MantisSec CSI Radar32 is the whole stack for building a room-scale
                 presence sensor out of that signal. Three <strong>ESP32-C3
                 beacons</strong> transmit at a known cadence. Two
                 <strong>ESP32-S3 receivers</strong> catch the beacons,
@@ -235,7 +235,7 @@ function drawHeroLayers(ctx, w, h, frame) {
                 All firmware is <strong>open source</strong>. All hardware
                 is <strong>off-the-shelf</strong>. Nothing calls home.
                 Nothing sees inside your walls. It's just wi-fi doing
-                what wi-fi does &mdash; with math on top.
+                what wi-fi does and we treat it like a light source.
             </p>
         </div>
     </section>
@@ -256,14 +256,14 @@ function drawHeroLayers(ctx, w, h, frame) {
                     into any computer with Chrome or Edge, click one
                     button per board.
                     <a class="lp-inline-cta" href="flash.html">
-                        &rarr; go to the web flasher
+                        &rarr; go to our WEB FLASHER
                     </a>
                 </li>
                 <li>
                     <strong>Place the hardware.</strong> Put the three
                     beacons around the room in a rough triangle. Put
-                    the receiver bar in the middle. No wiring, no room
-                    modelling.
+                    the receivers in the middle. No wiring, no added
+                    hassle.
                 </li>
                 <li>
                     <strong>Walk the calibration.</strong> The device
@@ -273,7 +273,8 @@ function drawHeroLayers(ctx, w, h, frame) {
                 <li>
                     <strong>Observe.</strong> Live top-down map on the
                     receiver screen &mdash; see who moves through the
-                    room in real time.
+                    room in real time. Two displays and stereo sensing
+                    if you have two t-display boards.
                 </li>
             </ol>
         </div>
@@ -391,7 +392,7 @@ function drawHeroLayers(ctx, w, h, frame) {
 
     <!-- ═══ Footer ═══ -->
     <footer class="footer">
-        <span>MantisSec &middot; CSI-Radar &middot; open firmware</span>
+        <span>MantisSec &middot; CSI Radar32 &middot; custom open firmware</span>
     </footer>
 
 </div>
