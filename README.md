@@ -5,7 +5,7 @@ Two receivers, three beacons, a calibration walk, and a live top-down
 map of who's in the room.
 
 please start here: https://5t31thphoto.github.io/CSIRadar32/
-
+Please get your hardware from my affiliate links on that site too!
 ## What it is
 
 An **empirical inverse sensor model**, 
