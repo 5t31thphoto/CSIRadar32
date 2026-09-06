@@ -44,93 +44,144 @@ const AFFILIATE = {
     xiao_c3:     "https://www.amazon.com/dp/B0DGX3LSC7/?tag=5t31th-20",
     xiao_s3:     "https://www.amazon.com/dp/B0DJ6NQFKX/?tag=5t31th-20",
 };
-// 2. The Animation System (Paste this right below the maps, before the closing </script>)
+     
+// ═══════════════════════════════════════════════════════════════
+// 2. THE ANIMATION SYSTEM — Automated Layer Injection
+// ═══════════════════════════════════════════════════════════════
 document.addEventListener("DOMContentLoaded", () => {
-    // This finds your top hero banner image automatically via its CSS class
+    // This automatically finds your top hero banner image via its template class
     const heroImg = document.querySelector('.lp-hero-img');
     if (heroImg) {
-        attachAnimationLayer(heroImg, drawHeroLayers);
+        initInteractiveOverlay(heroImg);
     }
 });
 
-function attachAnimationLayer(imgElement, drawRoutine) {
-    // Creates a hidden container structural box around your image
+function initInteractiveOverlay(imgElement) {
+    // 1. Create a structural block container to protect responsive margins
     const container = document.createElement('div');
     container.style.position = 'relative';
-    container.style.display = 'block';
+    container.style.display = 'inline-block';
     container.style.width = '100%';
     
+    // 2. Inject container safely around the static image element
     imgElement.parentNode.insertBefore(container, imgElement);
     container.appendChild(imgElement);
 
-    // Creates a transparent drawing canvas perfectly layered on top of your image
+    // 3. Mount the transparent hardware acceleration drawing overlay
     const canvas = document.createElement('canvas');
     canvas.style.position = 'absolute';
     canvas.style.top = '0';
     canvas.style.left = '0';
     canvas.style.width = '100%';
     canvas.style.height = '100%';
-    canvas.style.pointerEvents = 'none'; // Users can still right-click or drag the image
+    canvas.style.pointerEvents = 'none'; // Passthrough so users can right-click/drag image
     container.appendChild(canvas);
 
     const ctx = canvas.getContext('2d');
     
-    // Automatically recalculates canvas coordinates if the browser window changes size
-    function syncSize() {
+    // 4. Force coordinates to auto-recalculate when windows scale or resize
+    function synchronizeBounds() {
         canvas.width = imgElement.clientWidth;
         canvas.height = imgElement.clientHeight;
     }
-    
-    window.addEventListener('resize', syncSize);
-    imgElement.addEventListener('load', syncSize);
-    syncSize();
+    window.addEventListener('resize', synchronizeBounds);
+    imgElement.addEventListener('load', synchronizeBounds);
+    synchronizeBounds();
 
-    let loopFrame = 0;
-    function renderLoop() {
-        loopFrame++;
+    // 5. The core real-time rendering loop
+    let renderingFrame = 0;
+    function animationEngine() {
+        renderingFrame++;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        drawRoutine(ctx, canvas.width, canvas.height, loopFrame);
-        requestAnimationFrame(renderLoop);
+        
+        // Pass context tracking directly to our physics engine
+        drawHeroLayers(ctx, canvas.width, canvas.height, renderingFrame);
+        
+        requestAnimationFrame(animationEngine);
     }
-    requestAnimationFrame(renderLoop);
+    requestAnimationFrame(animationEngine);
 }
 
-// This contains the pixel coordinates telling the system where your artwork elements live
+// ═══════════════════════════════════════════════════════════════
+// 3. PHYSICS PROCESSING ENGINE — Multipath Phase Distortions
+// ═══════════════════════════════════════════════════════════════
 function drawHeroLayers(ctx, w, h, frame) {
-    ctx.globalCompositeOperation = 'screen'; // Makes lines look like neon light glows
+    ctx.globalCompositeOperation = 'screen';
+    
+    // Precise layout anchors tracked from your original schematic drawing
+    const rxX = w * 0.322, rxY = h * 0.328;       // Receivers (RX1/RX2)
+    const humanX = w * 0.612, humanY = h * 0.222; // Human target position
+    
+    const beacons = [
+        { x: w * 0.432, y: h * 0.075, color: 'rgba(255, 0, 255, ' },  // Beacon 1 (Magenta)
+        { x: w * 0.902, y: h * 0.118, color: 'rgba(160, 32, 240, ' }, // Beacon 2 (Purple)
+        { x: w * 0.880, y: h * 0.380, color: 'rgba(160, 32, 240, ' }  // Beacon 3 (Purple)
+    ];
 
-    // --- ANIMATION 1: Beacon 1 (Top Magenta Radar Ring) ---
-    let ringCycle = (frame % 140) / 140;
-    ctx.strokeStyle = `rgba(192, 0, 224, ${1 - ringCycle})`; // Fades out as it grows
-    ctx.lineWidth = 1.5;
+    // A. OMNIDIRECTIONAL FLOOD: Beacons radiating wide telemetry waves across the entire room
+    beacons.forEach((beacon, index) => {
+        let waveCycle = ((frame + (index * 40)) % 140) / 140;
+        ctx.strokeStyle = `${beacon.color}${0.35 * (1 - waveCycle)})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(beacon.x, beacon.y, waveCycle * (w * 0.35), 0, Math.PI * 2);
+        ctx.stroke();
+    });
+
+    // B. MULTIPATH CHANNELS: Linear tracking direct lines + human-scattered waves
+    beacons.forEach(beacon => {
+        // Direct Baseline static path
+        ctx.strokeStyle = 'rgba(0, 165, 165, 0.12)'; 
+        ctx.lineWidth = 0.75;
+        ctx.beginPath();
+        ctx.moveTo(beacon.x, beacon.y);
+        ctx.lineTo(rxX, rxY);
+        ctx.stroke();
+
+        // Perturbed Scatter Path flowing directly through the human coordinates
+        ctx.strokeStyle = 'rgba(168, 255, 0, 0.35)'; // Phase perturbation line (--ms-lime)
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        
+        let segments = 40;
+        for (let i = 0; i <= segments; i++) {
+            let percent = i / segments;
+            let currX, currY;
+            
+            if (percent < 0.5) {
+                let t = percent * 2;
+                currX = beacon.x + (humanX - beacon.x) * t;
+                currY = beacon.y + (humanY - beacon.y) * t;
+            } else {
+                let t = (percent - 0.5) * 2;
+                currX = humanX + (rxX - humanX) * t;
+                currY = humanY + (rxY - humanY) * t;
+            }
+            
+            // Generate active sine wave distortion centered exactly over human body profile
+            let proximityToHuman = Math.max(0, 1 - (Math.abs(percent - 0.5) * 3.5)); 
+            let phaseDistortion = Math.sin(percent * 24 - (frame * 0.14)) * (5 * proximityToHuman);
+            
+            if (i === 0) ctx.moveTo(currX, currY + phaseDistortion);
+            else ctx.lineTo(currX, currY + phaseDistortion);
+        }
+        ctx.stroke();
+    });
+
+    // C. PERTURBATION HALO: Active target footprint signature bloom
+    let glowRipple = Math.sin(frame * 0.05) * 3;
+    ctx.fillStyle = 'rgba(168, 255, 0, 0.06)'; // Soft luminous tracking layer
     ctx.beginPath();
-    // w * 0.43 is the horizontal percentage marker; h * 0.08 is the vertical height marker
-    ctx.arc(w * 0.432, h * 0.075, ringCycle * (w * 0.06), 0, Math.PI * 2);
-    ctx.stroke();
-
-    // --- ANIMATION 2: Traveling Signal Particle ---
-    let t = (frame % 180) / 180; // Reset movement loops smoothly
-    let startX = w * 0.432, startY = h * 0.075; // Beacon 1 location
-    let midX   = w * 0.612, midY   = h * 0.222; // Human target location
-    let endX   = w * 0.322, endY   = h * 0.328; // Receiver bar location
-
-    let currentX, currentY;
-    if (t < 0.5) {
-        let nT = t * 2;
-        currentX = startX + (midX - startX) * nT;
-        currentY = startY + (midY - startY) * nT;
-    } else {
-        let nT = (t - 0.5) * 2;
-        currentX = midX + (endX - midX) * nT;
-        currentY = midY + (endY - midY) * nT;
-    }
-
-    // Renders the bright lime signal particle moving along the path lines
-    ctx.fillStyle = '#A8FF00';
-    ctx.beginPath();
-    ctx.arc(currentX, currentY, 3.5, 0, Math.PI * 2);
+    ctx.arc(humanX, humanY, 15 + glowRipple, 0, Math.PI * 2);
     ctx.fill();
-}     
+
+    ctx.strokeStyle = 'rgba(168, 255, 0, 0.25)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.arc(humanX, humanY, 22 - glowRipple, 0, Math.PI * 2);
+    ctx.stroke();
+}
+     
 </script>
 
 <div class="page landing">
