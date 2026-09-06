@@ -4,12 +4,11 @@ Wi-Fi CSI **scene reconstruction** engine for the LilyGo T-Display-S3.
 Two receivers, three beacons, a calibration walk, and a live top-down
 map of who's in the room.
 
-
+please start here: https://5t31thphoto.github.io/CSIRadar32/
 
 ## What it is
 
-An **empirical inverse sensor model**, replacing the pursuit-plus-EMA-
-tracker architecture that persisted from v0.3 through v0.5.
+An **empirical inverse sensor model**, 
 
 The scene contains K unknown persons at positions p₁..p_K, each with a
 per-target strength α_k that absorbs body-size / posture variation. The
