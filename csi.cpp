@@ -593,23 +593,42 @@ void csi_beacon_enforce_rate() {
     if (now - last_check < BEACON_RATE_RECHECK_MS) return;
     last_check = now;
 
+    const int want = BEACON_REQUEST_RATE_HZ;
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active || b.cfg_pending) continue;      // already being worked
 
-        // Trust a recent PONG over inferred inter-arrival: observed rate
-        // can sit below the commanded one for reasons re-commanding
-        // cannot fix (delivery loss), and chasing that is what produced
-        // the permanent "off-rate" loop in the field log.
-        if (b.reported_rate_hz == (uint16_t)BEACON_REQUEST_RATE_HZ &&
-            (now - b.last_pong_ms) < 30000) continue;
+        // RE-COMMAND ONLY IF THE BEACON LOOKS LIKE IT RESET.
+        //
+        // The previous test was "reported == want AND the PONG is fresh".
+        // PONGs only arrive when we ping, and we only ping while
+        // re-arming -- so 30 s after a successful confirmation the PONG
+        // went stale, this decided the beacon was unconfirmed, re-armed,
+        // got a PONG, confirmed "after 0 tries", and 30 s later did it
+        // again.  A permanent cycle that the field log shows exactly:
+        // "confirmed 30Hz after 0 tries" / "unconfirmed - re-arming".
+        //
+        // Worse, every re-command re-anchors the beacon's transmit slot,
+        // so the spam was itself disturbing the cadence it was trying to
+        // police.
+        //
+        // What actually matters is whether the beacon fell back to its
+        // STOCK default -- that is the only failure re-commanding fixes.
+        // Anything near the commanded rate is obeying; a shortfall is
+        // delivery loss, and no amount of re-commanding cures that.
+        if (b.inter_arrival_ms_ema <= 0.5f) continue;   // no estimate yet
+        const int observed = (int)(1000.0f / b.inter_arrival_ms_ema + 0.5f);
+        const int stock    = (int)SAMPLE_RATE_HZ;
+        const int midpoint = (want + stock) / 2;
+        if (observed < midpoint) continue;              // obeying; leave it alone
 
-        // Genuinely unconfirmed: hand it back to the closed loop rather
-        // than transmitting from here.
+        // Genuinely back at (or near) its boot rate: it rebooted or never
+        // heard us.  Hand it to the closed loop.
         b.cfg_pending     = true;
         b.cfg_attempts    = 0;
         b.cfg_last_try_ms = 0;
-        MSLOG("[csi] b%u unconfirmed - re-arming config\n", (unsigned)b.id);
+        MSLOG("[csi] b%u at %dHz (stock) - re-commanding\n",
+              (unsigned)b.id, observed);
     }
 #endif
 }
@@ -728,8 +747,20 @@ void csi_reset_filters(bool hard) {
         b.last_cal_frame = b.frames;    // "no new frames yet" for accumulator
         b.status = LS_IDLE;
         // Zero phase accumulators so a fresh baseline pass has a clean sum.
+        //
+        // This loop was EMPTY.  cal_phase_i/q are circular accumulators
+        // that only ever get +=, and they feed phase_baseline, which
+        // feeds the stereo line fit, which feeds AoA.  They are zeroed
+        // when a beacon is first discovered, so a cold boot was fine --
+        // but "redo full cal" and "baseline only" both land here, so
+        // every RE-calibration summed the new baseline on top of the old
+        // one and the bearing reference was quietly wrong afterwards.
         for (int sc = 0; sc < CSI_NUM_SUBCARRIERS; sc++) {
+            b.cal_phase_i[sc]   = 0.0f;
+            b.cal_phase_q[sc]   = 0.0f;
+            b.phase_baseline[sc] = 0.0f;
         }
+        b.phase_baseline_valid = false;
         if (hard) {
             b.baseline_valid = false;
             b.walk_calibrated = false;

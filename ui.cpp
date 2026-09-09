@@ -30,7 +30,6 @@ static constexpr uint16_t COL_MUTED     = COL_MS_MID;
 static constexpr uint16_t COL_TEXT      = COL_MS_INK;
 
 // ── Helpers ─────────────────────────────────────────────────────
-static uint16_t beacon_color(int idx);
 static LovyanGFX &gfx() {
     return g_canvas_ok ? (LovyanGFX&)g_canvas : (LovyanGFX&)g_lcd;
 }
@@ -1191,7 +1190,24 @@ static void draw_view_tripwire() {
     auto &g = gfx();
 
     // Determine composite state
+    // v0.9 — WHOSE tripwire is this?
+    //
+    // In TW_REMOTE the tripwire is the beacon <-> ANCHOR link, because
+    // the anchor is the unit that stays put and therefore the only one
+    // whose link geometry means anything.  The probe is a remote display
+    // for it.  Previously the probe evaluated its OWN link, so carrying
+    // it around tripped its own wire constantly.
+    const bool mirroring = (g_app.tripwire_mode == TW_REMOTE)
+                        && (g_app.peer.cal_role == CAL_ROLE_PROBE)
+                        && g_app.peer.peer_present;
+
     bool any_motion = false, any_presence = false;
+    if (mirroring) {
+        if (peer_tripwire_fresh()) {
+            any_motion   = (g_app.tw_remote_status == LS_MOTION);
+            any_presence = (g_app.tw_remote_status == LS_PRESENCE);
+        }
+    } else
     for (int i = 0; i < MAX_BEACONS; i++) {
         if (!g_app.beacon[i].active) continue;
         if (g_app.beacon[i].status == LS_MOTION)   any_motion = true;
@@ -1232,10 +1248,30 @@ static void draw_view_tripwire() {
     // beacons landed at x=180 and 220 on a 170 px panel -- off-screen.
     // It also spaced by SLOT, so beacons in slots 0/2/4 drew with gaps.
     // Pack by active order and divide the width by the count.
+    // Source line: never leave the user guessing which link tripped.
+    g.setFont(&fonts::Font2);
+    if (mirroring) {
+        bool fresh = peer_tripwire_fresh();
+        g.setTextColor(fresh ? COL_MS_TEAL : COL_ALERT, COL_BG);
+        g.setCursor(6, CONTENT_Y + 148);
+        if (fresh) {
+            char l[32];
+            snprintf(l, sizeof(l), "anchor link B%u", (unsigned)g_app.tw_remote_beacon);
+            g.print(l);
+        } else {
+            g.print("anchor link LOST");
+        }
+    } else if (g_app.peer.peer_present) {
+        g.setTextColor(COL_MUTED, COL_BG);
+        g.setCursor(6, CONTENT_Y + 148);
+        g.print("this unit's link");
+    }
+
     int y = CONTENT_Y + 170;
     g.setFont(&fonts::Font2);
     int n_act = 0;
     for (int i = 0; i < MAX_BEACONS; i++) if (g_app.beacon[i].active) n_act++;
+    if (mirroring) n_act = 0;    // local dots mean nothing when mirroring
     if (n_act > 0) {
         int step = (SCREEN_W - 24) / n_act;
         if (step > 40) step = 40;
@@ -1526,6 +1562,9 @@ void ui_settings(int selected_row) {
     const char *ro_names[] = {"AUTO", "PROBE", "ANCHOR"};
     snprintf(values[4], 24, "%s", ro_names[g_app.peer.role_override]);
     strcpy(values[5], "");
+    labels[UI_SETTINGS_ROW_TRIPWIRE] = "Tripwire";
+    snprintf(values[UI_SETTINGS_ROW_TRIPWIRE], 24, "%s",
+             g_app.tripwire_mode == TW_REMOTE ? "anchor link" : "both units");
     labels[UI_SETTINGS_ROW_DEBUG] = "Debug log";
     snprintf(values[UI_SETTINGS_ROW_DEBUG], 24, "%d", ms_log_count());
     if (rows > UI_SETTINGS_ROW_UNDOCK) {
@@ -2193,6 +2232,86 @@ static uint16_t beacon_color(int idx) {
 // Draw a small map (radar mini-view) into a rect showing beacon
 // triangle + RX + a highlighted landmark position.  Used inside
 // ui_cal_landmark_walk to help the user visualize where to walk.
+// ═══════════════════════════════════════════════════════════════
+//  v0.9 — ROTATION COMPASS
+// ═══════════════════════════════════════════════════════════════
+// theta for the Fourier fit is inferred from ELAPSED TIME, assuming a
+// uniform 10 s turn.  People hesitate and overshoot, and that error goes
+// straight into the a1/b1 phase -- the very thing the rotation exists to
+// measure.  Rather than tolerate the slop, give the user a pace to
+// match: if they track the green needle, theta(t) is correct by
+// construction.
+//
+// BODY FRAME.  The script has them face B1, so B1 starts straight ahead
+// (needle up).  Turning right swings B1 to their left, so the needle
+// runs anticlockwise on screen -- what they would see if they held a
+// compass pointed at the beacon.
+//
+//   GREEN = where B1 should be, at a perfectly uniform turn rate.
+//   RED   = where the radio says their body actually is, from the
+//           angular centroid of per-beacon attenuation: the body blocks
+//           the links behind it, so that vector rotates with them.
+//           Same math the exterior bearing estimator uses.
+static void draw_rotation_compass(int cx, int cy, int R,
+                                  uint32_t elapsed_ms, uint32_t hold_ms) {
+    auto &g = gfx();
+
+    g.drawCircle(cx, cy, R,      COL_MS_DIM);
+    g.drawCircle(cx, cy, R - 6,  COL_MS_DIM);
+    // Tick every 45 deg so progress is readable at a glance.
+    for (int t = 0; t < 8; t++) {
+        float a = t * (float)M_PI / 4.0f;
+        int x0 = cx + (int)((R - 6) * sinf(a)), y0 = cy - (int)((R - 6) * cosf(a));
+        int x1 = cx + (int)(R       * sinf(a)), y1 = cy - (int)(R       * cosf(a));
+        g.drawLine(x0, y0, x1, y1, COL_MS_DIM);
+    }
+
+    // ── expected (green) ──
+    float frac = (hold_ms > 0) ? (float)elapsed_ms / (float)hold_ms : 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    float want = -frac * 2.0f * (float)M_PI;          // anticlockwise
+    int wx = cx + (int)((R - 10) * sinf(want));
+    int wy = cy - (int)((R - 10) * cosf(want));
+    g.drawLine(cx, cy, wx, wy, COL_MS_LIME);
+    g.fillCircle(wx, wy, 5, COL_MS_LIME);
+
+    // ── measured (red) ──
+    // Angular centroid of attenuation across beacons, in the ROOM frame,
+    // then rotated into the body frame by the start heading.
+    float sx = 0, sy = 0; int nb = 0;
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        const BeaconState &b = g_app.beacon[i];
+        if (!b.active) continue;
+        float bx, by;
+        scene_landmark_pos((LandmarkId)(LM_BEACON_1 + i), &bx, &by);
+        float th = atan2f(by, bx);
+        float w  = b.link_metric_ema;                 // 0..1, higher = more perturbed
+        if (w < 0) w = 0;
+        sx += w * cosf(th); sy += w * sinf(th); nb++;
+    }
+    if (nb > 0 && (sx * sx + sy * sy) > 1e-6f) {
+        // B1's room bearing is the zero of the body frame.
+        float b1x, b1y; scene_landmark_pos(LM_BEACON_1, &b1x, &b1y);
+        float ref  = atan2f(b1y, b1x);
+        float meas = atan2f(sy, sx) - ref;
+        int mx = cx + (int)((R - 18) * sinf(-meas));
+        int my = cy - (int)((R - 18) * cosf(-meas));
+        g.drawLine(cx, cy, mx, my, COL_MS_ALERT);
+        g.fillCircle(mx, my, 4, COL_MS_ALERT);
+    }
+
+    g.fillCircle(cx, cy, 3, COL_MS_INK);
+
+    // Legend, because two needles with no key is worse than one needle.
+    g.setFont(&fonts::Font0);
+    g.setTextColor(COL_MS_LIME, COL_BG);
+    g.setCursor(cx - R, cy + R + 4);
+    g.print("green=pace");
+    g.setTextColor(COL_MS_ALERT, COL_BG);
+    g.setCursor(cx + 6, cy + R + 4);
+    g.print("red=you");
+}
+
 // Top-down room map for the cal walk.
 //
 // v0.9: beacons were unlabelled 2 px dots, so a step saying "walk to B3"
@@ -2556,12 +2675,24 @@ void ui_cal_landmark_walk() {
     }
     int map_y = CONTENT_Y + 154;
     int map_h = 96;
-    // v0.9: labels need vertical room; the map was sized for bare dots.
-    draw_mini_landmark_map(4, map_y, SCREEN_W - 8,
-                           map_h < 110 ? 110 : map_h, highlight, next);
+    WizardPhase phase = wizard_current_phase();
+
+    // On a ROTATE step the room map is useless -- the user is standing
+    // still and the only thing that matters is their turn RATE.  Show
+    // the compass instead, so they have something to pace against.
+    if (step->kind == STEP_ROTATE && phase == WP_CAPTURE) {
+        int mh = (map_h < 110 ? 110 : map_h);
+        int R  = (mh / 2) - 16;
+        if (R > (SCREEN_W / 2) - 14) R = (SCREEN_W / 2) - 14;
+        draw_rotation_compass(SCREEN_W / 2, map_y + mh / 2, R,
+                              wizard_step_elapsed_ms(), step->hold_ms);
+    } else {
+        // v0.9: labels need vertical room; the map was sized for bare dots.
+        draw_mini_landmark_map(4, map_y, SCREEN_W - 8,
+                               map_h < 110 ? 110 : map_h, highlight, next);
+    }
 
     // Timer / status line right above footer — driven by wizard phase.
-    WizardPhase phase = wizard_current_phase();
     uint32_t hold_rem = wizard_hold_remaining_ms();
     uint32_t elapsed  = wizard_step_elapsed_ms();
     char tbuf[24];
@@ -2667,6 +2798,53 @@ static CalReport s_last_report = {};
 void ui_cal_stash_report(const CalReport &r) { s_last_report = r; }
 
 void ui_cal_results() {
+    // TRIPWIRE HAS NO WALK, SO IT HAS NO KERNEL.
+    //
+    // Grading it against cross-validation, loop closure and ambiguity --
+    // all structurally zero -- printed a wall of 0.000 and a MARGINAL
+    // verdict for a calibration that had in fact completed correctly.
+    // Tripwire only needs the empty-room baseline, so report THAT.
+    if (g_app.mode == RM_TRIPWIRE_1) {
+        clear();
+        draw_header("CAL RESULT");
+        auto &g = gfx();
+        const CalReport &r = s_last_report;
+
+        g.setFont(&fonts::Font4);
+        g.setTextColor(COL_MS_LIME, COL_BG);
+        const char *v = "BASELINE OK";
+        int vw = g.textWidth(v);
+        g.setCursor((SCREEN_W - vw) / 2, CONTENT_Y + 24);
+        g.print(v);
+
+        g.setFont(&fonts::Font2);
+        draw_multiline(8, CONTENT_Y + 60, 16, COL_MS_INK,
+            "Tripwire mode.\n"
+            "\n"
+            "One beacon, one\n"
+            "link. No room\n"
+            "walk is needed\n"
+            "or possible.\n"
+            "\n"
+            "The empty-room\n"
+            "reference is\n"
+            "captured.");
+
+        char line[40];
+        int n_act = 0;
+        for (int i = 0; i < MAX_BEACONS; i++) if (g_app.beacon[i].active) n_act++;
+        snprintf(line, sizeof(line), "beacons: %d   mode: %s",
+                 n_act, r.mode == CAL_MODE_SOLO ? "solo" : "stereo");
+        g.setTextColor(COL_MUTED, COL_BG);
+        g.setCursor(8, SCREEN_H - FOOTER_H - 20);
+        g.print(line);
+
+        draw_footer("redo", "accept");
+        flush();
+        return;
+    }
+
+
     clear();
     draw_header("CAL RESULT");
     auto &g = gfx();

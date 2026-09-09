@@ -84,6 +84,40 @@ void ms_log_clear();
 #define MS_CSI_SEQLOCK      1   // callback publishes raw I/Q, core 1 decodes
 #define MS_PEER_WIRE        1   // wired UART peer transport
 
+// ── Stereo tripwire topology ──────────────────────────────────
+// With one beacon and two receivers there are two sensible wirings, and
+// they are genuinely different instruments:
+//
+//   TW_REMOTE (default) — the tripwire is the beacon <-> ANCHOR link.
+//     The anchor is the one that stays put, so it is the one whose link
+//     geometry is fixed and meaningful.  The PROBE is a remote display
+//     and remote control for it: it shows the ANCHOR's alert, not a
+//     second one of its own.  Walking around with the probe does not
+//     create phantom trips.
+//
+//   TW_DUAL — two independent tripwires watching the same beacon.  Each
+//     receiver reports its own link.  Useful for covering two lines at
+//     once, or for comparing a fixed link against a hand-held one.
+//
+// Previously only the second behaviour existed, implicitly: each unit
+// evaluated its own beacon link and the probe showed its own trip,
+// which is wrong when the probe is in your hand and moving.
+enum TripwireMode : uint8_t {
+    TW_REMOTE = 0,   // probe mirrors the anchor's link
+    TW_DUAL   = 1,   // both receivers run their own
+};
+
+// Anchor -> probe tripwire state, sent only in TW_REMOTE.
+#define PEER_TRIPWIRE_MAGIC     0xC5B0741FUL
+struct PeerTripwirePacket {
+    uint32_t magic;
+    uint8_t  status;        // LinkStatus of the anchor's strongest link
+    uint8_t  beacon_id;
+    uint16_t metric_pct;    // 0..100, for the bar
+    uint32_t stamp_ms;
+};
+#define PEER_TRIPWIRE_STALE_MS  1200
+
 // ── PSRAM probe result ────────────────────────────────────────
 // PSRAM is enabled in the build but deliberately UNUSED (the canvas
 // stays in internal DRAM).  This is a safe experiment: if it initializes
