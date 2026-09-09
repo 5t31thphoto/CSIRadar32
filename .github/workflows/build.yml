@@ -95,10 +95,29 @@ jobs:
             fi
           fi
 
-          # Refuse to let a zip overwrite git internals or this workflow's
-          # own history.  .github IS allowed through so workflow updates
-          # can ship in the drop.
+          # Never let a zip overwrite git internals.
           rm -rf "$SRC/.git"
+
+          # GITHUB_TOKEN CANNOT create or update files under
+          # .github/workflows -- GitHub blocks it at the push, and there is
+          # no `workflows` scope that can be added to the permissions block
+          # to allow it.  Only a PAT with `workflow` scope can.  So the
+          # overlay skips them; anything else in .github still applies.
+          #
+          # This is NOT silent: if the zip carries workflow changes they are
+          # reported here so they can be applied by hand.  A dropped-in
+          # workflow change that vanished without a word would be worse than
+          # the failed push.
+          if [ -d "$SRC/.github/workflows" ]; then
+            if ! diff -rq "$SRC/.github/workflows" ".github/workflows" >/dev/null 2>&1; then
+              echo "::warning::Zip contains workflow changes. They were NOT applied -- GITHUB_TOKEN cannot update .github/workflows. Apply that directory manually."
+              echo "--- workflow differences (not applied) ---"
+              diff -rq "$SRC/.github/workflows" ".github/workflows" || true
+            else
+              echo "workflow files identical - nothing to apply"
+            fi
+            rm -rf "$SRC/.github/workflows"
+          fi
 
           echo "applying $(find "$SRC" -type f | wc -l) files"
           # -a preserves modes and copies dotfiles; trailing /. means
