@@ -55,9 +55,10 @@ void ui_csi_next_beacon();
 // v0.8: the row count is dynamic — the probe gains an undock row once
 // it has a usable kernel.  The state machine must use these rather than
 // a hardcoded 6 when wrapping the selection.
-#define UI_SETTINGS_MAX_ROWS      8
-#define UI_SETTINGS_ROW_DEBUG     6   // always present
-#define UI_SETTINGS_ROW_UNDOCK    7   // probe only, once a kernel exists
+#define UI_SETTINGS_MAX_ROWS      9
+#define UI_SETTINGS_ROW_TRIPWIRE  6   // stereo tripwire wiring
+#define UI_SETTINGS_ROW_DEBUG     7   // always present
+#define UI_SETTINGS_ROW_UNDOCK    8   // probe only, once a kernel exists
 bool ui_settings_undock_row_visible();
 int  ui_settings_row_count();
 void ui_settings(int selected_row);

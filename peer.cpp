@@ -329,6 +329,23 @@ void peer_send_probe_position(const PeerProbePositionPacket &pkt) {
     peer_deliver(&pkt, sizeof(pkt));
 }
 
+// v0.9: anchor -> probe tripwire mirror.  Only sent in TW_REMOTE, and
+// only by the anchor, whose link is the one with fixed geometry.
+void peer_send_tripwire(uint8_t status, uint8_t beacon_id, uint16_t pct) {
+    PeerTripwirePacket p = {};
+    p.magic      = PEER_TRIPWIRE_MAGIC;
+    p.status     = status;
+    p.beacon_id  = beacon_id;
+    p.metric_pct = pct;
+    p.stamp_ms   = millis();
+    peer_deliver(&p, sizeof(p));
+}
+
+bool peer_tripwire_fresh() {
+    return g_app.tw_remote_ms != 0 &&
+           (millis() - g_app.tw_remote_ms) < PEER_TRIPWIRE_STALE_MS;
+}
+
 void peer_send_track_state(const PeerTrackStatePacket &pkt) {
     peer_deliver(&pkt, sizeof(pkt));
 }
