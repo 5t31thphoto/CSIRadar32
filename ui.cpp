@@ -30,6 +30,7 @@ static constexpr uint16_t COL_MUTED     = COL_MS_MID;
 static constexpr uint16_t COL_TEXT      = COL_MS_INK;
 
 // ── Helpers ─────────────────────────────────────────────────────
+static uint16_t beacon_color(int idx);
 static LovyanGFX &gfx() {
     return g_canvas_ok ? (LovyanGFX&)g_canvas : (LovyanGFX&)g_lcd;
 }
