@@ -6,7 +6,7 @@
 #include "wizard.h"
 #include "scene.h"
 #include <math.h>
-
+#include "peer.h"
 // ── Display globals ─────────────────────────────────────────────
 static LGFX_TDisplayS3 g_lcd;
 static LGFX_Sprite     g_canvas(&g_lcd);
