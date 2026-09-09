@@ -269,7 +269,15 @@ jobs:
       - name: Set beacon id ${{ matrix.id }} in a working copy
         run: |
           set -euo pipefail
-          SRC="${{ env.BEACON_SKETCH }}"
+          # BEACON_SKETCH is the sketch DIRECTORY (arduino-cli takes a dir).
+          # The file to patch is the .ino inside it -- resolve it rather
+          # than assuming the Arduino same-name convention holds.
+          DIR="${{ env.BEACON_SKETCH }}"
+          SRC=$(ls "$DIR"/*.ino 2>/dev/null | head -1)
+          if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
+            echo "::error::no .ino found in $DIR"; exit 1
+          fi
+          echo "patching $SRC"
           python3 - "$SRC" "${{ matrix.id }}" <<'PY'
           import re, sys
           path, want = sys.argv[1], int(sys.argv[2])
