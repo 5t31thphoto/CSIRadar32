@@ -191,14 +191,11 @@ static void apply_command(const BeaconCommand &c, const uint8_t src[6]) {
             uint16_t hz = c.arg_u16;
             if (hz < 1)   hz = 1;
             if (hz > 200) hz = 200;
-            const uint32_t new_period_us = 1000000UL / hz;
-            const bool rate_changed = (new_period_us != s_tx_period_us)
-                                   || !s_precise_timing;
             s_tx_period_ms = 1000 / hz;
             if (s_tx_period_ms == 0) s_tx_period_ms = 1;
             // Exact microsecond period: 1000000/30 = 33333 us is a true
             // 30.000 Hz, where 1000/30 = 33 ms is 30.30 Hz.
-            s_tx_period_us   = new_period_us;
+            s_tx_period_us   = 1000000UL / hz;
             s_precise_timing = true;       // commanded => precise from now on
 
             // ── SLOT ANCHORING ──────────────────────────────────────
@@ -216,14 +213,7 @@ static void apply_command(const BeaconCommand &c, const uint8_t src[6]) {
             // Relative crystal drift (~20 ppm) moves neighbours by about
             // 1.2 ms per minute against a 5.6 ms slot, and the receiver
             // re-commands periodically, which re-anchors everyone.
-            // Re-anchor the slot ONLY when the rate actually changed.
-            // A repeated SET_RATE at the same rate used to reset the
-            // transmit deadline every time, so a receiver that
-            // re-commanded periodically was continuously nudging the
-            // cadence it was trying to hold steady.
-            if (!rate_changed) {
-                Serial.println("[BEACON] SET_RATE same rate - slot kept");
-            } else {
+            {
                 uint32_t slot = s_tx_period_us / BEACON_MAX_SLOTS;
                 uint32_t mine = (beacon_id >= 1 && beacon_id <= BEACON_MAX_SLOTS)
                               ? (uint32_t)(beacon_id - 1) : 0;

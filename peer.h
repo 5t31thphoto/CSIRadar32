@@ -46,10 +46,7 @@ void peer_send_cal_observation(const PeerCalObservation &pkt);  // PROBE→ANCHO
 
 // ── v0.8: probe undock mode ───────────────────────────────────
 void peer_send_probe_position(const PeerProbePositionPacket &pkt);  // PROBE→ANCHOR ~10 Hz
-void peer_send_track_state(const PeerTrackStatePacket &pkt);
-// v0.9: anchor mirrors its tripwire link to the probe (TW_REMOTE only).
-void peer_send_tripwire(uint8_t status, uint8_t beacon_id, uint16_t pct);
-bool peer_tripwire_fresh();        // ANCHOR→PROBE ~5 Hz
+void peer_send_track_state(const PeerTrackStatePacket &pkt);        // ANCHOR→PROBE ~5 Hz
 
 // ANCHOR side.  True while the probe has told us it is undocked AND is
 // still sending fresh position fixes.  Both conditions matter: a probe

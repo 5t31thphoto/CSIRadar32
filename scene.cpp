@@ -508,7 +508,7 @@ void scene_begin_rotate_capture(LandmarkId at) {
 // specified buffer + index range — buffer is always ANCHOR (that's
 // what runtime will see); PROBE data is used elsewhere for
 // parameterization / validation, not for the kernel itself.
-static bool write_kernel_sample_from_range(const CapFrame *buf,
+static void write_kernel_sample_from_range(const CapFrame *buf,
                                            int start, int end,
                                            float pos_x, float pos_y,
                                            uint8_t lm_id,
@@ -525,9 +525,9 @@ static bool write_kernel_sample_from_range(const CapFrame *buf,
                           "are being DISCARDED. Raise KERNEL_MAX_SAMPLES.\n",
                           KERNEL_MAX_SAMPLES);
         }
-        return false;   // caller must not assume a sample exists
+        return;
     }
-    if (end <= start) return false;
+    if (end <= start) return;
 
     KernelSample &s = s_kernel[s_kernel_count];
     memset(&s, 0, sizeof(s));
@@ -589,7 +589,6 @@ static bool write_kernel_sample_from_range(const CapFrame *buf,
         }
     }
     s_kernel_count++;
-    return true;
 }
 
 void scene_end_landmark_capture() {
@@ -884,16 +883,9 @@ void scene_end_rotate_capture() {
         // v0.4 behavior (write one representative sample, no aspect model).
         MSLOG("[scene] ROTATE too few frames (%d) — no Fourier fit\n",
                       s_cap_anchor_len);
-        // If the kernel is FULL this writes nothing, and the code below
-    // would then decorate the PREVIOUS landmark with this rotation's
-    // Fourier/aspect data -- silently corrupting a good sample.
-    if (!write_kernel_sample_from_range(s_cap_anchor, 0, s_cap_anchor_len,
+        write_kernel_sample_from_range(s_cap_anchor, 0, s_cap_anchor_len,
                                         px, py, (uint8_t)s_cap_landmark_a,
-                                        0xFF, 0xFF, 0)) {
-        MSLOGLN("[scene] kernel FULL - rotation discarded, not merged");
-        cap_reset();
-        return;
-    }
+                                        0xFF, 0xFF, 0);
         if (g_app.peer.cal_role == CAL_ROLE_ANCHOR) peer_send_command(PEER_OP_CAL_END);
         cap_reset();
         return;
@@ -930,17 +922,6 @@ void scene_end_rotate_capture() {
                              s_cap_anchor_len, coeff, &aspect_var, &fit_std);
         // Store into the just-written kernel sample
         for (int k = 0; k < 5; k++) ks.b[b].fourier[k] = coeff[k];
-        // Anchor the phase: the walk script now has the user face B1
-        // before every rotation, so turn angle 0 corresponds to this
-        // known room-frame bearing.  Storing it makes the harmonics
-        // comparable across landmarks, which is the whole point of
-        // capturing them.
-        {
-            float b1x, b1y;
-            scene_landmark_pos(LM_BEACON_1, &b1x, &b1y);
-            ks.b[b].rot_start_heading = atan2f(b1y - ks.pos[1],
-                                               b1x - ks.pos[0]);
-        }
         // aspect_var is Parseval energy of non-DC harmonics + a term
         // for residual variance NOT captured by the 5-term fit
         ks.b[b].aspect_var = aspect_var + fit_std * fit_std;
@@ -2262,19 +2243,7 @@ static void exterior_update(const ObsVec &obs,
     }
     // If the interior solve fully explained this frame, there is nothing
     // left over to be outside.
-    // DO NOT bail just because a birth succeeded.
-    //
-    // `interior_explained` means "the last birth attempt added an
-    // interior target" -- NOT "this observation is fully accounted for".
-    // A frame can hold an interior person AND someone outside the
-    // calibrated ring at the same time, and this returned early on
-    // exactly those frames, throwing the exterior away.  That defeats
-    // the point of the regime: unexplained residual is supposed to
-    // become a bearing rather than vanish.
-    //
-    // The residual computed below is the correct test, and it already
-    // accounts for whatever the interior fit explained.
-    (void)interior_explained_it;
+    if (interior_explained_it) return;
 
     float bearing, conc, rms;
     if (!exterior_sector(obs, targets, K, &bearing, &conc, &rms)) return;
@@ -2494,30 +2463,13 @@ void scene_update() {
             nt.active = true;
             nt.id = s_next_track_id++;
             if (s_next_track_id == 0) s_next_track_id = 1;
-            // SEED THE POSITION.  nt = {} zeroes pos, so the velocity
-            // update below would compute (detected - origin)/dt on the
-            // very first frame: a target detected at (0.6, 0.4) with
-            // dt = 40 ms is handed 15 units/s of entirely fictitious
-            // velocity, which then PREDICTS the track forward before the
-            // next fit and lingers through the EMA.
-            nt.pos[0] = targets[k].pos[0];
-            nt.pos[1] = targets[k].pos[1];
-            nt.vel[0] = 0.0f;
-            nt.vel[1] = 0.0f;
-            nt.is_new = true;          // skip the delta this frame
         }
         TargetTrack &tr = s_tracks[tidx];
-        // Velocity update: raw position delta / dt, EMA'd.  A newborn has
-        // no previous position to difference against, so it starts at
-        // rest and begins accumulating velocity on its SECOND frame.
-        if (tr.is_new) {
-            tr.is_new = false;
-        } else {
-            float new_vx = (targets[k].pos[0] - tr.pos[0]) / dt_s;
-            float new_vy = (targets[k].pos[1] - tr.pos[1]) / dt_s;
-            tr.vel[0] = 0.7f * tr.vel[0] + 0.3f * new_vx;
-            tr.vel[1] = 0.7f * tr.vel[1] + 0.3f * new_vy;
-        }
+        // Velocity update: raw position delta / dt, EMA'd
+        float new_vx = (targets[k].pos[0] - tr.pos[0]) / dt_s;
+        float new_vy = (targets[k].pos[1] - tr.pos[1]) / dt_s;
+        tr.vel[0] = 0.7f * tr.vel[0] + 0.3f * new_vx;
+        tr.vel[1] = 0.7f * tr.vel[1] + 0.3f * new_vy;
         tr.pos[0] = targets[k].pos[0];
         tr.pos[1] = targets[k].pos[1];
         // Posterior covariance from Fisher info at MAP

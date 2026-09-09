@@ -56,6 +56,10 @@ static int s_settings_row = 0;
 // most recent step.
 static int  s_probe_last_hinted_idx = -1;
 static bool s_finalize_ran = false;
+// Cache for the finalize report so ui_cal_results can render it.
+// Tracks if the empty room calibration phase has begun
+static bool s_empty_started = false; 
+
 
 // v0.4: baseline-only redo — set by settings row 2.  When true, the
 // next ST_CAL_EMPTY_ROOM completion skips the walk-cal wizard and
@@ -231,12 +235,7 @@ static void state_splash() {
     // screen is the only place the version and identity are shown, and
     // it is short.  No button reaches it now, so no edge, real or
     // spurious, can cut it short.
-    // Same duration every time.  Waking from deep sleep used to get a
-    // 900 ms splash, which is the "it skips itself after wake but not on
-    // a fresh boot" report -- it was not a button at all, it was this
-    // shortcut.  The splash is where the version and identity live; a
-    // wake is exactly when you want to see them.
-    const uint32_t splash_timeout = 4000;
+    const uint32_t splash_timeout = g_app.woke_from_deep_sleep ? 900 : 4000;
     if (state_age_ms() > splash_timeout) {
         g_app.woke_from_deep_sleep = false;
         csi_engine_begin();
@@ -434,7 +433,7 @@ static void state_cal_anchor_place() {
 
 // Empty-room step state: whether the user has pressed START from
 // outside the room (stereo) or the countdown has expired (solo).
-static bool     s_empty_started  = false;
+;
 static uint32_t s_empty_start_ms = 0;
 
 static void state_cal_empty_room() {
@@ -843,13 +842,6 @@ static void state_settings() {
             case 5:
                 enter_state(ST_DASHBOARD);
                 return;
-            case UI_SETTINGS_ROW_TRIPWIRE:
-                g_app.tripwire_mode =
-                    (g_app.tripwire_mode == TW_REMOTE) ? TW_DUAL : TW_REMOTE;
-                MSLOG("[ui] tripwire mode = %s\n",
-                      g_app.tripwire_mode == TW_REMOTE ? "anchor link"
-                                                       : "both units");
-                break;
             case UI_SETTINGS_ROW_DEBUG:
                 s_debug_scroll = 0;
                 enter_state(ST_DEBUG_LOG);
@@ -967,29 +959,6 @@ void loop() {
         // rates, and the command itself is extra ESP-NOW airtime during
         // the measurement we are trying to make.  Anything off-rate gets
         // corrected as soon as cal finishes.
-        // v0.9: in TW_REMOTE the ANCHOR owns the tripwire and mirrors it
-        // to the probe, so the probe shows the fixed link rather than a
-        // second one that trips whenever the user moves.
-        if (g_app.tripwire_mode == TW_REMOTE
-            && g_app.peer.cal_role == CAL_ROLE_ANCHOR
-            && !is_cal_state(g_app.state)) {
-            static uint32_t last_tw = 0;
-            if (millis() - last_tw > 125) {
-                last_tw = millis();
-                uint8_t st = LS_IDLE, bid = 0; uint16_t pct = 0;
-                for (int i = 0; i < MAX_BEACONS; i++) {
-                    const BeaconState &b = g_app.beacon[i];
-                    if (!b.active) continue;
-                    if (b.status >= st) {           // strongest wins
-                        st = b.status; bid = b.id;
-                        float m = b.link_metric_ema * 100.0f;
-                        pct = (uint16_t)(m < 0 ? 0 : (m > 100 ? 100 : m));
-                    }
-                }
-                peer_send_tripwire(st, bid, pct);
-            }
-        }
-
         if (g_app.beacon_count > 0 && !is_cal_state(g_app.state)) {
             csi_beacon_service();        // retries only unconfirmed beacons
             csi_beacon_enforce_rate();   // periodic re-verify

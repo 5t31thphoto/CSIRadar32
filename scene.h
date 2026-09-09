@@ -66,12 +66,6 @@ struct KernelSample {
         // v0.5 uses aspect_var (which is essentially the sum of squared
         // non-DC coefficients) but stores the coefficients for v0.6.
         float fourier[5];             // [a0, a1, b1, a2, b2]
-        // Absolute room-frame heading the rotation STARTED from, i.e.
-        // the bearing from this landmark to B1.  Without it the Fourier
-        // phase is measured from an arbitrary pose and cannot be
-        // compared between landmarks -- which is why these coefficients
-        // sat unused.  alpha_room = start_heading + turn_angle.
-        float rot_start_heading;
 
         // Local Jacobian from adjacent transit slices (populated at
         // landmarks that had an incoming or outgoing transit; zero'd
@@ -103,7 +97,6 @@ struct OccupancyField {
 // ── Target track (temporally linked detection) ─────────────────
 struct TargetTrack {
     bool     active;
-    bool     is_new;      // first frame: no previous pos to difference
     uint8_t  id;                      // stable ID (for trail color)
     float    pos[2];                  // normalized coords
     float    vel[2];
