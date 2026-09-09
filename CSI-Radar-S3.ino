@@ -56,6 +56,12 @@ static int s_settings_row = 0;
 // most recent step.
 static int  s_probe_last_hinted_idx = -1;
 static bool s_finalize_ran = false;
+// Cache for the finalize report so ui_cal_results can render it.
+static CalReport s_report = {};
+
+// Tracks if the empty room calibration phase has begun
+static bool s_empty_started = false; 
+
 
 // v0.4: baseline-only redo — set by settings row 2.  When true, the
 // next ST_CAL_EMPTY_ROOM completion skips the walk-cal wizard and
