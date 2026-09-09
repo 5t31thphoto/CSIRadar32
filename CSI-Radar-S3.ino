@@ -433,7 +433,7 @@ static void state_cal_anchor_place() {
 
 // Empty-room step state: whether the user has pressed START from
 // outside the room (stereo) or the countdown has expired (solo).
-static bool     s_empty_started  = false;
+;
 static uint32_t s_empty_start_ms = 0;
 
 static void state_cal_empty_room() {
