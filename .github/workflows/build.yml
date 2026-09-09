@@ -24,13 +24,136 @@ env:
   BEACON_SKETCH: CSI-Beacon-Extended
 
 jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  #  apply-drop — "drop a zip in the root and commit" updater
+  # ═══════════════════════════════════════════════════════════════
+  #  Put any *.zip in the repo root and push.  This job unpacks it
+  #  OVER the working tree, commits the result, removes the zip, and
+  #  hands the new commit SHA to the build jobs so they compile the
+  #  updated source in the SAME run.
+  #
+  #  Overlay semantics, deliberately:
+  #    - files in the zip overwrite files in the repo
+  #    - files/folders only in the zip are added
+  #    - files NOT in the zip are left completely alone
+  #  Nothing is ever deleted.  A partial zip is a safe patch.
+  #
+  #  If there is no zip in the root this job does nothing and simply
+  #  passes through the triggering SHA, so normal pushes behave
+  #  exactly as they did before.
+  #
+  #  No infinite loop: pushes made with GITHUB_TOKEN do not trigger
+  #  another workflow run.
+  apply-drop:
+    name: Apply dropped zip (if any)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.result.outputs.sha }}
+      applied: ${{ steps.result.outputs.applied }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Look for a dropped zip
+        id: find
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "none found"
+            echo "zip=" >> "$GITHUB_OUTPUT"
+          elif [ ${#zips[@]} -gt 1 ]; then
+            echo "::error::More than one .zip in the repo root: ${zips[*]}"
+            echo "::error::Leave exactly one so it is unambiguous which to apply."
+            exit 1
+          else
+            echo "found: ${zips[0]}"
+            echo "zip=${zips[0]}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Unpack over the working tree
+        if: steps.find.outputs.zip != ''
+        run: |
+          set -euo pipefail
+          ZIP="${{ steps.find.outputs.zip }}"
+          TMP=$(mktemp -d)
+          unzip -q "$ZIP" -d "$TMP/x"
+
+          # Zips exported from a folder usually have a single wrapper
+          # directory (CSIRadar32-main/).  Use its CONTENTS, not the
+          # folder itself, or everything lands one level too deep.
+          SRC="$TMP/x"
+          if [ "$(ls -A "$SRC" | wc -l)" -eq 1 ]; then
+            only="$(ls -A "$SRC")"
+            if [ -d "$SRC/$only" ]; then
+              echo "unwrapping top-level folder: $only/"
+              SRC="$SRC/$only"
+            fi
+          fi
+
+          # Refuse to let a zip overwrite git internals or this workflow's
+          # own history.  .github IS allowed through so workflow updates
+          # can ship in the drop.
+          rm -rf "$SRC/.git"
+
+          echo "applying $(find "$SRC" -type f | wc -l) files"
+          # -a preserves modes and copies dotfiles; trailing /. means
+          # "contents of", so this overlays instead of nesting.
+          cp -a "$SRC"/. .
+
+          rm -f "$ZIP"
+          echo "removed $ZIP so it does not re-apply next push"
+
+      - name: Commit the result
+        id: result
+        run: |
+          set -euo pipefail
+          if [ -z "${{ steps.find.outputs.zip }}" ]; then
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "zip contents identical to repo; nothing to commit"
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -q -m "Apply ${{ steps.find.outputs.zip }} [drop-in]"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+          NEW=$(git rev-parse HEAD)
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+          echo "sha=${NEW}"   >> "$GITHUB_OUTPUT"
+          echo "committed ${NEW}"
+
+      - name: Summary
+        run: |
+          echo "### Drop-in updater" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.result.outputs.applied }}" = "true" ]; then
+            echo "Applied \`${{ steps.find.outputs.zip }}\` and committed \`${{ steps.result.outputs.sha }}\`." >> $GITHUB_STEP_SUMMARY
+            echo "Build jobs below compile that commit." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No zip found. Normal build of \`${{ steps.result.outputs.sha }}\`." >> $GITHUB_STEP_SUMMARY
+          fi
   build-receiver:
     name: Build receiver (T-Display-S3)
+    needs: apply-drop
     runs-on: ubuntu-latest
     outputs:
       short_sha: ${{ steps.sha.outputs.short_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Build the commit apply-drop produced, so a zip dropped
+          # in this push is compiled in this same run.
+          ref: ${{ needs.apply-drop.outputs.sha }}
       - uses: arduino/setup-arduino-cli@v2
       - name: Install ESP32 core
         run: |
@@ -53,11 +176,34 @@ jobs:
             done
           fi
           ls CSI-Radar-S3/
+      # T-Display-S3 is an ESP32-S3R8: QIO flash + OPI PSRAM.  That pairing
+      # is the reason PSRAM init fails here.  Nearly every S3 board
+      # definition assumes flash and PSRAM share a bus width -- both quad or
+      # both octal -- and this board does not.  PSRAM=opi with an octal
+      # flash mode fails; PSRAM=enabled (quad) with QIO flash fails.  It has
+      # to be exactly PSRAM=opi + FlashMode=qio.
+      #
+      # FlashSize is deliberately NOT set: it regenerates the partition
+      # table, the current build boots, and flash size is irrelevant to
+      # PSRAM init.  Merge offsets below are fixed and use --flash_size
+      # keep, so board options flow through without touching them.
+      #
+      # NOTHING in the firmware depends on PSRAM.  The framebuffer stays in
+      # internal DRAM on purpose.  This flag exists so setup() can report
+      # whether PSRAM actually initializes -- a fact, from the device,
+      # instead of a guess.  A failed init logs and continues; it is not
+      # fatal.
+      # CDCOnBoot=cdc: belt and braces.  MS_SERIAL_LOG is 0 so the
+      # firmware emits nothing on UART0 anyway, but GPIO43/44 are
+      # U0TXD/U0RXD and also the peer-link pins -- if anyone ever flips
+      # MS_SERIAL_LOG on for bench work, this keeps the console on USB
+      # instead of letting it collide with the wire.
       - name: Compile
         run: |
           mkdir -p build/rx
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32s3 \
+            --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashMode=qio,CDCOnBoot=cdc \
+            --build-property "compiler.optimization_flags=-O2" \
             --output-dir build/rx \
             "${{ env.RX_SKETCH }}"
       - name: Merge into single .bin
@@ -80,11 +226,12 @@ jobs:
 
   build-beacon:
     name: Build beacon ${{ matrix.chip }} id ${{ matrix.id }}
+    needs: apply-drop
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        id:   [1, 2, 3]
+        id:   [1, 2, 3, 4, 5, 6]
         chip: [c3, s3]
         include:
           - chip: c3
@@ -95,6 +242,10 @@ jobs:
             fqbn: esp32:esp32:XIAO_ESP32S3
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Build the commit apply-drop produced, so a zip dropped
+          # in this push is compiled in this same run.
+          ref: ${{ needs.apply-drop.outputs.sha }}
       - uses: arduino/setup-arduino-cli@v2
       - name: Install ESP32 core
         run: |
@@ -102,13 +253,48 @@ jobs:
           arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install ${{ env.ESP32_CORE }}
+      # Set the beacon ID the same way it was being set by hand: edit the
+      # one initializer in the sketch, then compile.
+      #
+      # The previous approach passed -DBEACON_ID_DEFAULT as a build flag,
+      # but the sketch never references that macro -- so the flag bound to
+      # nothing, every per-ID build produced an identical binary, and every
+      # flashed board came up as id 1 with MAC 1A:00:00:00:00:01.  Because
+      # slot_for_mac() keys on the MAC, the receiver then collapsed all of
+      # them into ONE beacon slot: the symptom was "recognizes them all as
+      # id 1 and only connects to one at a time".
+      #
+      # This patches a WORKING COPY.  The committed firmware still reads
+      # `= 1`, so a local Arduino build is unchanged.
+      - name: Set beacon id ${{ matrix.id }} in a working copy
+        run: |
+          set -euo pipefail
+          SRC="${{ env.BEACON_SKETCH }}"
+          python3 - "$SRC" "${{ matrix.id }}" <<'PY'
+          import re, sys
+          path, want = sys.argv[1], int(sys.argv[2])
+          src = open(path).read()
+          pat = re.compile(r'^(\s*static\s+uint8_t\s+beacon_id\s*=\s*)(\d+)(\s*;)', re.M)
+          new, n = pat.subn(lambda m: f"{m.group(1)}{want}{m.group(3)}", src)
+          if n != 1:
+              sys.exit(f"FATAL: expected exactly 1 beacon_id initializer, found {n}. "
+                       "The sketch changed shape -- fix this step rather than "
+                       "shipping identical binaries for every id.")
+          open(path, 'w').write(new)
+          print(f"beacon_id set to {want}")
+          PY
+          # Verify the edit actually landed. The old failure was SILENT --
+          # never let that happen again.
+          grep -qE "static +uint8_t +beacon_id +=[[:space:]]*${{ matrix.id }};" "$SRC" \
+            || { echo "::error::beacon_id patch did not take"; exit 1; }
+          grep -nE "static +uint8_t +beacon_id" "$SRC"
+
       - name: Compile beacon (id=${{ matrix.id }}, chip=${{ matrix.chip }})
         run: |
           mkdir -p build/beacon
           arduino-cli compile \
             --fqbn ${{ matrix.fqbn }} \
             --output-dir build/beacon \
-            --build-property "build.extra_flags=-DBEACON_ID_DEFAULT=${{ matrix.id }}" \
             "${{ env.BEACON_SKETCH }}"
       - name: Merge into single .bin
         run: |
@@ -131,12 +317,18 @@ jobs:
 
   build-pages:
     name: Assemble web flasher
-    needs: [build-receiver, build-beacon]
+    needs: [apply-drop, build-receiver, build-beacon]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # commits the fresh bins back into docs/bins
     outputs:
       short_sha: ${{ needs.build-receiver.outputs.short_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Build the commit apply-drop produced, so a zip dropped
+          # in this push is compiled in this same run.
+          ref: ${{ needs.apply-drop.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: receiver-merged
@@ -171,6 +363,10 @@ jobs:
           set -e
           mkdir -p site
           cp -r docs/. site/
+          # docs/bins is intentionally NOT in the repo: binaries are build
+          # artifacts, and committed copies were stale ones from the build
+          # that never applied the beacon ID.  This directory is created
+          # here and filled from the artifacts below.
           mkdir -p site/bins
           cp dl/receiver/csi-radar-s3-merged.bin site/bins/
           cp dl/beacons/csi-beacon-*-merged.bin site/bins/
@@ -178,9 +374,55 @@ jobs:
           python3 .ci/make_qr.py "https://5t31thphoto.github.io/CSIRadar32/" site/qr.svg
           SHORT_SHA="${{ needs.build-receiver.outputs.short_sha }}"
           BUILD_DATE=$(date -u +%Y-%m-%d)
-          sed -i "s|{{SHORT_SHA}}|${SHORT_SHA}|g" site/index.html
-          sed -i "s|{{BUILD_DATE}}|${BUILD_DATE}|g" site/index.html
+          # The templated page is flash.html.  It USED to be index.html,
+          # and when it was renamed these two lines were not updated, so
+          # every build has been substituting a file with no tokens in it
+          # while the flasher footer renders the literal {{SHORT_SHA}}.
+          # Substitute both, so it keeps working if tokens are ever added
+          # to the landing page too.
+          for page in site/flash.html site/index.html; do
+            sed -i "s|{{SHORT_SHA}}|${SHORT_SHA}|g" "$page"
+            sed -i "s|{{BUILD_DATE}}|${BUILD_DATE}|g" "$page"
+          done
           touch site/.nojekyll
+      # Publish the freshly built binaries back into docs/bins so the repo
+      # always carries flashable firmware that MATCHES its source.  The
+      # deployed site already gets them via site/bins; this makes opening
+      # docs/flash.html straight off a local clone work too.
+      #
+      # Only on the default branch, and only when the bytes actually
+      # changed -- a source-only push rebuilds byte-identical binaries and
+      # produces no commit, so history does not grow for nothing.  Each
+      # real firmware change is ~13 MB across 13 binaries.
+      #
+      # Pushes made with GITHUB_TOKEN do not trigger another workflow run,
+      # so this cannot loop.
+      - name: Commit fresh bins into docs/bins
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          set -euo pipefail
+          BR="${GITHUB_REF_NAME}"
+          git fetch --depth=1 origin "$BR"
+          git checkout -B "$BR" "origin/$BR"
+
+          mkdir -p docs/bins
+          cp dl/receiver/csi-radar-s3-merged.bin docs/bins/
+          cp dl/beacons/csi-beacon-*-merged.bin  docs/bins/
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A docs/bins
+
+          if git diff --cached --quiet; then
+            echo "bins unchanged - nothing to commit"
+            exit 0
+          fi
+          COUNT=$(ls -1 docs/bins/*.bin | wc -l)
+          git commit -q -m "ci: publish ${COUNT} firmware binaries [skip ci]"
+          git push origin "HEAD:${BR}"
+          echo "committed ${COUNT} binaries"
+          ls -l docs/bins
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
