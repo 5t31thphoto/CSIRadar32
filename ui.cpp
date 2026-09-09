@@ -29,6 +29,7 @@ static constexpr uint16_t COL_ALERT     = COL_MS_ALERT;
 static constexpr uint16_t COL_MUTED     = COL_MS_MID;
 static constexpr uint16_t COL_TEXT      = COL_MS_INK;
 
+static uint16_t beacon_color(int idx);
 // ── Helpers ─────────────────────────────────────────────────────
 static LovyanGFX &gfx() {
     return g_canvas_ok ? (LovyanGFX&)g_canvas : (LovyanGFX&)g_lcd;
