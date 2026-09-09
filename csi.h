@@ -37,19 +37,6 @@ void csi_choose_mode(RadarMode m);
 // For 1 beacon: at (0, side_cm/2), T-Display at origin.
 void csi_assign_default_geometry(float side_cm);
 
-// ── v0.9: beacon control ─────────────────────────────────────
-// The extended beacon firmware has always accepted these; nothing ever
-// sent them.  target_id 0 addresses every beacon.
-void csi_beacon_command(uint8_t target_id, uint8_t op,
-                        uint16_t arg_u16 = 0, uint32_t arg_u32 = 0);
-void csi_beacon_ping_all();                 // request PONGs (fw_marker, rate)
-void csi_beacon_set_rate_all(uint16_t hz);  // set TX rate on every beacon
-void csi_beacon_apply_run_config();         // ping + set rate + set sleep
-// Periodically verify beacons are still on the requested rate and
-// re-command any that are not.  Call from the main loop.
-void csi_beacon_enforce_rate();
-bool csi_beacon_try_consume_pong(const uint8_t *data, int len);
-
 // Reset filter chain / calibration state for all beacons (retain baseline
 // if `hard` is false; wipe everything if true).
 void csi_reset_filters(bool hard);
@@ -66,11 +53,7 @@ void csi_walk_accumulate();
 void csi_walk_finalize();
 
 // Progress helpers (0..1) for UI progress bars.
-float csi_baseline_progress();
-// Seconds the baseline will take at the beacons' CURRENT transmit rate.
-// The sample count is fixed (statistical resolution is the invariant),
-// so the duration is what moves when the rate changes.
-int   csi_baseline_expected_seconds();    // min progress across active beacons
+float csi_baseline_progress();    // min progress across active beacons
 float csi_walk_progress();
 
 // Spatial estimator — updates g_app.est_x/est_y/est_confidence.

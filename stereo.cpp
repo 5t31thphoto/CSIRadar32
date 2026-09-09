@@ -107,7 +107,7 @@ static void fold_disparity_baseline_locked(BeaconState &b) {
     b.intercept_baseline = wrap_pi(b.intercept_baseline);
     // Mark stash consumed so we don't fold twice on re-cal without a fresh peer packet.
     s_peer_base_stash[b.id].present = false;
-    MSLOG("[stereo] disparity baseline set B%u slope=%.4f int=%.3f\n",
+    Serial.printf("[stereo] disparity baseline set B%u slope=%.4f int=%.3f\n",
                   (unsigned)b.id, b.slope_baseline, b.intercept_baseline);
 }
 
@@ -173,15 +173,6 @@ void stereo_record_local(BeaconState &b, uint32_t counter, uint32_t stamp_ms) {
 void stereo_flush_summaries_to_peer() {
     if (g_app.peer.role != ROLE_SECONDARY) return;
     if (!g_app.peer.peer_present) return;
-    // v0.85: an undocked probe is no longer 6 cm from the anchor, so its
-    // phase disparity is not an AoA cue — it is just noise with a
-    // confident-looking sign.  The anchor would pair it, subtract the
-    // 6 cm disparity baseline and run asinf(residual/k) anyway, poisoning
-    // every beacon's AoA at exactly the moment self-suppression matters.
-    // Stop at the source; the anchor's pairs then go stale within
-    // STEREO_PAIR_WINDOW_MS and csi_update_spatial drops the AoA channels
-    // after 500 ms, which is the correct graceful degradation.
-    if (g_app.probe_undocked) return;
     uint32_t now = millis();
     for (int b = 0; b < MAX_BEACONS; b++) {
         BeaconState &bs = g_app.beacon[b];
@@ -315,18 +306,11 @@ void stereo_update_aoa() {
     else if (n == 2) lo_drift = (vals[0] + vals[1]) * 0.5f;
     else if (n == 3) lo_drift = median3(vals[0], vals[1], vals[2]);
     else {
-        // Sort, then take the true median.
-        // v0.8: n can now be 4..6 (was 4 max).  The even case is the mean
-        // of the two middle samples, as before — n==4 is bit-identical.
-        // The odd case (n==5) needs the single middle sample; averaging
-        // vals[1] and vals[2] there would bias the common-LO-drift
-        // estimate, and that bias propagates into every beacon's AoA
-        // because the drift is subtracted from all of them.
+        // Simple sort for n==4
         for (int a = 0; a < n - 1; a++)
             for (int b = a + 1; b < n; b++)
                 if (vals[a] > vals[b]) { float t = vals[a]; vals[a] = vals[b]; vals[b] = t; }
-        lo_drift = (n & 1) ? vals[n / 2]
-                           : (vals[n/2 - 1] + vals[n/2]) * 0.5f;
+        lo_drift = (vals[n/2 - 1] + vals[n/2]) * 0.5f;
     }
     g_app.peer.lo_drift_rad = lo_drift;
     g_app.peer.lo_drift_ema = 0.85f * g_app.peer.lo_drift_ema + 0.15f * lo_drift;

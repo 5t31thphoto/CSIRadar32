@@ -55,41 +55,7 @@ static uint32_t       s_cap_start_ms = 0;
 //         strongest — cross-checks that the user actually stood where
 //         they said).
 // Collapsing them into one buffer was mixing categories.  Fixed.
-// v0.85: capture ring depth.  Reduced 400 -> 256 alongside the ingest
-// decimator below.  At CAP_HZ this holds 12.8 s, so the longest window in
-// any script (the 10 s ROTATE, 200 frames) lands with ~28% margin -- the
-// margin matters because the ring does not wrap, and a truncated rotation
-// is precisely the failure this change exists to remove.
-// Saves ~25 KB of .bss across the two buffers.
-#define CAP_MAX_FRAMES 256
-
-// Capture ingest rate.  scene_observe() is driven from csi_update_spatial(),
-// which loop() calls EVERY iteration with no rate gate — so before this,
-// how much of a landmark actually reached the kernel depended on how fast
-// the main loop happened to run.  The ring stops appending when full (it
-// does not wrap), so a fast loop would fill 400 frames in a couple of
-// seconds and the back of every capture was silently discarded.  For a
-// 10 s ROTATE that meant the Fourier aspect fit saw only the first part of
-// the turn and produced a basis for a fraction of a rotation.
-//
-// Decimating to a fixed rate makes the capture deterministic, makes the
-// samples uniform in time (which compute_arclength_boundaries and the
-// Fourier fit both already assume), and lets the ring shrink.
-// Capture decimation during calibration.
-//
-// Bounded from BOTH sides:
-//   upper — must stay below the beacon rate, or captures re-sample the
-//           same frame and deflate std_amp.  At 30 Hz beacons, 20 Hz
-//           gives a 1.5:1 ratio.
-//   upper — the longest capture is the 10 s ROTATE, and the ring does
-//           NOT wrap: at 25 Hz that is 250 frames into a 256 slot
-//           buffer, 2% margin, and any jitter silently truncates the
-//           rotation and hands the Fourier fit a partial turn.  20 Hz
-//           gives 200 frames, 22% margin.
-//   lower — enough samples per landmark for stable statistics: a 3 s
-//           stand still yields 60, a rotation 200 for a 2-harmonic fit.
-#define CAP_HZ            20
-#define CAP_MIN_INTERVAL_MS (1000 / CAP_HZ)
+#define CAP_MAX_FRAMES 400
 struct CapFrame {
     uint32_t t_ms;
     float amp[MAX_BEACONS];
@@ -114,16 +80,11 @@ static float s_beacon_snr[MAX_BEACONS];
 // positional indicator → lower reliability.  Used as an additional
 // weight in pursuit_score at INFERENCE time (not just once at finalize).
 // Range: (0, 1] where 1 = orientation-invariant, 0 = pure aspect noise.
-// v0.8: was {1,1,1,1}, which silently left beacons 5 and 6 at 0.0
-// after the MAX_BEACONS bump — a zero weight removes a beacon from
-// the likelihood entirely.  {} + a runtime fill keeps it size-agnostic.
-static float s_beacon_orient_reliability[MAX_BEACONS];
+static float s_beacon_orient_reliability[MAX_BEACONS] = {1,1,1,1};
 
 // Per-beacon runtime weights = SNR × orient_reliability × loop-closure penalty.
 // Precomputed at finalize so the inner scoring loop just multiplies.
-// Same hazard as s_beacon_orient_reliability above — filled in
-// scene_begin()/scene_reset() rather than brace-initialized.
-static float s_beacon_weight[MAX_BEACONS];
+static float s_beacon_weight[MAX_BEACONS] = {1,1,1,1};
 
 // Wizard step / landmark provenance for PROBE→ANCHOR packet tagging.
 // Populated by wizard via scene_cal_note_step().
@@ -134,35 +95,6 @@ static uint8_t s_cal_cur_landmark = 0xFF;
 // tracks the residual when three gates all hold (quiet scene, no tracks,
 // small |r|).  Subtracted from raw observation before pursuit.
 static float s_bg_amp[MAX_BEACONS] = {};
-
-// ── v0.8: probe-undock self-localization state ────────────────
-// On the PROBE unit, s_kernel[] is a PROBE-perspective kernel (every
-// unit folds its OWN frames into its OWN kernel during the walk — see
-// the comment above scene_observe).  The probe just never ran
-// scene_finalize_cal(), so these per-beacon weights were never
-// computed.  scene_finalize_probe_kernel() fills them in.  They are
-// kept separate from s_beacon_weight[] so that redocking leaves the
-// anchor-perspective runtime weights untouched.
-// ── v0.85 exterior regime state ───────────────────────────────
-static ExteriorContact s_ext[EXT_MAX_CONTACTS] = {};
-static uint8_t         s_ext_next_id = 1;
-// Calibrated from the ROTATE at LM_OPPOSITE_RX.  Without these two the
-// perimeter detector would be guessing both its sensitivity and its
-// angular honesty, and the exterior rotation would be collected and
-// never used — the exact failure the old OPP_RX landmark had.
-//   _amp_floor_frac : lowest total residual across a full turn, as a
-//                     fraction of the mean.  We divide the trip
-//                     threshold by this so a body presenting its
-//                     narrowest cross-section still trips.
-//   _bearing_spread : circular std of the residual bearing across a
-//                     full turn — the aspect-induced angular error,
-//                     used as a floor on reported sector width.
-static float s_ext_amp_floor_frac = 1.0f;
-static float s_ext_bearing_spread = 0.0f;
-static bool  s_ext_calibrated     = false;
-
-static bool  s_probe_kernel_ready = false;
-static float s_probe_beacon_weight[MAX_BEACONS];
 
 // Cached alias-pair table copied from the CalReport at finalize.  Runtime
 // checks track positions against this table to flag ambiguity.
@@ -192,7 +124,6 @@ static inline void cell_to_pos(int gx, int gy, float *x, float *y) {
     *x = -SCENE_EXTENT + (2.0f * SCENE_EXTENT) * ((float)gx + 0.5f) / (float)FIELD_DIM;
     *y = -SCENE_EXTENT + (2.0f * SCENE_EXTENT) * ((float)gy + 0.5f) / (float)FIELD_DIM;
 }
-static float beacon_bearing(int b);      // defined with the exterior code
 static inline float clampf(float x, float lo, float hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }
@@ -263,13 +194,6 @@ void scene_reset() {
         s_beacon_weight[b] = 1;
         s_bg_amp[b] = 0;
     }
-    s_probe_kernel_ready = false;
-    memset(s_ext, 0, sizeof(s_ext));
-    s_ext_next_id = 1;
-    s_ext_amp_floor_frac = 1.0f;
-    s_ext_bearing_spread = 0.0f;
-    s_ext_calibrated = false;
-    for (int b = 0; b < MAX_BEACONS; b++) s_probe_beacon_weight[b] = 1;
     s_alias_count = 0;
     memset(s_alias_pairs, 0, sizeof(s_alias_pairs));
     s_novelty = 0;
@@ -286,30 +210,11 @@ void scene_reset() {
 // average vertex distance from centroid is 1.  Then derive landmarks
 // from those normalized positions.  This keeps the kernel and the
 // field in a scale-invariant frame regardless of physical geometry.
-// v0.8 helper: map a 0-indexed beacon pair to the LandmarkId of the
-// perimeter edge midpoint between them.  Returns LM_COUNT for a pair
-// that has no landmark (a diagonal — those are not walked).
-static LandmarkId perimeter_mid_landmark(int i, int j) {
-    int a = i, b = j;
-    if (a > b) { int t = a; a = b; b = t; }
-    if (a == 0 && b == 1) return LM_MID_12;
-    if (a == 1 && b == 2) return LM_MID_23;
-    if (a == 0 && b == 2) return LM_MID_13;   // 3-beacon closing edge
-    if (a == 2 && b == 3) return LM_MID_34;
-    if (a == 3 && b == 4) return LM_MID_45;
-    if (a == 4 && b == 5) return LM_MID_56;
-    if (a == 0 && b == 3) return LM_MID_41;   // 4-beacon closing edge
-    if (a == 0 && b == 4) return LM_MID_51;   // 5-beacon closing edge
-    if (a == 0 && b == 5) return LM_MID_61;   // 6-beacon closing edge
-    return LM_COUNT;
-}
-
 void scene_derive_landmarks_from_geometry() {
-    // Collect active beacon nominal positions.
-    // v0.8: was capped at 3; now walks up to MAX_BEACONS.
+    // Collect active beacon nominal positions
     float bx[MAX_BEACONS], by[MAX_BEACONS];
     int n = 0;
-    for (int i = 0; i < MAX_BEACONS && n < MAX_BEACONS; i++) {
+    for (int i = 0; i < MAX_BEACONS && n < 3; i++) {
         if (!g_app.beacon[i].active) continue;
         bx[n] = g_app.beacon[i].pos_x;
         by[n] = g_app.beacon[i].pos_y;
@@ -324,11 +229,7 @@ void scene_derive_landmarks_from_geometry() {
     float cx = 0, cy = 0;
     for (int i = 0; i < n; i++) { cx += bx[i]; cy += by[i]; }
     cx /= n; cy /= n;
-    // Mean radius from centroid.
-    // NOTE: this normalization convention (centroid-relative, divided by
-    // MEAN radius, NOT multiplied by SCENE_EXTENT) is inherited from
-    // v0.7 and deliberately left alone.  Changing it would move every
-    // landmark and silently invalidate existing calibrations.
+    // Mean radius from centroid
     float r_sum = 0;
     for (int i = 0; i < n; i++) r_sum += sqrtf(sq(bx[i] - cx) + sq(by[i] - cy));
     float r = (r_sum / n);
@@ -339,66 +240,25 @@ void scene_derive_landmarks_from_geometry() {
     float rx_y = (0.0f - cy) / r;
 
     // Normalize beacon positions
-    float nbx[MAX_BEACONS], nby[MAX_BEACONS];
+    float nbx[3], nby[3];
     for (int i = 0; i < n; i++) {
         nbx[i] = (bx[i] - cx) / r;
         nby[i] = (by[i] - cy) / r;
     }
-    // Fill any unused beacon slots with the last available position, so
-    // an LM_BEACON_k landmark for a beacon that isn't present still has
-    // a defined (if uninformative) position rather than garbage.
-    for (int i = n; i < MAX_BEACONS; i++) { nbx[i] = nbx[n-1]; nby[i] = nby[n-1]; }
-
-    // Default every landmark to the centroid first.  Landmarks that
-    // don't apply at this beacon count (e.g. LM_MID_56 in a 4-beacon
-    // layout) then hold a harmless in-frame value instead of stale
-    // positions left over from a previous geometry.
-    for (int i = 0; i < LM_COUNT; i++) { s_lm_pos[i][0] = 0; s_lm_pos[i][1] = 0; }
+    // Fill in any missing beacon slots with the last available position
+    for (int i = n; i < 3; i++) { nbx[i] = nbx[n-1]; nby[i] = nby[n-1]; }
 
     s_lm_pos[LM_RX][0]        = rx_x;         s_lm_pos[LM_RX][1]        = rx_y;
-    for (int i = 0; i < MAX_BEACONS; i++) {
-        s_lm_pos[LM_BEACON_1 + i][0] = nbx[i];
-        s_lm_pos[LM_BEACON_1 + i][1] = nby[i];
-    }
+    s_lm_pos[LM_BEACON_1][0]  = nbx[0];       s_lm_pos[LM_BEACON_1][1]  = nby[0];
+    s_lm_pos[LM_BEACON_2][0]  = nbx[1];       s_lm_pos[LM_BEACON_2][1]  = nby[1];
+    s_lm_pos[LM_BEACON_3][0]  = nbx[2];       s_lm_pos[LM_BEACON_3][1]  = nby[2];
     s_lm_pos[LM_CENTROID][0]  = 0;            s_lm_pos[LM_CENTROID][1]  = 0;
-
-    // Perimeter edge midpoints, i → (i+1) mod n.  For n == 3 this
-    // produces MID_12, MID_23 and MID_13 exactly as v0.7 did.
-    for (int i = 0; i < n; i++) {
-        int j = (i + 1) % n;
-        if (n == 2 && i == 1) break;          // 2-beacon: one edge only
-        LandmarkId mid = perimeter_mid_landmark(i, j);
-        if (mid >= LM_COUNT) continue;
-        s_lm_pos[mid][0] = 0.5f * (nbx[i] + nbx[j]);
-        s_lm_pos[mid][1] = 0.5f * (nby[i] + nby[j]);
-    }
-
-    // ── LM_OPPOSITE_RX: the EXTERIOR anchor (v0.85) ──────────────
-    // Through v0.7 this was `2 * rx`, which for a ring centred on the
-    // receivers collapses to the origin — the same coordinate as LM_RX
-    // and LM_CENTROID.  The user genuinely walked outside, but the
-    // sample was filed at the centre, so the one landmark that was
-    // supposed to describe "a person outside the perimeter" instead
-    // contaminated the centre with a fingerprint from across the room,
-    // and the OPP->RX leg became a zero-length transit that wrote 8
-    // more slices onto the same point.
-    //
-    // Now it is a real exterior position, and it is the anchor for the
-    // whole outside-the-ring regime: the sector detector needs to know
-    // what a body looks like when every beacon is clustered into one
-    // narrow arc instead of surrounding it.
-    //
-    // Placement: opposite the first beacon, pushed past the ring.  For
-    // EVEN beacon counts, "opposite B1" lands exactly on another beacon,
-    // so we rotate by half a sector to sit in the gap between the two
-    // far beacons instead of on top of one.
-    {
-        float th1 = atan2f(nby[0], nbx[0]);           // bearing of B1
-        float th  = th1 + (float)M_PI;
-        if ((n % 2) == 0) th += (float)M_PI / (float)n;
-        s_lm_pos[LM_OPPOSITE_RX][0] = LM_EXTERIOR_RADIUS * cosf(th);
-        s_lm_pos[LM_OPPOSITE_RX][1] = LM_EXTERIOR_RADIUS * sinf(th);
-    }
+    s_lm_pos[LM_MID_12][0]    = 0.5f*(nbx[0]+nbx[1]); s_lm_pos[LM_MID_12][1] = 0.5f*(nby[0]+nby[1]);
+    s_lm_pos[LM_MID_23][0]    = 0.5f*(nbx[1]+nbx[2]); s_lm_pos[LM_MID_23][1] = 0.5f*(nby[1]+nby[2]);
+    s_lm_pos[LM_MID_13][0]    = 0.5f*(nbx[0]+nbx[2]); s_lm_pos[LM_MID_13][1] = 0.5f*(nby[0]+nby[2]);
+    // Opposite RX = reflect centroid through RX (or just past RX away from beacons)
+    s_lm_pos[LM_OPPOSITE_RX][0] = 2.0f * rx_x;
+    s_lm_pos[LM_OPPOSITE_RX][1] = 2.0f * rx_y;
 }
 
 void scene_landmark_pos(LandmarkId id, float *out_x, float *out_y) {
@@ -414,7 +274,7 @@ void scene_cal_begin(CalMode mode) {
     s_cal_mode = mode;
     s_cal_active = true;
     s_empty_room_ready = false;
-    MSLOG("[scene] cal begin mode=%d\n", (int)mode);
+    Serial.printf("[scene] cal begin mode=%d\n", (int)mode);
 }
 
 void scene_cal_abort() {
@@ -422,12 +282,12 @@ void scene_cal_abort() {
     s_cap_kind = CAP_NONE;
     s_cap_anchor_len = 0;
     s_cap_probe_len = 0;
-    MSLOGLN("[scene] cal aborted");
+    Serial.println("[scene] cal aborted");
 }
 
 void scene_cal_ack_empty_room() {
     s_empty_room_ready = true;
-    MSLOGLN("[scene] empty-room baseline acknowledged");
+    Serial.println("[scene] empty-room baseline acknowledged");
 }
 
 // v0.4 tripwire shortcut — no walk cal, no kernel to build.  With one
@@ -439,7 +299,7 @@ void scene_cal_tripwire_finalize() {
     s_cal_active   = false;
     s_cal_complete = true;
     s_empty_room_ready = true;
-    MSLOGLN("[scene] tripwire finalize (no walk cal, no kernel)");
+    Serial.println("[scene] tripwire finalize (no walk cal, no kernel)");
 }
 
 // Called by wizard when it enters/exits a step so PROBE-side outgoing
@@ -470,7 +330,7 @@ void scene_begin_landmark_capture(LandmarkId lm) {
     // Announce to PROBE (from ANCHOR, if stereo) so PROBE tags its stream
     if (g_app.peer.cal_role == CAL_ROLE_ANCHOR)
         peer_send_command(PEER_OP_CAL_BEGIN, (uint8_t)lm);
-    MSLOG("[scene] STAND lm=%u\n", (unsigned)lm);
+    Serial.printf("[scene] STAND lm=%u\n", (unsigned)lm);
 }
 
 void scene_begin_transit_capture(LandmarkId from, LandmarkId to) {
@@ -481,7 +341,7 @@ void scene_begin_transit_capture(LandmarkId from, LandmarkId to) {
     s_cap_start_ms = millis();
     if (g_app.peer.cal_role == CAL_ROLE_ANCHOR)
         peer_send_command(PEER_OP_CAL_BEGIN, 0xFF, ((uint16_t)from << 8) | (uint16_t)to);
-    MSLOG("[scene] WALK %u→%u\n", (unsigned)from, (unsigned)to);
+    Serial.printf("[scene] WALK %u→%u\n", (unsigned)from, (unsigned)to);
 }
 
 void scene_begin_rotate_capture(LandmarkId at) {
@@ -492,7 +352,7 @@ void scene_begin_rotate_capture(LandmarkId at) {
     s_cap_start_ms = millis();
     if (g_app.peer.cal_role == CAL_ROLE_ANCHOR)
         peer_send_command(PEER_OP_CAL_BEGIN, (uint8_t)at, 0xFFFF);
-    MSLOG("[scene] ROTATE at lm=%u\n", (unsigned)at);
+    Serial.printf("[scene] ROTATE at lm=%u\n", (unsigned)at);
 }
 
 // Fold accumulated frames into a KernelSample entry.  Common code
@@ -507,18 +367,7 @@ static void write_kernel_sample_from_range(const CapFrame *buf,
                                            uint8_t transit_from,
                                            uint8_t transit_to,
                                            float transit_frac) {
-    if (s_kernel_count >= KERNEL_MAX_SAMPLES) {
-        // v0.85: this used to drop silently, which would quietly cost the
-        // back half of a walk with no indication anything was wrong.
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            MSLOG("[scene] KERNEL FULL at %d samples - later landmarks "
-                          "are being DISCARDED. Raise KERNEL_MAX_SAMPLES.\n",
-                          KERNEL_MAX_SAMPLES);
-        }
-        return;
-    }
+    if (s_kernel_count >= KERNEL_MAX_SAMPLES) return;
     if (end <= start) return;
 
     KernelSample &s = s_kernel[s_kernel_count];
@@ -589,7 +438,7 @@ void scene_end_landmark_capture() {
     scene_landmark_pos(s_cap_landmark_a, &px, &py);
     write_kernel_sample_from_range(s_cap_anchor, 0, s_cap_anchor_len, px, py,
                                     (uint8_t)s_cap_landmark_a, 0xFF, 0xFF, 0);
-    MSLOG("[scene] STAND done lm=%u anchor_frames=%d probe_frames=%d total_samples=%d\n",
+    Serial.printf("[scene] STAND done lm=%u anchor_frames=%d probe_frames=%d total_samples=%d\n",
                   (unsigned)s_cap_landmark_a, s_cap_anchor_len, s_cap_probe_len,
                   s_kernel_count);
     if (g_app.peer.cal_role == CAL_ROLE_ANCHOR) peer_send_command(PEER_OP_CAL_END);
@@ -676,7 +525,7 @@ static void compute_arclength_boundaries(int N_slices,
     for (int k = 1; k <= N_slices; k++)
         if (out_boundaries[k] < out_boundaries[k-1])
             out_boundaries[k] = out_boundaries[k-1];
-    MSLOG("[scene] transit arc-length OK: probe_arc=%.2f probe_frames=%d\n",
+    Serial.printf("[scene] transit arc-length OK: probe_arc=%.2f probe_frames=%d\n",
                   (double)total, probe_len);
 }
 
@@ -707,7 +556,7 @@ void scene_end_transit_capture() {
                                         (uint8_t)s_cap_landmark_b,
                                         frac);
     }
-    MSLOG("[scene] WALK done %u→%u anchor=%d probe=%d slices=%d total=%d\n",
+    Serial.printf("[scene] WALK done %u→%u anchor=%d probe=%d slices=%d total=%d\n",
                   (unsigned)s_cap_landmark_a, (unsigned)s_cap_landmark_b,
                   s_cap_anchor_len, s_cap_probe_len, N_SLICES, s_kernel_count);
     if (g_app.peer.cal_role == CAL_ROLE_ANCHOR) peer_send_command(PEER_OP_CAL_END);
@@ -748,7 +597,7 @@ static void extract_rotation_theta(float *theta_out) {
     }
     // Upgrade to PROBE-arc-length θ if we have enough PROBE data
     if (s_cap_probe_len < 8) {
-        MSLOGLN("[scene] ROTATE θ: time-linear (no PROBE stream)");
+        Serial.println("[scene] ROTATE θ: time-linear (no PROBE stream)");
         return;
     }
     // Per-beacon peak for normalization (so no channel dominates arc length)
@@ -773,7 +622,7 @@ static void extract_rotation_theta(float *theta_out) {
     }
     float total = cum[s_cap_probe_len - 1];
     if (total < 1e-3f) {
-        MSLOGLN("[scene] ROTATE θ: time-linear fallback (no PROBE motion)");
+        Serial.println("[scene] ROTATE θ: time-linear fallback (no PROBE motion)");
         return;
     }
     // For each ANCHOR frame, find nearest PROBE frame in time,
@@ -789,7 +638,7 @@ static void extract_rotation_theta(float *theta_out) {
         }
         theta_out[i] = 2.0f * (float)M_PI * (cum[best_j] / total);
     }
-    MSLOG("[scene] ROTATE θ: PROBE-arc-length OK (probe_arc=%.2f)\n",
+    Serial.printf("[scene] ROTATE θ: PROBE-arc-length OK (probe_arc=%.2f)\n",
                   (double)total);
 }
 
@@ -873,7 +722,7 @@ void scene_end_rotate_capture() {
     if (s_cap_anchor_len < 6) {
         // Too few frames to fit anything meaningful — fall back to
         // v0.4 behavior (write one representative sample, no aspect model).
-        MSLOG("[scene] ROTATE too few frames (%d) — no Fourier fit\n",
+        Serial.printf("[scene] ROTATE too few frames (%d) — no Fourier fit\n",
                       s_cap_anchor_len);
         write_kernel_sample_from_range(s_cap_anchor, 0, s_cap_anchor_len,
                                         px, py, (uint8_t)s_cap_landmark_a,
@@ -930,69 +779,7 @@ void scene_end_rotate_capture() {
             s_beacon_orient_reliability[b] = reliability;
         }
     }
-    // ── v0.85: exterior aspect envelope ──────────────────────────
-    // A rotation at the EXTERIOR anchor is the only place we learn what
-    // a body looks like when every beacon is clustered into one narrow
-    // arc instead of surrounding it.  Two scalars come out of it, and
-    // both feed the perimeter detector directly:
-    //
-    //   amp_floor_frac  the weakest total residual across the full turn,
-    //                   as a fraction of the mean.  The trip threshold
-    //                   is multiplied by it so a body presenting its
-    //                   narrowest cross-section still raises a contact.
-    //                   Without this the threshold is set for a broadside
-    //                   body and quietly misses edge-on ones.
-    //
-    //   bearing_spread  circular std of the residual bearing over the
-    //                   turn.  A body is not an isotropic scatterer, so
-    //                   its aspect skews the angular centroid; we cannot
-    //                   remove that bias without knowing which way they
-    //                   face, but we can refuse to draw a sector
-    //                   narrower than the wander we measured.
-    if (s_cap_landmark_a == LM_OPPOSITE_RX) {
-        double sum_mag = 0; int n_mag = 0;
-        float  min_mag = 1e30f;
-        double bz_r = 0, bz_i = 0;
-        for (int i = 0; i < s_cap_anchor_len; i++) {
-            float zr = 0, zi = 0, mag = 0;
-            int nb = 0;
-            for (int b = 0; b < MAX_BEACONS; b++) {
-                if (!s_cap_anchor[i].beacon_valid[b]) continue;
-                float r = s_cap_anchor[i].amp[b];
-                if (r < 0) r = 0;
-                float th = beacon_bearing(b);
-                zr += r * cosf(th);
-                zi += r * sinf(th);
-                mag += r;
-                nb++;
-            }
-            if (nb < 2 || mag < 1e-6f) continue;
-            sum_mag += mag; n_mag++;
-            if (mag < min_mag) min_mag = mag;
-            float bearing = atan2f(zi, zr);
-            bz_r += cosf(bearing);
-            bz_i += sinf(bearing);
-        }
-        if (n_mag >= 6) {
-            float mean_mag = (float)(sum_mag / n_mag);
-            s_ext_amp_floor_frac = (mean_mag > 1e-6f) ? (min_mag / mean_mag) : 1.0f;
-            // Guard: a pathological capture must not drive sensitivity to
-            // zero (alarm on everything) or to one (learned nothing).
-            s_ext_amp_floor_frac = clampf(s_ext_amp_floor_frac, 0.25f, 1.0f);
-            float R = sqrtf((float)(bz_r*bz_r + bz_i*bz_i)) / (float)n_mag;
-            s_ext_bearing_spread = sqrtf(fmaxf(0.0f,
-                                     -2.0f * logf(fmaxf(1e-4f, R))));
-            s_ext_bearing_spread = clampf(s_ext_bearing_spread, 0.0f,
-                                          (float)M_PI * 0.5f);
-            s_ext_calibrated = true;
-            MSLOG("[scene] EXTERIOR aspect: amp_floor=%.2f "
-                          "bearing_spread=%.1f deg\n",
-                          (double)s_ext_amp_floor_frac,
-                          (double)(s_ext_bearing_spread * 180.0f / M_PI));
-        }
-    }
-
-    MSLOG("[scene] ROTATE lm=%u done anchor=%d probe=%d "
+    Serial.printf("[scene] ROTATE lm=%u done anchor=%d probe=%d "
                   "aspect_var=[%.3f %.3f %.3f]\n",
                   (unsigned)s_cap_landmark_a, s_cap_anchor_len, s_cap_probe_len,
                   (double)ks.b[0].aspect_var,
@@ -1087,26 +874,8 @@ void scene_ingest_peer_cal(const PeerCalObservation &pkt) {
 // used directly as the kernel (with the known degradation that the
 // receiver moved with the target — honestly reduced accuracy).
 void scene_observe(const FrameObservation &obs) {
-    // v0.9 decimator.  BOTH consumers below must be gated by this, not
-    // just the local capture: the ANCHOR buffers its own frames here
-    // while the PROBE streams its frames over the peer link, and
-    // compute_arclength_boundaries() maps between the two by timestamp.
-    // If only one side is decimated they fill at different rates, the
-    // probe buffer hits CAP_MAX_FRAMES partway through the leg, and the
-    // arc-length boundaries collapse into the first part of the walk.
-    // Decimating the probe stream also cuts cal-time ESP-NOW traffic by
-    // the same factor, on the radio that is busy sniffing CSI.
-    static uint32_t s_cap_last_ms = 0;
-    bool cap_due = (obs.frame_ms - s_cap_last_ms) >= (uint32_t)CAP_MIN_INTERVAL_MS;
-    // Advance the gate whenever it fires, independently of whether the
-    // local buffer still has room -- otherwise a full anchor buffer
-    // leaves cap_due permanently true and the probe reverts to
-    // transmitting every loop.
-    if (cap_due && s_cal_active && s_cap_kind != CAP_NONE) s_cap_last_ms = obs.frame_ms;
-
     // 1) During cal capture, buffer this-unit's frame into anchor buf.
-    if (s_cal_active && s_cap_kind != CAP_NONE && cap_due
-        && s_cap_anchor_len < CAP_MAX_FRAMES) {
+    if (s_cal_active && s_cap_kind != CAP_NONE && s_cap_anchor_len < CAP_MAX_FRAMES) {
         CapFrame &f = s_cap_anchor[s_cap_anchor_len];
         f.t_ms = obs.frame_ms;
         memset(f.beacon_valid, 0, sizeof(f.beacon_valid));
@@ -1124,10 +893,8 @@ void scene_observe(const FrameObservation &obs) {
         s_cap_anchor_len++;
     }
 
-    // 2) If we're PROBE in stereo cal, transmit this frame to ANCHOR —
-    //    on the SAME decimated cadence, so the two capture buffers stay
-    //    index-aligned in time for the arc-length mapping.
-    if (s_cal_active && cap_due && g_app.peer.cal_role == CAL_ROLE_PROBE) {
+    // 2) If we're PROBE in stereo cal, transmit this frame to ANCHOR.
+    if (s_cal_active && g_app.peer.cal_role == CAL_ROLE_PROBE) {
         scene_cal_transmit_probe_frame(obs);
     }
 
@@ -1395,130 +1162,40 @@ void scene_finalize_cal(CalReport &report) {
     // CLOSE in observation space (< 0.15 normalized).  Stored as
     // AliasPair entries so runtime can flag tracks landing near them.
     {
-        // ── v0.85: ambiguity as a Mahalanobis margin ──────────────
-        //
-        // Two landmarks are confusable to the degree that their
-        // PREDICTED OBSERVATIONS overlap given the sensor's own noise.
-        // That is a Mahalanobis distance, and it must use the very same
-        // per-channel sigma meas_model() uses at inference, or the
-        // number will not predict the confusions the solver actually
-        // makes:
-        //     amp   sigma^2 = std_amp^2 + aspect_var   (aspect_var is a
-        //             variance: Parseval energy of the non-DC rotation
-        //             harmonics plus the fit residual — it is how much a
-        //             body's reading swings with its facing, which is
-        //             genuine ambiguity when orientation is unknown)
-        //     phase sigma^2 = std_phase^2, residual wrapped to (-pi,pi]
-        //
-        // Difference of two independent hypotheses, so the variances
-        // add: sigma_ij^2 = sigma_i^2 + sigma_j^2.
-        //
-        // Physical separation still gates which pairs are interesting,
-        // and PHYS_FAR_SQ stays as it was: one ring radius is already
-        // scale-invariant and geometrically meaningful.  What changes is
-        // that the RF side is no longer a hand-picked cutoff on a
-        // meaningless scale.
-        //
-        // D_DETECT = 4 sigma is a stated error probability, not a tuned
-        // constant: Phi(-4/2) = 2.3% chance of confusing the pair on any
-        // single update.
         int alias_n = 0;
         const float PHYS_FAR_SQ = 1.0f;
-        const float D_DETECT    = 4.0f;
-        uint16_t found = 0, tested = 0;
-        float    margin = 1e30f;
-        float    res_sep = 0.0f;
-
-        for (int i = 0; i < s_kernel_count; i++) {
+        const float RF_CLOSE = 0.15f;
+        for (int i = 0; i < s_kernel_count && alias_n < CAL_MAX_ALIAS_PAIRS; i++) {
             if (s_kernel[i].landmark_id == 0xFF) continue;
-            for (int j = i + 1; j < s_kernel_count; j++) {
+            for (int j = i + 1; j < s_kernel_count && alias_n < CAL_MAX_ALIAS_PAIRS; j++) {
                 if (s_kernel[j].landmark_id == 0xFF) continue;
                 float pd2 = dist2(s_kernel[i].pos[0], s_kernel[i].pos[1],
                                   s_kernel[j].pos[0], s_kernel[j].pos[1]);
-
-                // Mahalanobis distance over every channel both samples saw.
-                float d2 = 0;
-                int   nch = 0;
+                if (pd2 < PHYS_FAR_SQ) continue;
+                float rf_d = 0;
+                int   rf_n = 0;
                 for (int b = 0; b < MAX_BEACONS; b++) {
-                    const KernelSample::PerBeacon &bi = s_kernel[i].b[b];
-                    const KernelSample::PerBeacon &bj = s_kernel[j].b[b];
-                    if (bi.sample_count == 0 || bj.sample_count == 0) continue;
-
-                    // Amplitude
-                    float va = sq(bi.std_amp) + bi.aspect_var
-                             + sq(bj.std_amp) + bj.aspect_var;
-                    if (va < 2.0f * SIGMA_AMP_FLOOR * SIGMA_AMP_FLOOR)
-                        va = 2.0f * SIGMA_AMP_FLOOR * SIGMA_AMP_FLOOR;
-                    float da = bi.mean_amp - bj.mean_amp;
-                    d2 += (da * da) / va;
-                    nch++;
-
-                    // Phase — wrap the residual, it is an angle
-                    float vp = sq(bi.std_phase) + sq(bj.std_phase);
-                    if (vp < 2.0f * SIGMA_PHASE_FLOOR * SIGMA_PHASE_FLOOR)
-                        vp = 2.0f * SIGMA_PHASE_FLOOR * SIGMA_PHASE_FLOOR;
-                    float dp = wrap_pi(bi.mean_phase - bj.mean_phase);
-                    d2 += (dp * dp) / vp;
-                    nch++;
-
-                    // AoA only where both samples actually observed it
-                    if (bi.saw_aoa > 0 && bj.saw_aoa > 0) {
-                        float vo = sq(bi.std_aoa) + sq(bj.std_aoa);
-                        if (vo < 2.0f * SIGMA_AOA_FLOOR * SIGMA_AOA_FLOOR)
-                            vo = 2.0f * SIGMA_AOA_FLOOR * SIGMA_AOA_FLOOR;
-                        float dobs = wrap_pi(bi.mean_aoa_dev - bj.mean_aoa_dev);
-                        d2 += (dobs * dobs) / vo;
-                        nch++;
-                    }
+                    if (s_kernel[i].b[b].sample_count == 0) continue;
+                    if (s_kernel[j].b[b].sample_count == 0) continue;
+                    float range = s_amp_range_hi[b] - s_amp_range_lo[b];
+                    if (range < 1e-6f) continue;
+                    float di = (s_kernel[i].b[b].mean_amp
+                              - s_kernel[j].b[b].mean_amp) / range;
+                    rf_d += sq(di);
+                    rf_n++;
                 }
-                if (nch == 0) continue;
-                float d = sqrtf(d2);
-
-                // Resolution: the largest separation at which two places
-                // were still confusable.  Healthy arrays only blur nearby
-                // points, so this reads as resolution; a genuine alias
-                // pushes it out and it reads as the alias distance.
-                if (d < D_DETECT) {
-                    float sep = sqrtf(pd2);
-                    if (sep > res_sep) res_sep = sep;
-                }
-
-                if (pd2 < PHYS_FAR_SQ) continue;   // not a far pair
-                tested++;
-                if (d < margin) margin = d;
-                if (d >= D_DETECT) continue;       // distinguishable, fine
-                found++;
-
-                // Keep the worst offenders, scanning ALL pairs.  The old
-                // loop carried the cap in both loop conditions and simply
-                // STOPPED at 16 found, so the reported count was censored
-                // and 16 was indistinguishable from 98.
-                int slot = -1;
-                if (alias_n < CAL_MAX_ALIAS_PAIRS) {
-                    slot = alias_n++;
-                } else {
-                    float worst = -1.0f;
-                    for (int a = 0; a < CAL_MAX_ALIAS_PAIRS; a++) {
-                        if (report.alias_pairs[a].sigma_distance > worst) {
-                            worst = report.alias_pairs[a].sigma_distance;
-                            slot  = a;
-                        }
-                    }
-                    if (worst <= d) slot = -1;     // stored set already worse
-                }
-                if (slot >= 0) {
-                    report.alias_pairs[slot].lm_a = s_kernel[i].landmark_id;
-                    report.alias_pairs[slot].lm_b = s_kernel[j].landmark_id;
-                    report.alias_pairs[slot].sigma_distance = d;
-                    report.alias_pairs[slot].phys_distance  = sqrtf(pd2);
+                if (rf_n == 0) continue;
+                float rf_dist = sqrtf(rf_d / rf_n);
+                if (rf_dist < RF_CLOSE) {
+                    report.alias_pairs[alias_n].lm_a = s_kernel[i].landmark_id;
+                    report.alias_pairs[alias_n].lm_b = s_kernel[j].landmark_id;
+                    report.alias_pairs[alias_n].rf_distance = rf_dist;
+                    report.alias_pairs[alias_n].phys_distance = sqrtf(pd2);
+                    alias_n++;
                 }
             }
         }
-        report.alias_pair_count        = (uint8_t)alias_n;
-        report.alias_pairs_found       = found;
-        report.far_pairs_tested        = tested;
-        report.ambiguity_margin_sigma  = (tested > 0) ? margin : 0.0f;
-        report.resolution_sep          = res_sep;
+        report.alias_pair_count = (uint8_t)alias_n;
     }
     // Cache in module-static so runtime doesn't have to walk the report
     s_alias_count = report.alias_pair_count;
@@ -1561,7 +1238,7 @@ void scene_finalize_cal(CalReport &report) {
         // strongest).  If beacon b's mean_amp is well below peak, flag it.
         if (mine / peak < GEOM_VALIDATION_MIN_FRAC) {
             report.geometry_validation_fail_mask |= (1u << b);
-            MSLOG("[scene] GEOM WARN: at LM_BEACON_%d, beacon %d "
+            Serial.printf("[scene] GEOM WARN: at LM_BEACON_%d, beacon %d "
                           "amp=%.3f is only %.0f%% of peak %.3f\n",
                           b+1, b, (double)mine,
                           100.0 * mine / peak, (double)peak);
@@ -1572,7 +1249,7 @@ void scene_finalize_cal(CalReport &report) {
     s_cal_complete = true;
     s_cal_active = false;
 
-    MSLOG("[scene] cal finalize: N=%d xval=%.3f loop=%.3f "
+    Serial.printf("[scene] cal finalize: N=%d xval=%.3f loop=%.3f "
                   "obs=%.3f aliases=%u geom_fail=0x%02X\n",
                   s_kernel_count, report.cross_val_error, report.loop_closure_error,
                   (double)report.mean_observability,
@@ -1741,35 +1418,6 @@ static void build_obs_vec(const FrameObservation &obs, ObsVec &o) {
         }
         o.aoa_conf[b] = obs.beacon[b].aoa_conf;
     }
-}
-
-// ── How many targets can THIS frame's data actually support? ────
-//
-// Each target contributes DIMS_PER_TARGET (= 3) unknowns: x, y, alpha.
-// The observation vector supplies one equation per VALID channel, and
-// validity is per-frame: amplitude and phase are usually there, AoA
-// only when stereo pairing is live and above AOA_MIN_CONF.
-//
-// With 3 beacons and no AoA that is 6 equations.  Fitting 4 targets
-// there means 12 unknowns against 6 equations — rank-deficient, and the
-// only reason gn_solve_joint doesn't blow up is the 1e-3 Levenberg
-// damping on the diagonal.  Targets 3 and 4 in that regime are
-// regularization artifacts, not people, and they cost real CPU while
-// actively degrading the fit of the targets that ARE real.
-//
-// Conversely at 6 beacons with AoA there are 18 equations, and capping
-// at 4 throws away one or two people the array can genuinely separate.
-//
-// So the ceiling is data-derived, leaving a margin of one target's
-// worth of equations so the system stays over-determined rather than
-// exactly determined.
-static int scene_max_targets_for_frame(const ObsVec &o) {
-    int d_valid = 0;
-    for (int d = 0; d < D_OBS; d++) if (o.valid[d]) d_valid++;
-    int k = (d_valid - DIMS_PER_TARGET) / DIMS_PER_TARGET;
-    if (k < 1) k = 1;                       // always allow a single target
-    if (k > SCENE_MAX_TARGETS) k = SCENE_MAX_TARGETS;
-    return k;
 }
 
 // ── Multi-target forward model: ŷ = Σ_k α_k · h(p_k) ────────────
@@ -1986,7 +1634,7 @@ static float gn_solve_joint(const ObsVec &obs, TargetState *targets, int K) {
         }
         // Trust-region step: halve until accepted or too small
         float step_scale = 1.0f;
-        static TargetState trial[SCENE_MAX_TARGETS];   // see note above
+        TargetState trial[SCENE_MAX_TARGETS];
         for (int hs = 0; hs < 6; hs++) {
             for (int k = 0; k < K; k++) {
                 trial[k] = targets[k];
@@ -2072,10 +1720,6 @@ static void track_to_target(const TargetTrack &tr, TargetState &t) {
 // Given fitted targets, subtract their predicted amp contribution
 // from the observation and search the field for the position whose
 // h(p) best explains the remaining amp residual.
-// Defined with the exterior-regime code below; birth_search needs it to
-// restrict itself to the interior.
-static float kernel_coverage_dist(float px, float py);
-
 static bool birth_search(const ObsVec &obs, const TargetState *targets, int K,
                           float *out_px, float *out_py, float *out_score) {
     float y_pred[D_OBS], var_pred[D_OBS];
@@ -2092,28 +1736,11 @@ static bool birth_search(const ObsVec &obs, const TargetState *targets, int K,
     float best_score = 0;
     float best_px = 0, best_py = 0;
     const float cell_step = (2.0f * SCENE_EXTENT) / (float)FIELD_DIM;
-    // v0.85: the exclusion radius is a fixed FRACTION of the layout, so
-    // at 2 cells it forces two people to be ~12% of the ring apart before
-    // both can be born.  More beacons sharpen the likelihood surface, so
-    // holding the fraction constant spends the extra resolution instead
-    // of banking it.  Tighten it once the array can support the finer
-    // separation.
-    int n_act_b = 0;
-    for (int b = 0; b < MAX_BEACONS; b++) if (g_app.beacon[b].active) n_act_b++;
-    const float excl_cells = (n_act_b >= 5) ? 1.0f : (float)PEAK_EXCLUSION_CELLS;
-    const float excl_sq = sq(excl_cells * cell_step);
+    const float excl_sq = sq(PEAK_EXCLUSION_CELLS * cell_step);
     for (int gy = 0; gy < FIELD_DIM; gy++) {
         for (int gx = 0; gx < FIELD_DIM; gx++) {
             float px, py;
             cell_to_pos(gx, gy, &px, &py);
-            // v0.85: INTERIOR regime only.  A cell with no kernel support
-            // cannot produce an honest position, so we do not search it —
-            // but the residual there is NOT discarded: whatever this
-            // search fails to explain is handed to exterior_update(),
-            // which reports it as a bearing.  Skipping these cells also
-            // removes 23-41% of the meas_model calls in this loop, which
-            // is what pays for the larger target count.
-            if (kernel_coverage_dist(px, py) > EXT_COVERAGE_RADIUS) continue;
             // Exclude cells near already-fitted targets
             bool exc = false;
             for (int k = 0; k < K; k++) {
@@ -2145,145 +1772,6 @@ static bool birth_search(const ObsVec &obs, const TargetState *targets, int K,
     *out_py = best_py;
     *out_score = best_score;
     return best_score > BIRTH_SEARCH_MIN_SCORE;
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  v0.85 — EXTERIOR SECTOR ESTIMATOR
-// ═══════════════════════════════════════════════════════════════
-// Distance from (px,py) to the nearest kernel sample.  A cell beyond
-// EXT_COVERAGE_RADIUS has no learned response: meas_model's 6-NN IDW
-// there degenerates to a near-constant average of whatever samples
-// happen to be closest, and the resulting likelihood surface is flat.
-// A flat surface can sit LOWER than the true basin, which is how a
-// birth search run over uncovered ground invents a confidently-placed
-// person out of nothing.
-static float kernel_coverage_dist(float px, float py) {
-    float best = 1e30f;
-    for (int i = 0; i < s_kernel_count; i++) {
-        float d = dist2(px, py, s_kernel[i].pos[0], s_kernel[i].pos[1]);
-        if (d < best) best = d;
-    }
-    return sqrtf(best);
-}
-
-// Bearing of beacon b from the receivers, in the normalized frame.
-// atan2(y, x) with the same convention the renderer uses.
-static float beacon_bearing(int b) {
-    float x, y;
-    scene_landmark_pos((LandmarkId)(LM_BEACON_1 + b), &x, &y);
-    return atan2f(y, x);
-}
-
-// Angular centroid of the per-beacon residual pattern.
-//
-//   Z = sum_b r_b * e^(i*theta_b)
-//
-// bearing      = arg(Z)
-// concentration= |Z| / sum_b |r_b|   in [0,1]
-//
-// This consults NO kernel data — it is geometry (known beacon bearings)
-// times measurement (residual amplitude).  That is precisely why it
-// still works outside the walked region, where h(p) is undefined.
-// Angular resolution is set by how many illuminators ring the space:
-// the sector can never honestly be narrower than pi/N.
-static bool exterior_sector(const ObsVec &obs,
-                            const TargetState *targets, int K,
-                            float *out_bearing, float *out_conc,
-                            float *out_rms) {
-    float y_pred[D_OBS], var_pred[D_OBS];
-    uint8_t val_pred[D_OBS];
-    predict_multi(targets, K, y_pred, var_pred, val_pred);
-
-    float zr = 0, zi = 0, abs_sum = 0, sse = 0;
-    int n = 0;
-    for (int b = 0; b < MAX_BEACONS; b++) {
-        if (!g_app.beacon[b].active) continue;
-        int d = CH_AMP(b);
-        if (!obs.valid[d]) continue;
-        // Residual left over after the interior targets are accounted for.
-        float r = obs.y[d] - (val_pred[d] ? y_pred[d] : 0.0f);
-        // Only positive perturbation indicates an occluder; a negative
-        // residual means we over-predicted, which is not evidence of a
-        // body out there.
-        if (r < 0) r = 0;
-        float th = beacon_bearing(b);
-        zr += r * cosf(th);
-        zi += r * sinf(th);
-        abs_sum += r;
-        sse += r * r;
-        n++;
-    }
-    if (n < 2 || abs_sum < 1e-6f) return false;
-    *out_bearing = atan2f(zi, zr);
-    *out_conc    = sqrtf(zr*zr + zi*zi) / abs_sum;
-    *out_rms     = sqrtf(sse / (float)n);
-    return true;
-}
-
-// Fold one sector observation into the contact list.  Contacts are
-// matched by bearing so a person walking around the outside stays one
-// contact rather than blinking in and out as they cross sectors.
-static void exterior_update(const ObsVec &obs,
-                            const TargetState *targets, int K,
-                            bool interior_explained_it) {
-    uint32_t now = millis();
-
-    // Retire stale contacts first.
-    for (int i = 0; i < EXT_MAX_CONTACTS; i++) {
-        if (!s_ext[i].active) continue;
-        if (now - s_ext[i].last_seen_ms > EXT_HOLD_MS) s_ext[i].active = false;
-    }
-    // If the interior solve fully explained this frame, there is nothing
-    // left over to be outside.
-    if (interior_explained_it) return;
-
-    float bearing, conc, rms;
-    if (!exterior_sector(obs, targets, K, &bearing, &conc, &rms)) return;
-
-    // Sensitivity is set at the LOW end of the aspect envelope measured
-    // during the exterior ROTATE, so a body turned edge-on still trips.
-    float trip = EXT_TRIP_RMS * (s_ext_calibrated ? s_ext_amp_floor_frac : 1.0f);
-    if (rms < trip) return;
-
-    // The sector can never be narrower than the array's own resolution
-    // (pi/N), nor than the aspect-induced bearing wander we measured.
-    int n_act = 0;
-    for (int b = 0; b < MAX_BEACONS; b++) if (g_app.beacon[b].active) n_act++;
-    if (n_act < 2) return;
-    float half = (float)M_PI / (float)n_act;
-    if (s_ext_calibrated && s_ext_bearing_spread > half)
-        half = s_ext_bearing_spread;
-    // A diffuse pattern widens the sector rather than being thrown away.
-    if (conc < EXT_MIN_CONCENTRATION) half = (float)M_PI * 0.5f;
-
-    // Match to an existing contact by bearing.
-    int slot = -1;
-    float best = 1e30f;
-    for (int i = 0; i < EXT_MAX_CONTACTS; i++) {
-        if (!s_ext[i].active) continue;
-        float d = fabsf(wrap_pi(s_ext[i].bearing_rad - bearing));
-        if (d < half && d < best) { best = d; slot = i; }
-    }
-    if (slot < 0) {
-        for (int i = 0; i < EXT_MAX_CONTACTS; i++)
-            if (!s_ext[i].active) { slot = i; break; }
-        if (slot < 0) return;                    // list full
-        s_ext[slot] = {};
-        s_ext[slot].active        = true;
-        s_ext[slot].id            = s_ext_next_id++;
-        s_ext[slot].bearing_rad   = bearing;
-        s_ext[slot].first_seen_ms = now;
-    } else {
-        // Smooth the bearing; circular EMA via unit vectors.
-        float bx = 0.75f * cosf(s_ext[slot].bearing_rad) + 0.25f * cosf(bearing);
-        float by = 0.75f * sinf(s_ext[slot].bearing_rad) + 0.25f * sinf(bearing);
-        s_ext[slot].bearing_rad = atan2f(by, bx);
-    }
-    s_ext[slot].sector_half_rad = half;
-    s_ext[slot].energy          = rms;
-    s_ext[slot].confidence      = conc;
-    s_ext[slot].last_seen_ms    = now;
-    if (s_ext[slot].confirm_count < 0xFFFF) s_ext[slot].confirm_count++;
 }
 
 // ── Rasterize track posteriors into the display field ───────────
@@ -2352,15 +1840,7 @@ void scene_update() {
     build_obs_vec(g_last_obs, obs);
 
     // ── 3) Compose current target set from active tracks ──
-    // v0.9: STATIC, not stack.  TargetState is 340 B (it embeds a full
-    // MeasModel plus both numerical Jacobians), and scene_update holds
-    // targets[] and trial[] live at the same time.  At SCENE_MAX_TARGETS=6
-    // that is 4 KB of the 8192 B Arduino loop stack, on top of
-    // gn_solve_joint's 18x18 Hessian -- 76% used, and the peak only
-    // occurs when 5-6 targets are actually being fitted, i.e. with people
-    // in the room.  scene_update() is called from exactly one place and
-    // is not reentrant, so static is safe and moves this off the stack.
-    static TargetState targets[SCENE_MAX_TARGETS];
+    TargetState targets[SCENE_MAX_TARGETS];
     int trk_idx[SCENE_MAX_TARGETS];
     int K = 0;
     for (int t = 0; t < TRACK_MAX && K < SCENE_MAX_TARGETS; t++) {
@@ -2375,53 +1855,25 @@ void scene_update() {
 
     // ── 5) Try birth: does adding a target improve joint likelihood
     //       by at least MIN_LOG_LIK_GAIN_TO_ADD? ──
-    const int k_max = scene_max_targets_for_frame(obs);
-    bool interior_explained = false;
-    while (K < k_max) {
+    while (K < SCENE_MAX_TARGETS) {
         float bx, by, bscore;
         if (!birth_search(obs, targets, K, &bx, &by, &bscore)) break;
-        static TargetState trial[SCENE_MAX_TARGETS];   // see note above
+        TargetState trial[SCENE_MAX_TARGETS];
         for (int k = 0; k < K; k++) trial[k] = targets[k];
         trial[K].pos[0] = bx;
         trial[K].pos[1] = by;
         trial[K].alpha  = ALPHA_INIT;
         int K_new = K + 1;
         float ll_new = gn_solve_joint(obs, trial, K_new);
-        // v0.85: BIC-style penalty for the 3 parameters a target adds is
-        // 0.5*k*ln(n_obs) = 1.5*ln(D_valid).  The old fixed 4.0 was tuned
-        // for roughly 14 channels; left constant it makes births CHEAPER
-        // as beacons are added, because the log-likelihood sums over more
-        // channels.  Scaling keeps birth sensitivity constant from 3 to 6.
-        int d_valid_b = 0;
-        for (int d = 0; d < D_OBS; d++) if (obs.valid[d]) d_valid_b++;
-        // BIC penalty for the 3 parameters a target adds is
-        // 0.5*k*ln(n_obs) = 1.5*ln(D_valid).  But taking that alone
-        // LOWERS the bar at low channel counts: at 3 beacons with no AoA
-        // D_valid is 6 and 1.5*ln(6) = 2.69, well under the tuned 4.0 --
-        // which would make spurious births EASIER on the 3-beacon path
-        // that the whole system was tuned around.  Take the stricter of
-        // the two: 3-beacon behaviour is then bit-identical to v0.7, and
-        // the bar only rises once extra channels actually justify it.
-        float bic = 1.5f * logf((float)(d_valid_b > 2 ? d_valid_b : 3));
-        float gain_needed = (bic > MIN_LOG_LIK_GAIN_TO_ADD)
-                          ? bic : MIN_LOG_LIK_GAIN_TO_ADD;
-        if (ll_new - ll_cur > gain_needed) {
+        if (ll_new - ll_cur > MIN_LOG_LIK_GAIN_TO_ADD) {
             for (int k = 0; k < K_new; k++) targets[k] = trial[k];
             trk_idx[K] = -1;   // will be assigned to a new track below
             K = K_new;
             ll_cur = ll_new;
-            interior_explained = true;
         } else {
             break;
         }
     }
-
-    // ── 5b) EXTERIOR regime ──
-    // Whatever the interior solve could not explain is not noise to be
-    // dropped: it is a contact we cannot localize.  Report it as a
-    // bearing.  `interior_explained` is true when the last birth attempt
-    // succeeded, i.e. the residual found a home inside the covered area.
-    exterior_update(obs, targets, K, interior_explained);
 
     // ── 6) Death: remove targets whose alpha dropped below floor ──
     // Prune in place; if K changes, re-solve on the pruned set.
@@ -2550,364 +2002,3 @@ const KernelSample *scene_kernel_sample(int idx) {
     return &s_kernel[idx];
 }
 float scene_novelty_score() { return s_novelty; }
-
-// ═══════════════════════════════════════════════════════════════
-//  v0.8 — PROBE UNDOCK MODE
-// ═══════════════════════════════════════════════════════════════
-//
-//  Two halves, running on opposite units:
-//
-//  PROBE  : scene_finalize_probe_kernel() once at end of cal, then
-//           scene_estimate_probe_position() every tick while undocked.
-//  ANCHOR : scene_apply_self_suppression() after each scene_update(),
-//           using the position the probe reported over the peer link.
-//
-//  The probe's estimator is deliberately SIMPLER than the target
-//  inference in scene_update().  Target inference has to solve for an
-//  unknown number of occluders, each with an unknown body-strength
-//  alpha.  The probe has to solve for exactly one position, and there
-//  is no alpha: the kernel entry at landmark L is literally "what this
-//  radio measured while it sat at L", and while undocked the probe is
-//  measuring the same quantity from wherever it now is.  So the model
-//  is a direct match y ≈ h_probe(p) — no superposition, no birth/death,
-//  no matching pursuit.  Coarse grid → local refine → curvature.
-
-// Per-beacon weights for the probe's own kernel.  Mirrors the
-// discriminability/noise ratio that scene_finalize_cal computes for the
-// anchor, but over the probe's kernel and without the loop-closure and
-// orientation terms (the probe never ran those experiments).
-bool scene_finalize_probe_kernel() {
-    s_probe_kernel_ready = false;
-    for (int b = 0; b < MAX_BEACONS; b++) s_probe_beacon_weight[b] = 1.0f;
-    if (s_kernel_count < 4) {
-        MSLOG("[scene] probe kernel too small (%d samples)\n", s_kernel_count);
-        return false;
-    }
-
-    int usable_beacons = 0;
-    for (int b = 0; b < MAX_BEACONS; b++) {
-        double sum_across = 0, sum_across2 = 0, sum_within = 0;
-        int n_across = 0, n_within = 0;
-        for (int i = 0; i < s_kernel_count; i++) {
-            if (s_kernel[i].b[b].sample_count == 0) continue;
-            sum_across  += s_kernel[i].b[b].mean_amp;
-            sum_across2 += sq(s_kernel[i].b[b].mean_amp);
-            sum_within  += s_kernel[i].b[b].std_amp;
-            n_across++; n_within++;
-        }
-        if (n_across < 2) { s_probe_beacon_weight[b] = 0.0f; continue; }
-        float m = (float)(sum_across / n_across);
-        float across_var = (float)(sum_across2 / n_across) - sq(m);
-        if (across_var < 0) across_var = 0;
-        float within = (float)(sum_within / n_within);
-        if (within < 1e-6f) within = 1e-6f;
-        float w = sqrtf(across_var) / within;
-        if (!isfinite(w) || w < 0.01f) w = 0.01f;
-        s_probe_beacon_weight[b] = w;
-        usable_beacons++;
-    }
-
-    // Self-localization from amplitude alone needs at least three
-    // independent illuminators to pin down (x, y) without a reflection
-    // ambiguity, which matches the 3-beacon floor of the whole system.
-    if (usable_beacons < 3) {
-        MSLOG("[scene] probe kernel unusable: %d beacons\n", usable_beacons);
-        return false;
-    }
-    s_probe_kernel_ready = true;
-    MSLOG("[scene] probe kernel ready: %d samples, %d beacons\n",
-                  s_kernel_count, usable_beacons);
-    return true;
-}
-
-bool scene_probe_kernel_ready() { return s_probe_kernel_ready; }
-
-// Maximum distance (normalized units) a candidate position may sit from
-// the nearest kernel sample and still be considered.
-//
-// This gate is load-bearing, not a tidiness measure.  meas_model()
-// interpolates by 6-NN IDW, which OUTSIDE the walked region degenerates
-// to a near-constant average of whatever samples happen to be closest.
-// The cost surface out there is flat and meaningless — and a flat
-// surface can easily sit lower than the true position's basin, so the
-// argmin runs away to a place the user has never been.  Observed in
-// the synthetic 3-beacon case: true position 0.18 from the nearest
-// sample, winning position 0.75 away and badly wrong.  Roughly four
-// grid cells, i.e. about one adult stride at typical room scale.
-#define PROBE_COVERAGE_RADIUS   0.45f
-
-// Distance from (px, py) to the nearest kernel sample.
-static float probe_kernel_coverage_dist(float px, float py) {
-    float best = 1e30f;
-    for (int i = 0; i < s_kernel_count; i++) {
-        float d = dist2(px, py, s_kernel[i].pos[0], s_kernel[i].pos[1]);
-        if (d < best) best = d;
-    }
-    return sqrtf(best);
-}
-
-// Cost = negative log-likelihood of the probe sitting at (px, py).
-// Amp + phase channels only: AoA is a stereo product and the undocked
-// probe has no stereo partner, so those channels are never valid here.
-static float probe_cost_at(const ObsVec &o, float px, float py,
-                           int *out_n_contrib, float *out_sse) {
-    MeasModel m;
-    meas_model(px, py, m);
-    float cost = 0, sse = 0;
-    int n = 0;
-    for (int b = 0; b < MAX_BEACONS; b++) {
-        float w = s_probe_beacon_weight[b];
-        if (w <= 0.0f) continue;
-        const int chans[2] = { CH_AMP(b), CH_PHASE(b) };
-        for (int c = 0; c < 2; c++) {
-            int d = chans[c];
-            if (!o.valid[d] || !m.valid[d]) continue;
-            float r = channel_residual(d, o.y[d], m.mean[d]);
-            float v = fmaxf(1e-6f, m.var[d]);
-            float z = r / sqrtf(v);
-            cost += w * huber(z) + 0.5f * w * logf(v);
-            sse  += r * r;
-            n++;
-        }
-    }
-    if (out_n_contrib) *out_n_contrib = n;
-    if (out_sse) *out_sse = sse;
-    // No contributing channel → flat, maximally-bad cost so the search
-    // never prefers a cell it knows nothing about.
-    if (n == 0) return 1e30f;
-    return cost;
-}
-
-bool scene_estimate_probe_position(const FrameObservation &obs,
-                                   float out_pos[2],
-                                   float out_cov[3],
-                                   float *out_conf) {
-    if (!s_probe_kernel_ready) return false;
-
-    ObsVec o;
-    build_obs_vec(obs, o);
-    int n_valid_beacons = 0;
-    for (int b = 0; b < MAX_BEACONS; b++)
-        if (o.valid[CH_AMP(b)]) n_valid_beacons++;
-    if (n_valid_beacons < 3) return false;
-
-    // ── Coarse pass over the field grid ──
-    // We keep the whole cost map because we need more than the argmin:
-    // amplitude-only self-localization has genuine spatial aliases (two
-    // far-apart cells that explain the same readings almost equally
-    // well), and a fix sitting on one of those is exactly the case
-    // where the anchor must NOT be told to trust it.  Cheaper than it
-    // looks: FIELD_DIM² = 576 floats = 2.3 KB, and the map is scanned
-    // twice rather than the kernel being walked twice.
-    static float cost_map[FIELD_DIM][FIELD_DIM];
-    float best_px = 0, best_py = 0, best_cost = 1e30f;
-    int best_gx = 0, best_gy = 0;
-    for (int gy = 0; gy < FIELD_DIM; gy++) {
-        for (int gx = 0; gx < FIELD_DIM; gx++) {
-            float px, py;
-            cell_to_pos(gx, gy, &px, &py);
-            // Coverage gate first — skipping an uncovered cell also
-            // skips its meas_model() call, so this pass is CHEAPER
-            // than the ungated one, not more expensive.
-            if (probe_kernel_coverage_dist(px, py) > PROBE_COVERAGE_RADIUS) {
-                cost_map[gx][gy] = 1e30f;
-                continue;
-            }
-            float c = probe_cost_at(o, px, py, nullptr, nullptr);
-            cost_map[gx][gy] = c;
-            if (c < best_cost) {
-                best_cost = c; best_px = px; best_py = py;
-                best_gx = gx; best_gy = gy;
-            }
-        }
-    }
-    if (best_cost >= 1e29f) return false;
-
-    // Runner-up outside the winner's basin — same spatial-exclusion
-    // rule the target birth search uses, so "second peak" means a
-    // genuinely separate hypothesis rather than the winner's own skirt.
-    float runner_cost = 1e30f;
-    for (int gy = 0; gy < FIELD_DIM; gy++) {
-        for (int gx = 0; gx < FIELD_DIM; gx++) {
-            int ddx = gx - best_gx, ddy = gy - best_gy;
-            if (ddx < 0) ddx = -ddx;
-            if (ddy < 0) ddy = -ddy;
-            int cheb = ddx > ddy ? ddx : ddy;
-            if (cheb <= PEAK_EXCLUSION_CELLS * 2) continue;
-            if (cost_map[gx][gy] < runner_cost) runner_cost = cost_map[gx][gy];
-        }
-    }
-
-    // ── Sub-cell refinement: axial probes, halving step ──
-    const float cell = (2.0f * SCENE_EXTENT) / (float)FIELD_DIM;
-    float step = cell * REFINE_STEP_FRAC;
-    for (int it = 0; it < REFINE_ITERS; it++) {
-        const float cand[4][2] = {
-            { best_px + step, best_py }, { best_px - step, best_py },
-            { best_px, best_py + step }, { best_px, best_py - step },
-        };
-        for (int k = 0; k < 4; k++) {
-            float cx = clampf(cand[k][0], -SCENE_EXTENT, SCENE_EXTENT);
-            float cy = clampf(cand[k][1], -SCENE_EXTENT, SCENE_EXTENT);
-            if (probe_kernel_coverage_dist(cx, cy) > PROBE_COVERAGE_RADIUS) continue;
-            float c = probe_cost_at(o, cx, cy, nullptr, nullptr);
-            if (c < best_cost) { best_cost = c; best_px = cx; best_py = cy; }
-        }
-        step *= 0.5f;
-    }
-
-    int n_contrib = 0; float sse = 0;
-    probe_cost_at(o, best_px, best_py, &n_contrib, &sse);
-
-    // ── Covariance from the curvature of the cost surface ──
-    // The Hessian of the negative log-likelihood at the optimum IS the
-    // Fisher information, so its inverse is the posterior covariance.
-    // Central differences at half a cell — small enough to be local,
-    // large enough not to be swallowed by the kernel's IDW noise.
-    const float h = cell * 0.5f;
-    float c0  = best_cost;
-    float cxp = probe_cost_at(o, best_px + h, best_py, nullptr, nullptr);
-    float cxm = probe_cost_at(o, best_px - h, best_py, nullptr, nullptr);
-    float cyp = probe_cost_at(o, best_px, best_py + h, nullptr, nullptr);
-    float cym = probe_cost_at(o, best_px, best_py - h, nullptr, nullptr);
-    float cpp = probe_cost_at(o, best_px + h, best_py + h, nullptr, nullptr);
-    float cpm = probe_cost_at(o, best_px + h, best_py - h, nullptr, nullptr);
-    float cmp = probe_cost_at(o, best_px - h, best_py + h, nullptr, nullptr);
-    float cmm = probe_cost_at(o, best_px - h, best_py - h, nullptr, nullptr);
-
-    float Hxx = (cxp - 2.0f * c0 + cxm) / (h * h);
-    float Hyy = (cyp - 2.0f * c0 + cym) / (h * h);
-    float Hxy = (cpp - cpm - cmp + cmm) / (4.0f * h * h);
-
-    // A non-PD Hessian means the optimum isn't a well-formed basin
-    // (flat or saddle region of the kernel).  Fall back to a wide,
-    // isotropic covariance rather than inventing a sharp one.
-    float cov_xx, cov_yy, cov_xy;
-    float detH = Hxx * Hyy - Hxy * Hxy;
-    const float WIDE = 0.25f;      // ~0.5 normalized-unit 1-sigma
-    if (Hxx > 1e-6f && Hyy > 1e-6f && detH > 1e-9f) {
-        cov_xx =  Hyy / detH;
-        cov_yy =  Hxx / detH;
-        cov_xy = -Hxy / detH;
-    } else {
-        cov_xx = cov_yy = WIDE; cov_xy = 0;
-    }
-    // Clamp: never claim sub-cm precision, never report a covariance so
-    // wide that self-suppression would swallow the whole room.
-    cov_xx = clampf(cov_xx, POST_COV_FLOOR, WIDE);
-    cov_yy = clampf(cov_yy, POST_COV_FLOOR, WIDE);
-    float cov_lim = sqrtf(cov_xx * cov_yy) * 0.95f;   // keep it PD
-    cov_xy = clampf(cov_xy, -cov_lim, cov_lim);
-
-    // ── Confidence ──
-    // Two independent things have to be true for a fix to be trusted:
-    // the basin has to be sharp (observability), and the residual has
-    // to be small (fit quality).  Multiplying means either one being
-    // bad drags the confidence down, which is the behaviour we want
-    // for gating self-suppression.
-    float sigma = sqrtf(0.5f * (cov_xx + cov_yy));
-    float obs_term = clampf(1.0f - (sigma / 0.45f), 0.0f, 1.0f);
-    float rms = n_contrib > 0 ? sqrtf(sse / (float)n_contrib) : 1.0f;
-    float fit_term = clampf(1.0f - rms, 0.0f, 1.0f);
-
-    // Third term: separation from the best competing hypothesis.  A
-    // sharp basin with a small residual can still be the WRONG basin —
-    // curvature and fit are both local, and neither can see an alias
-    // sitting across the room.  Without this term a 3-beacon fix that
-    // has landed on a mirror of the true position reports high
-    // confidence, and the anchor would then tag a real intruder as
-    // "YOU".  Scaled against the spread of the cost surface so it is
-    // unit-free.
-    float alias_term = 1.0f;
-    if (runner_cost < 1e29f) {
-        float margin = runner_cost - best_cost;
-        float scale  = fabsf(best_cost) * 0.25f + 1e-3f;
-        alias_term = clampf(margin / scale, 0.0f, 1.0f);
-    }
-
-    float conf = obs_term * fit_term * alias_term;
-    if (!isfinite(conf)) conf = 0;
-
-    out_pos[0] = best_px;
-    out_pos[1] = best_py;
-    out_cov[0] = cov_xx;
-    out_cov[1] = cov_yy;
-    out_cov[2] = cov_xy;
-    if (out_conf) *out_conf = conf;
-    return true;
-}
-
-// ── ANCHOR side: tag tracks that are (probably) the probe carrier ──
-void scene_apply_self_suppression(const float probe_pos[2],
-                                  const float probe_cov[3]) {
-    // 2-sigma in the COMBINED uncertainty of the probe fix and the
-    // track fix.  Probe self-position is typically 30-50cm 1-sigma and
-    // a track is 20-40cm, so the combined 2-sigma cancellation radius
-    // lands around 0.8-1.4m: wide enough to hold onto the carrier while
-    // they stand still, narrow enough not to eat someone a metre away.
-    const float SELF_THRESH = 2.0f;
-    for (int t = 0; t < TRACK_MAX; t++) {
-        if (!s_tracks[t].active) { s_tracks[t].is_self = 0; continue; }
-        float cxx = probe_cov[0] + s_tracks[t].cov_xx;
-        float cyy = probe_cov[1] + s_tracks[t].cov_yy;
-        float cxy = probe_cov[2] + s_tracks[t].cov_xy;
-        float det = cxx * cyy - cxy * cxy;
-        if (det < 1e-9f) { s_tracks[t].is_self = 0; continue; }
-        float inv_xx =  cyy / det;
-        float inv_yy =  cxx / det;
-        float inv_xy = -cxy / det;
-        float dx = s_tracks[t].pos[0] - probe_pos[0];
-        float dy = s_tracks[t].pos[1] - probe_pos[1];
-        float m2 = dx*dx*inv_xx + dy*dy*inv_yy + 2.0f*dx*dy*inv_xy;
-        s_tracks[t].is_self = (m2 < SELF_THRESH * SELF_THRESH) ? 1 : 0;
-    }
-
-    // v0.85: the operator carrying the undocked probe can walk OUTSIDE
-    // the ring, where they stop being a track and become an exterior
-    // contact.  Mahalanobis distance is meaningless out there because a
-    // contact has no position, so match in the bearing domain instead:
-    // if the probe reports itself beyond the ring and its bearing lines
-    // up with a sector, that sector is the operator.
-    //
-    // Tagged, never hidden — same rule as tracks.  An operator who can't
-    // see themselves on the perimeter has lost awareness of their own
-    // position, which is the opposite of the point.
-    float pr = sqrtf(sq(probe_pos[0]) + sq(probe_pos[1]));
-    if (pr > 0.9f) {
-        float pb = atan2f(probe_pos[1], probe_pos[0]);
-        for (int i = 0; i < EXT_MAX_CONTACTS; i++) {
-            if (!s_ext[i].active) continue;
-            float d = fabsf(wrap_pi(s_ext[i].bearing_rad - pb));
-            s_ext[i].is_self = (d <= s_ext[i].sector_half_rad) ? 1 : 0;
-        }
-    } else {
-        for (int i = 0; i < EXT_MAX_CONTACTS; i++) s_ext[i].is_self = 0;
-    }
-}
-
-int scene_exterior_count() {
-    int n = 0;
-    for (int i = 0; i < EXT_MAX_CONTACTS; i++)
-        if (s_ext[i].active && s_ext[i].confirm_count >= EXT_CONFIRM_FRAMES) n++;
-    return n;
-}
-
-const ExteriorContact *scene_get_exterior(int idx) {
-    int n = 0;
-    for (int i = 0; i < EXT_MAX_CONTACTS; i++) {
-        if (!s_ext[i].active) continue;
-        if (s_ext[i].confirm_count < EXT_CONFIRM_FRAMES) continue;
-        if (n == idx) return &s_ext[i];
-        n++;
-    }
-    return nullptr;
-}
-
-bool  scene_exterior_calibrated()     { return s_ext_calibrated; }
-float scene_exterior_amp_floor()      { return s_ext_amp_floor_frac; }
-float scene_exterior_bearing_spread() { return s_ext_bearing_spread; }
-
-void scene_clear_self_suppression() {
-    for (int t = 0; t < TRACK_MAX; t++) s_tracks[t].is_self = 0;
-    for (int i = 0; i < EXT_MAX_CONTACTS; i++) s_ext[i].is_self = 0;
-}

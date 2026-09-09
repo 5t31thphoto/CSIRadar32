@@ -3,334 +3,173 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MantisSec CSI Radar32 — Wi-Fi Presence Sensing</title>
-<meta name="description" content="MantisSec CSI-Radar32: open-source Wi-Fi channel state presence detection for arbitrary rooms. Flash it from your browser.">
-<link rel="icon" href="assets/favicon.ico" sizes="any">
-<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
-<link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16.png">
-<link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+<meta name="robots" content="noindex, nofollow">
+<title>MantisSec CSI-Radar-S3 — Web Flasher</title>
+<link rel="icon" type="image/png" href="assets/favicon.png">
 <link rel="stylesheet" href="style.css">
+<!-- ESP Web Tools — provides <esp-web-install-button> custom element.
+     v10.1.0 pinned; version bump requires manual verification against
+     the chip ROM stubs the library ships with. -->
+<script type="module"
+        src="https://unpkg.com/esp-web-tools@10.1.0/dist/web/install-button.js?module"></script>
 </head>
 <body>
+<div class="page">
 
-<!-- ═══════════════════════════════════════════════════════════════
-     SWAPPABLE ASSETS — edit this block to replace any placeholder
-     graphic with your own photo.  Change the path, that's it.
-     Every <img data-asset="key"> gets its src from ASSETS[key];
-     every <a data-affiliate="key"> gets its href from AFFILIATE[key].
-     ═══════════════════════════════════════════════════════════════ -->
-<script>
-const ASSETS = {
-    // Hero diagram at the top of the page
-    hero:            "assets/landing-hero.png",
-
-    // The 3-panel "how it works" strip
-    how_it_works:    "assets/how-it-works.png",
-
-    // ═══ Device screencaps (portrait, T-Display S3 native 170x320) ═══
-    // Pixel-art approximations of what the receiver shows.
-    // Replace with real captures if you want.
-    observe_splash:  "assets/screencap-splash.png",
-    observe_cal:     "assets/screencap-cal.png",
-    observe_live:    "assets/screencap-live.png",
-
-    // ═══ Installation photos ═══
-    // Stand-in pixel-art graphics live here until you swap them for
-    // real photos.  Recommended aspect: 4:3 landscape, ~800px wide.
-    photo_hardware:  "assets/photo-hardware.png",
-    photo_mounted:   "assets/photo-mounted.png",
-    photo_room:      "assets/photo-room.png",
-};
-
-const AFFILIATE = {
-    tdisplay_s3: "https://www.amazon.com/dp/B0BRTT727Z/?tag=5t31th-20",
-    xiao_c3:     "https://www.amazon.com/dp/B0DGX3LSC7/?tag=5t31th-20",
-    xiao_s3:     "https://www.amazon.com/dp/B0DJ6NQFKX/?tag=5t31th-20",
-};
-     
-// ═══════════════════════════════════════════════════════════════
-// 2. THE ANIMATION SYSTEM — Automated Layer Injection
-// ═══════════════════════════════════════════════════════════════
-document.addEventListener("DOMContentLoaded", () => {
-    // This automatically finds your top hero banner image via its template class
-    const heroImg = document.querySelector('.lp-hero-img');
-    if (heroImg) {
-        initInteractiveOverlay(heroImg);
-    }
-});
-
-function initInteractiveOverlay(imgElement) {
-    // 1. Create a structural block container to protect responsive margins
-    const container = document.createElement('div');
-    container.style.position = 'relative';
-    container.style.display = 'inline-block';
-    container.style.width = '100%';
-    
-    // 2. Inject container safely around the static image element
-    imgElement.parentNode.insertBefore(container, imgElement);
-    container.appendChild(imgElement);
-
-    // 3. Mount the transparent hardware acceleration drawing overlay
-    const canvas = document.createElement('canvas');
-    canvas.style.position = 'absolute';
-    canvas.style.top = '0';
-    canvas.style.left = '0';
-    canvas.style.width = '100%';
-    canvas.style.height = '100%';
-    canvas.style.pointerEvents = 'none'; // Passthrough so users can right-click/drag image
-    container.appendChild(canvas);
-
-    const ctx = canvas.getContext('2d');
-    
-    // 4. Force coordinates to auto-recalculate when windows scale or resize
-    function synchronizeBounds() {
-        canvas.width = imgElement.clientWidth;
-        canvas.height = imgElement.clientHeight;
-    }
-    window.addEventListener('resize', synchronizeBounds);
-    imgElement.addEventListener('load', synchronizeBounds);
-    synchronizeBounds();
-
-    // 5. The core real-time rendering loop
-    let renderingFrame = 0;
-    function animationEngine() {
-        renderingFrame++;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        // Pass context tracking directly to our physics engine
-        drawHeroLayers(ctx, canvas.width, canvas.height, renderingFrame);
-        
-        requestAnimationFrame(animationEngine);
-    }
-    requestAnimationFrame(animationEngine);
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 3. PHYSICS PROCESSING ENGINE — Multipath Phase Distortions (NEW PERSPECTIVE)
-// ═══════════════════════════════════════════════════════════════
-function drawHeroLayers(ctx, w, h, frame) {
-    ctx.globalCompositeOperation = 'screen';
-    
-    // Coordinates updated to track perfectly with your new image layout perspective
-    const rxX = w * 0.355, rxY = h * 0.690;       // Receivers (RX1/RX2 at the bottom-left layout cluster)
-    const humanX = w * 0.612, humanY = h * 0.445; // Human target position (Center hallway vector)
-    
-    const beacons = [
-        { x: w * 0.438, y: h * 0.115, color: 'rgba(255, 0, 255, ' },  // Beacon 1 (Top Center Magenta)
-        { x: w * 0.902, y: h * 0.178, color: 'rgba(160, 32, 240, ' }, // Beacon 2 (Far Right Top Purple)
-        { x: w * 0.875, y: h * 0.855, color: 'rgba(160, 32, 240, ' }  // Beacon 3 (Far Right Bottom Purple)
-    ];
-
-    // A. OMNIDIRECTIONAL FLOOD: Beacons radiating wide telemetry waves across the entire room
-    beacons.forEach((beacon, index) => {
-        let waveCycle = ((frame + (index * 45)) % 150) / 150;
-        ctx.strokeStyle = `${beacon.color}${0.32 * (1 - waveCycle)})`;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.arc(beacon.x, beacon.y, waveCycle * (w * 0.38), 0, Math.PI * 2);
-        ctx.stroke();
-    });
-
-    // B. MULTIPATH CHANNELS: Linear tracking direct lines + human-scattered waves
-    beacons.forEach(beacon => {
-        // Direct Baseline static path
-        ctx.strokeStyle = 'rgba(0, 165, 165, 0.12)'; 
-        ctx.lineWidth = 0.75;
-        ctx.beginPath();
-        ctx.moveTo(beacon.x, beacon.y);
-        ctx.lineTo(rxX, rxY);
-        ctx.stroke();
-
-        // Perturbed Scatter Path flowing directly through the new human coordinates
-        ctx.strokeStyle = 'rgba(168, 255, 0, 0.35)'; // Phase perturbation line (--ms-lime)
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        
-        let segments = 45;
-        for (let i = 0; i <= segments; i++) {
-            let percent = i / segments;
-            let currX, currY;
-            
-            if (percent < 0.5) {
-                let t = percent * 2;
-                currX = beacon.x + (humanX - beacon.x) * t;
-                currY = beacon.y + (humanY - beacon.y) * t;
-            } else {
-                let t = (percent - 0.5) * 2;
-                currX = humanX + (rxX - humanX) * t;
-                currY = humanY + (rxY - humanY) * t;
-            }
-            
-            // Generate active sine wave distortion centered exactly over human body profile
-            let proximityToHuman = Math.max(0, 1 - (Math.abs(percent - 0.5) * 3.2)); 
-            let phaseDistortion = Math.sin(percent * 22 - (frame * 0.13)) * (4.5 * proximityToHuman);
-            
-            if (i === 0) ctx.moveTo(currX, currY + phaseDistortion);
-            else ctx.lineTo(currX, currY + phaseDistortion);
-        }
-        ctx.stroke();
-    });
-
-    // C. PERTURBATION HALO: Active target footprint signature bloom
-    let glowRipple = Math.sin(frame * 0.05) * 2.5;
-    ctx.fillStyle = 'rgba(168, 255, 0, 0.05)'; // Soft luminous tracking layer
-    ctx.beginPath();
-    ctx.arc(humanX, humanY, 14 + glowRipple, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.strokeStyle = 'rgba(168, 255, 0, 0.22)';
-    ctx.lineWidth = 0.5;
-    ctx.beginPath();
-    ctx.arc(humanX, humanY, 20 - glowRipple, 0, Math.PI * 2);
-    ctx.stroke();
-}
-
-</script>
-
-<div class="page landing">
-
-    <!-- ═══ Hero ═══ -->
-    <header class="lp-hero">
-        <img data-asset="hero" alt="MantisSec system schematic" class="lp-hero-img">
-        <div class="lp-hero-copy">
-            <div class="lp-brand"><span class="brand">MantisSec</span></div>
-            <h1 class="lp-tagline">See who's in the room. Without a camera.</h1>
-            <p class="lp-lede">
-                Open-source Wi-Fi <strong>channel-state presence sensing</strong>
-                for arbitrary rooms. Three tiny beacons, two little
-                receivers, one calibration walk, and a live top-down
-                map of who's moving through the space.
-            </p>
-            <div class="lp-cta-row">
-                <a class="lp-cta-primary" href="flash.html">
-                    START HERE &nbsp;&rarr;&nbsp; Flash your hardware
-                </a>
-                <a class="lp-cta-secondary" href="#hardware">
-                    don't have the hardware yet? GET IT HERE
-                </a>
-            </div>
+    <!-- ═══ Header ═══ -->
+    <header class="header">
+        <!-- Splash mantis — raster image dropped into docs/assets/.
+             Fallback SVG glyph shown if the PNG is missing so the page
+             still looks intentional in dev. -->
+        <picture class="header-mark">
+            <source srcset="assets/mantis-splash.png" type="image/png">
+            <img src="assets/mantis-splash.png"
+                 alt="MantisSec mark"
+                 width="72" height="72"
+                 onerror="this.replaceWith(document.getElementById('mantis-fallback').content.cloneNode(true))">
+        </picture>
+        <template id="mantis-fallback">
+            <svg class="header-mark" viewBox="0 0 64 64" fill="none">
+                <ellipse cx="32" cy="22" rx="7" ry="9" fill="none"
+                         stroke="#00A5A5" stroke-width="1.8"/>
+                <circle cx="27" cy="19" r="2.2" fill="#A8FF00"/>
+                <circle cx="37" cy="19" r="2.2" fill="#A8FF00"/>
+                <path d="M32 30 L32 52" stroke="#5D005D" stroke-width="1.8"/>
+                <path d="M25 25 L18 30 L20 38 L26 36 M39 25 L46 30 L44 38 L38 36"
+                      stroke="#5D005D" stroke-width="1.8" fill="none"/>
+            </svg>
+        </template>
+        <div class="header-title">
+            <h1><span class="brand">MantisSec</span> · CSI-Radar-S3</h1>
+            <div class="subtitle">Firmware · Web Flasher</div>
         </div>
     </header>
 
-    <!-- ═══ What it is ═══ -->
-    <section class="panel lp-section">
-        <div class="lp-section-head">
-            <span class="lp-section-num">// what</span>
-            <h2>What it is</h2>
+    <!-- Browser warning (Web Serial only in Chromium) -->
+    <div id="browser-warn" class="browser-warn"></div>
+
+    <!-- ═══ Flash panel ═══ -->
+    <section class="panel">
+
+        <div class="form-row">
+            <label for="role-select">1 · What are you flashing?</label>
+            <select id="role-select">
+                <option value="">— pick a device —</option>
+                <option value="receiver">Receiver (T-Display-S3)</option>
+                <option value="beacon-1">Beacon 1</option>
+                <option value="beacon-2">Beacon 2</option>
+                <option value="beacon-3">Beacon 3</option>
+            </select>
         </div>
-        <div class="instructions lp-prose">
-            <p>
-                Every Wi-Fi packet carries a <strong>channel state
-                information</strong> vector, a fingerprint of
-                the multipath between two radios. Move a body through
-                the room and that fingerprint deforms in predictable
-                ways.
-            </p>
-            <p>
-                MantisSec CSI Radar32 is the whole stack for building a room-scale
-                presence sensor out of that signal. Three <strong>ESP32-C3
-                beacons</strong> transmit at a known cadence. Two
-                <strong>ESP32-S3 receivers</strong> catch the beacons,
-                extract CSI, run an inverse sensor model, and paint a
-                live top-down map on a little screen.
-            </p>
-            <p>
-                All firmware is <strong>open source</strong>. All hardware
-                is <strong>off-the-shelf</strong>. Nothing calls home.
-                Nothing sees inside your walls. It's just wi-fi doing
-                what wi-fi does and we treat it like a light source.
-            </p>
+
+        <div class="form-row">
+            <label for="board-select">2 · Which board is plugged in?</label>
+            <select id="board-select" disabled>
+                <option value="">— select device first —</option>
+            </select>
         </div>
+
+        <div class="action-row">
+            <esp-web-install-button id="install-btn">
+                <button slot="activate" class="flash-btn" id="activate-btn">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                    </svg>
+                    <span id="btn-label">Select device &amp; board</span>
+                </button>
+                <span slot="unsupported">
+                    <button class="flash-btn">Browser not supported</button>
+                </span>
+                <span slot="not-allowed">
+                    <button class="flash-btn">HTTPS required</button>
+                </span>
+            </esp-web-install-button>
+        </div>
+
+        <div id="status" class="status info">
+            <span class="status-dot"></span>
+            <span id="status-msg">Pick what you're flashing and which board you have plugged in.</span>
+        </div>
+
     </section>
 
-    <!-- ═══ How you set it up ═══ -->
-    <section class="panel lp-section">
-        <div class="lp-section-head">
-            <span class="lp-section-num">// how</span>
-            <h2>How you set it up</h2>
-        </div>
-        <img data-asset="how_it_works"
-             alt="Three-step process: flash, place, calibrate"
-             class="lp-fullwidth-img">
-        <div class="instructions lp-prose">
-            <ol class="lp-steps">
-                <li>
-                    <strong>Flash the firmware.</strong> Plug each board
-                    into any computer with Chrome or Edge, click one
-                    button per board.
-                    <a class="lp-inline-cta" href="flash.html">
-                        &rarr; go to our WEB FLASHER
-                    </a>
-                </li>
-                <li>
-                    <strong>Place the hardware.</strong> Put the three
-                    beacons around the room in a rough triangle. Put
-                    the receivers in the middle. No wiring, no added
-                    hassle.
-                </li>
-                <li>
-                    <strong>Walk the calibration.</strong> The device
-                    walks you through a one-time cal walk to each
-                    beacon and back. Takes about 90 seconds.
-                </li>
-                <li>
-                    <strong>Observe.</strong> Live top-down map on the
-                    receiver screen &mdash; see who moves through the
-                    room in real time. Two displays and stereo sensing
-                    if you have two t-display boards.
-                </li>
+    <!-- ═══ Quick directions ═══ -->
+    <section class="panel">
+        <div class="instructions">
+            <h3>Flash flow</h3>
+            <ol>
+                <li>Plug in with a <span class="accent">USB data cable</span>
+                    (not charge-only).</li>
+                <li>Pick device role &amp; board above.</li>
+                <li>Click <span class="accent">Connect &amp; Flash</span>,
+                    pick the port in the browser dialog.</li>
+                <li>Wait 20-60 s. When done, unplug + re-plug to boot.</li>
+            </ol>
+            <h3 style="margin-top: 18px;">If a device won't connect</h3>
+            <ol>
+                <li>Hold <span class="accent">BOOT</span> while plugging in
+                    to force flash mode.</li>
+                <li>Try a different USB cable — many "charging" cables have
+                    no data lines.</li>
+                <li>XIAO: hold BOOT + tap RESET, release RESET first.</li>
             </ol>
         </div>
     </section>
 
-    <!-- ═══ What you see (portrait screencaps) ═══ -->
-    <section class="panel lp-section">
-        <div class="lp-section-head">
-            <span class="lp-section-num">// observe</span>
-            <h2>What you see</h2>
-        </div>
-        <div class="lp-screencap-row">
-            <figure class="lp-screencap">
-                <img data-asset="observe_splash" alt="Splash screen">
-                <figcaption>Boot</figcaption>
-            </figure>
-            <figure class="lp-screencap">
-                <img data-asset="observe_cal" alt="Calibration walk">
-                <figcaption>Cal walk</figcaption>
-            </figure>
-            <figure class="lp-screencap">
-                <img data-asset="observe_live" alt="Live radar view">
-                <figcaption>Live map</figcaption>
-            </figure>
-        </div>
+    <!-- ═══ Beacon &amp; receiver layout ═══ -->
+    <!-- Two image slots — drop raster PNG diagrams into docs/assets/
+         to populate.  Room-agnostic: just shows relative positions of
+         the boards / walk path.  See docs/assets/README.md for how to
+         generate them if the files are missing. -->
+    <section class="panel">
+        <div class="instructions">
+            <h3>How to place the boards</h3>
 
-        <div class="lp-photo-row">
-            <figure>
-                <img data-asset="photo_hardware" alt="Assembled hardware">
-                <figcaption>Assembled hardware</figcaption>
-            </figure>
-            <figure>
-                <img data-asset="photo_mounted" alt="Beacon mounted">
-                <figcaption>Beacon in the wild</figcaption>
-            </figure>
-            <figure>
-                <img data-asset="photo_room" alt="Real installation">
-                <figcaption>Installed in a room</figcaption>
-            </figure>
+            <h4 class="layout-mode-label">Tripwire (1 beacon)</h4>
+            <div class="layout-figure">
+                <img src="assets/layout-tripwire.png"
+                     alt="Tripwire layout: 1 receiver, 1 beacon, watch zone between them"
+                     class="layout-image"
+                     onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'layout-missing',textContent:'[tripwire layout image — drop assets/layout-tripwire.png]'}))">
+            </div>
+            <ul class="layout-notes">
+                <li>Receiver and beacon <span class="accent">1&ndash;5 m apart</span>,
+                    at similar height.</li>
+                <li>Anything crossing the line between them will register.</li>
+                <li>Skip walk-cal — tripwire mode goes straight from empty-room
+                    baseline to running.</li>
+            </ul>
+
+            <h4 class="layout-mode-label">Full mode (2 receivers + 3 beacons)</h4>
+            <div class="layout-figure">
+                <img src="assets/layout-full.png"
+                     alt="Full layout: 2 receivers on 6cm bar (anchor + probe), 3 beacons spread out, dotted walk path connecting all landmarks"
+                     class="layout-image"
+                     onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'layout-missing',textContent:'[full layout image — drop assets/layout-full.png]'}))">
+            </div>
+            <ul class="layout-notes">
+                <li>Beacons <span class="accent">roughly triangular</span>,
+                    similar height, 1&ndash;3 m spacing between them.</li>
+                <li>Receivers on a <span class="accent">6 cm bar</span> — anchor
+                    stays there for cal, probe walks with you.</li>
+                <li>During cal you'll visit each beacon, the centroid, three
+                    edge midpoints, and a point behind the receiver bar.
+                    The device tells you what to do at each stop.</li>
+            </ul>
         </div>
     </section>
 
-    <!-- ═══ Get the hardware ═══ -->
-    <section class="panel lp-section" id="hardware">
-        <div class="lp-section-head">
-            <span class="lp-section-num">// hardware</span>
-            <h2>Get the hardware</h2>
-        </div>
+    <!-- ═══ Supported hardware / affiliate links ═══ -->
+    <section class="panel">
         <div class="instructions">
+            <h3>Supported hardware</h3>
             <p class="hw-blurb">
-                These are the exact boards the firmware targets. Ordering
+                These are the exact boards this firmware targets. Buying
                 through the links below sends a small kickback our way at
-                no cost to you &mdash; it's how the project keeps going.
+                no cost to you &mdash; it's how we keep this project going.
+                Thanks for the support.
             </p>
 
             <div class="hw-item">
@@ -339,10 +178,11 @@ function drawHeroLayers(ctx, w, h, frame) {
                     <span class="hw-role">receiver &times; 1&ndash;2</span>
                 </div>
                 <div class="hw-detail">
-                    ESP32-S3 with a 1.9&Prime; ST7789 display. Two for
-                    full stereo mode, one for solo tripwire.
+                    ESP32-S3 with a 1.9&Prime; ST7789 display. You'll want
+                    two of these for full stereo mode, or one for solo.
                 </div>
-                <a class="hw-link" data-affiliate="tdisplay_s3"
+                <!-- TODO: user drops their affiliate URL here -->
+                <a class="hw-link" href="AFFILIATE_LINK_TDISPLAY_S3"
                    target="_blank" rel="noopener sponsored">
                     Buy T-Display-S3 &rarr;
                 </a>
@@ -355,9 +195,10 @@ function drawHeroLayers(ctx, w, h, frame) {
                 </div>
                 <div class="hw-detail">
                     Small, cheap, low-power. Three of these become the
-                    beacons the receivers listen to.
+                    beacons whose signals the receivers listen to.
                 </div>
-                <a class="hw-link" data-affiliate="xiao_c3"
+                <!-- TODO: user drops their affiliate URL here -->
+                <a class="hw-link" href="AFFILIATE_LINK_XIAO_ESP32C3"
                    target="_blank" rel="noopener sponsored">
                     Buy XIAO ESP32-C3 &rarr;
                 </a>
@@ -370,9 +211,10 @@ function drawHeroLayers(ctx, w, h, frame) {
                 </div>
                 <div class="hw-detail">
                     Works too if you already have S3 XIAOs sitting around.
-                    C3 is the default recommendation (cheaper, lower power).
+                    C3 is what we recommend by default (cheaper, lower power).
                 </div>
-                <a class="hw-link" data-affiliate="xiao_s3"
+                <!-- TODO: user drops their affiliate URL here -->
+                <a class="hw-link" href="AFFILIATE_LINK_XIAO_ESP32S3"
                    target="_blank" rel="noopener sponsored">
                     Buy XIAO ESP32-S3 &rarr;
                 </a>
@@ -380,46 +222,14 @@ function drawHeroLayers(ctx, w, h, frame) {
         </div>
     </section>
 
-    <!-- ═══ Secondary CTA band ═══ -->
-    <section class="lp-cta-band">
-        <div class="lp-cta-band-inner">
-            <div class="lp-cta-band-copy">
-                <h3>Hardware in hand?</h3>
-                <p>Flash it from your browser. No toolchain, no drivers.</p>
-            </div>
-            <a class="lp-cta-primary lp-cta-large" href="flash.html">
-                START HERE &nbsp;&rarr;
-            </a>
-        </div>
-    </section>
-
     <!-- ═══ Footer ═══ -->
     <footer class="footer">
-        <span>MantisSec &middot; CSI Radar32 &middot; custom open firmware</span>
+        <span>Build <code>{{SHORT_SHA}}</code> · {{BUILD_DATE}}</span>
+        <a href="https://github.com/5t31thphoto/CSIRadar32" target="_blank" rel="noopener">source</a>
     </footer>
 
 </div>
 
-<!-- Wire up ASSETS/AFFILIATE constants -->
-<script>
-(function () {
-    document.querySelectorAll("img[data-asset]").forEach(img => {
-        const key = img.getAttribute("data-asset");
-        const path = ASSETS[key];
-        if (path && path.length > 0) img.src = path;
-    });
-    document.querySelectorAll("a[data-affiliate]").forEach(a => {
-        const key = a.getAttribute("data-affiliate");
-        const url = AFFILIATE[key];
-        if (url) a.href = url;
-    });
-})();
-</script>
-
-<!-- Canvas overlays for the how-it-works and live-view figures.
-     Same technique as the hero animation above: transparent canvas on
-     top, screen blend, images and copy untouched. -->
-<script src="overlays.js"></script>
-
+<script src="flasher.js"></script>
 </body>
 </html>

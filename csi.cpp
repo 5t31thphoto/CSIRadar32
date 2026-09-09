@@ -2,7 +2,6 @@
 //  CSI-Radar-S3 — csi.cpp
 // ═══════════════════════════════════════════════════════════════
 #include "csi.h"
-#include <stdarg.h>
 #include "peer.h"
 #include "stereo.h"
 #include "scene.h"
@@ -22,44 +21,6 @@
 #ifndef ESP_ARDUINO_VERSION_MAJOR
   // Fallback: assume modern core if we can't detect
   #define ESP_ARDUINO_VERSION_MAJOR 3
-#endif
-
-// ═══════════════════════════════════════════════════════════════
-//  IN-RAM LOG RING
-// ═══════════════════════════════════════════════════════════════
-// Lives here because csi.cpp links into every build and depends on
-// neither ui nor scene.  Written from both cores (the CSI callback logs
-// on core 0), so the index is advanced only after the line is written:
-// a torn LINE is cosmetic, a torn INDEX would write outside the array.
-#if MS_LOG_RING
-static char     s_log[MS_LOG_LINES][MS_LOG_LINE_LEN];
-static uint16_t s_log_head  = 0;      // next slot to write
-static uint16_t s_log_count = 0;
-
-void ms_log_printf(const char *fmt, ...) {
-    uint16_t slot = s_log_head;
-    if (slot >= MS_LOG_LINES) slot = 0;          // defensive
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(s_log[slot], MS_LOG_LINE_LEN, fmt, ap);
-    va_end(ap);
-    // Strip trailing newlines: the renderer draws one line per slot.
-    int n = (int)strlen(s_log[slot]);
-    while (n > 0 && (s_log[slot][n-1] == '\n' || s_log[slot][n-1] == '\r'))
-        s_log[slot][--n] = 0;
-    s_log_head = (uint16_t)((slot + 1) % MS_LOG_LINES);
-    if (s_log_count < MS_LOG_LINES) s_log_count++;
-}
-
-int ms_log_count() { return (int)s_log_count; }
-
-const char *ms_log_line(int idx) {
-    if (idx < 0 || idx >= (int)s_log_count) return "";
-    int start = ((int)s_log_head - (int)s_log_count + MS_LOG_LINES * 2) % MS_LOG_LINES;
-    return s_log[(start + idx) % MS_LOG_LINES];
-}
-
-void ms_log_clear() { s_log_head = 0; s_log_count = 0; }
 #endif
 
 // ── Local helpers ───────────────────────────────────────────────
@@ -91,7 +52,6 @@ static int IRAM_ATTR slot_for_mac(const uint8_t *mac) {
             g_app.beacon[i].baseline_valid  = false;
             g_app.beacon[i].walk_calibrated = false;
             g_app.beacon[i].cal_count = 0;
-            g_app.beacon[i].cal_top_n = 0;
             g_app.beacon[i].hampel_idx = g_app.beacon[i].hampel_count = 0;
             g_app.beacon[i].mv_idx     = g_app.beacon[i].mv_count     = 0;
             g_app.beacon[i].lp_x_prev  = g_app.beacon[i].lp_y_prev    = 0;
@@ -111,17 +71,10 @@ static int IRAM_ATTR slot_for_mac(const uint8_t *mac) {
             g_app.beacon[i].intercept_baseline = 0;
             g_app.beacon[i].aoa_rad = 0;
             g_app.beacon[i].aoa_conf = 0;
-            // Seqlock must start EVEN (= no write in flight), or the
-            // first reader spins its retries and drops a frame.
-            g_app.beacon[i].iq_seq   = 0;
-            g_app.beacon[i].iq_slot  = 0;
-            g_app.beacon[i].iq_pairs = 0;
             for (int sc = 0; sc < CSI_NUM_SUBCARRIERS; sc++) {
-                g_app.beacon[i].baseline[sc]       = 0;
+                g_app.beacon[i].cal_phase_i[sc] = 0;
+                g_app.beacon[i].cal_phase_q[sc] = 0;
                 g_app.beacon[i].phase_baseline[sc] = 0;
-                g_app.beacon[i].cal_phase_i[sc]    = 0;
-                g_app.beacon[i].cal_phase_q[sc]    = 0;
-                g_app.beacon[i].prev_amplitude[sc] = 0;
             }
             for (int r = 0; r < STEREO_MAG_PACK_MAX; r++) {
                 g_app.beacon[i].stereo_ring[r].counter = 0;
@@ -151,28 +104,20 @@ static void IRAM_ATTR csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
 
     BeaconState &b = g_app.beacon[slot];
 
-    // ── v0.9: publish raw I/Q under a seqlock; do NO float math here ──
-    //
-    // This runs in the Wi-Fi task on core 0.  Two things changed:
-    //
-    //  1. It used to compute 64 sqrtf + 64 atan2f inline (~13 us/frame)
-    //     inside the Wi-Fi task.  That work now happens on core 1, where
-    //     it cannot delay packet servicing.
-    //
-    //  2. It used to write amplitude[]/phase[] that core 1 reads with no
-    //     synchronisation whatsoever, so a reader could see half of one
-    //     frame and half of the next.  The stereo line fit consumes all
-    //     64 phases at once, so a torn read silently corrupts AoA.
-    //
-    // Seqlock: write into the slot the reader is NOT holding, then bump
-    // the sequence.  Odd sequence = write in flight.  Wait-free for the
-    // writer, so the Wi-Fi task never blocks on the consumer.
-    uint8_t next = (uint8_t)(b.iq_slot ^ 1u);
-    memcpy(b.iq_raw[next], buf, (size_t)pairs * 2);
-    b.iq_seq   = b.iq_seq + 1;     // odd: publish in progress
-    b.iq_pairs = (uint16_t)pairs;
-    b.iq_slot  = next;
-    b.iq_seq   = b.iq_seq + 1;     // even: stable
+    // Compute amplitude AND phase per subcarrier.  atan2f is fine on the S3
+    // FPU; ~50 cycles × 64 subcarriers ≈ 13 µs at 240 MHz.  Phase is what
+    // the stereo AoA path needs.
+    for (int i = 0; i < pairs; i++) {
+        float q  = (float)buf[i * 2];
+        float ii = (float)buf[i * 2 + 1];
+        b.amplitude[i] = sqrtf(q * q + ii * ii);
+        b.phase[i]     = atan2f(q, ii);
+    }
+    // Zero any remaining subcarriers so downstream math stays defined
+    for (int i = pairs; i < CSI_NUM_SUBCARRIERS; i++) {
+        b.amplitude[i] = 0.0f;
+        b.phase[i]     = 0.0f;
+    }
 
     // v0.4: inter-arrival EMA for RX-side beacon rate inference.
     // First frame just seeds last_frame_ms; from the second onward we
@@ -207,11 +152,6 @@ static void handle_espnow_common(const uint8_t *src, const uint8_t *data, int le
     // T-Display, NOT from a beacon, so they won't match BEACON_MAC_PREFIX.
     if (peer_try_consume(src, data, len)) return;
 
-    // v0.9: a PONG comes FROM a beacon MAC but is not a counter frame,
-    // so it must be claimed before the counter path below reads its
-    // first 4 bytes as a sequence number.
-    if (csi_beacon_try_consume_pong(data, len)) return;
-
     if (!mac_prefix_match(src)) return;
     int slot = slot_for_mac(src);
     if (slot < 0) return;
@@ -236,7 +176,7 @@ static void espnow_recv_cb(const uint8_t *src, const uint8_t *data, int len) {
 #endif
 
 // ── Filter blocks ──────────────────────────────────────────────
-static float compute_turbulence(const float *amp) {
+static float compute_turbulence(const volatile float *amp) {
     float sum = 0, sq = 0;
     int n = 0;
     for (int i = 0; i < CSI_SEL_COUNT; i++) {
@@ -281,66 +221,28 @@ static float hampel(BeaconState &b, float value) {
     return value;
 }
 
-// Effective sample rate for THIS beacon, from its own measured
-// inter-arrival time.  Beacons can be commanded to different rates and
-// a stock beacon may sit alongside commanded ones, so the rate is a
-// per-beacon runtime property, never a compile-time constant.
-static inline float beacon_rate_hz(const BeaconState &b) {
-    if (b.inter_arrival_ms_ema > 0.5f) {
-        float hz = 1000.0f / b.inter_arrival_ms_ema;
-        if (hz < 1.0f)   hz = 1.0f;
-        if (hz > 200.0f) hz = 200.0f;
-        return hz;
-    }
-    return SAMPLE_RATE_HZ;   // not enough frames yet: assume stock rate
-}
-
 static float lowpass(BeaconState &b, float x) {
-    // 1st-order Butterworth.
-    //
-    // The coefficients used to be `static` and computed ONCE from a
-    // fixed SAMPLE_RATE_HZ -- so every beacon shared one filter design,
-    // and if a beacon was ever commanded to a different rate its filter
-    // was silently wrong.  Cutoff is now a fraction of that beacon's own
-    // Nyquist, recomputed only when its measured rate actually moves.
-    float fs = beacon_rate_hz(b);
-    if (fabsf(fs - b.lp_design_fs) > 0.05f * b.lp_design_fs || b.lp_design_fs <= 0) {
-        float ny = fs * 0.5f;
-        float fc = LP_CUTOFF_HZ;
-        if (fc > LP_CUTOFF_MAX_FRAC_NYQ * ny) fc = LP_CUTOFF_MAX_FRAC_NYQ * ny;
-        float wc = tanf((float)M_PI * fc / fs);
+    // 1st order Butterworth, cutoff LP_CUTOFF_HZ @ SAMPLE_RATE_HZ.
+    // Precompute once — cheap to recompute per call, still.
+    static float b0 = 0, a1 = 0;
+    static bool inited = false;
+    if (!inited) {
+        float wc = tanf((float)M_PI * LP_CUTOFF_HZ / SAMPLE_RATE_HZ);
         float k  = 1.0f + wc;
-        b.lp_b0 = wc / k;
-        b.lp_a1 = (wc - 1.0f) / k;
-        b.lp_design_fs = fs;
+        b0 = wc / k;
+        a1 = (wc - 1.0f) / k;
+        inited = true;
     }
-    float y = b.lp_b0 * x + b.lp_b0 * b.lp_x_prev - b.lp_a1 * b.lp_y_prev;
+    float y = b0 * x + b0 * b.lp_x_prev - a1 * b.lp_y_prev;
     b.lp_x_prev = x;
     b.lp_y_prev = y;
     return y;
 }
 
 static float moving_variance(BeaconState &b, float x) {
-    // Window is MOVVAR_SECONDS of real time, not a fixed sample count:
-    // how quickly motion is detected is a property of people, not of
-    // the beacon rate.  The buffer is sized for the stock 100 Hz max;
-    // at lower rates we simply use fewer of its slots.
-    int win = (int)(MOVVAR_SECONDS * beacon_rate_hz(b));
-    if (win < 4)           win = 4;
-    if (win > MOVVAR_WIN)  win = MOVVAR_WIN;
-
-    // The window SHRINKS when beacons are commanded down from the
-    // 100 Hz default (50 slots -> 15 at 30 Hz).  mv_idx can be left
-    // pointing past the new window, so clamp it BEFORE writing:
-    // otherwise the next samples land in slots the variance loop never
-    // reads, and the metric is computed from a mix of old-rate and
-    // new-rate data for a full window afterwards -- right at the moment
-    // calibration starts.
-    if (b.mv_idx >= win) b.mv_idx = 0;
     b.mv_buf[b.mv_idx] = x;
-    b.mv_idx = (b.mv_idx + 1) % win;
-    if (b.mv_count > win) b.mv_count = win;
-    if (b.mv_count < win) b.mv_count++;
+    b.mv_idx = (b.mv_idx + 1) % MOVVAR_WIN;
+    if (b.mv_count < MOVVAR_WIN) b.mv_count++;
     float s = 0, sq = 0;
     for (int i = 0; i < b.mv_count; i++) {
         s  += b.mv_buf[i];
@@ -351,22 +253,17 @@ static float moving_variance(BeaconState &b, float x) {
     return v > 0 ? v : 0;
 }
 
-// v0.85: exact p95 from the retained top-K.
-//
-// For n observations the p95 sits at sorted index floor(0.95*(n-1)), i.e.
-// it is the (n - that index)-th LARGEST value.  For n = 500 that is the
-// 26th largest, so retaining the top 26 is sufficient to answer exactly
-// -- no sort of a 500-element buffer, and no 2 KB per beacon.
-//
-// `top` is ascending with `top_n` entries; `n` is the total number of
-// samples that were offered.
-static float p95_from_top(const float *top, int top_n, int n) {
-    if (n <= 0 || top_n <= 0) return 0.0f;
-    int idx  = (int)(0.95f * (float)(n - 1));
-    int need = n - idx;                 // rank from the top
-    if (need > top_n) need = top_n;     // fewer samples than K were seen
-    if (need < 1)     need = 1;
-    return top[top_n - need];
+static float percentile(float *arr, int n, float pct) {
+    // sort a copy; small N (~500) is fine on S3
+    for (int i = 1; i < n; i++) {
+        float k = arr[i]; int j = i - 1;
+        while (j >= 0 && arr[j] > k) { arr[j+1] = arr[j]; j--; }
+        arr[j+1] = k;
+    }
+    int idx = (int)(pct / 100.0f * (n - 1));
+    if (idx >= n) idx = n - 1;
+    if (idx < 0)  idx = 0;
+    return arr[idx];
 }
 
 // ── Public API ─────────────────────────────────────────────────
@@ -385,7 +282,7 @@ void csi_engine_begin() {
 
     if (esp_now_init() != ESP_OK) {
         // If ESP-NOW init fails we can still get CSI, just no fast discovery.
-        MSLOGLN("[CSI] esp_now_init failed");
+        Serial.println("[CSI] esp_now_init failed");
     } else {
         esp_now_register_recv_cb(espnow_recv_cb);
     }
@@ -403,7 +300,7 @@ void csi_engine_begin() {
     esp_wifi_set_csi(true);
     esp_wifi_set_promiscuous(true);
 
-    MSLOGLN("[CSI] engine started on ch 11 HT40");
+    Serial.println("[CSI] engine started on ch 11 HT40");
 }
 
 void csi_engine_end() {
@@ -427,227 +324,21 @@ void csi_reset_discovery() {
     g_app.total_csi_frames = 0;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  v0.9 — BEACON CONTROL (RX → beacon)
-// ═══════════════════════════════════════════════════════════════
-// Sending side of a protocol the beacon firmware has implemented since
-// the beginning and that the receiver never used.  Consequence of the
-// gap: every beacon has run at its compiled default of 100 Hz forever,
-// while the capture path decimates to CAP_HZ (20) -- so roughly four
-// out of five transmitted frames were paid for in battery and thrown
-// away on arrival.
-//
-// Commands go out as ESP-NOW broadcast.  The beacons are not registered
-// as unicast peers (we only ever listened to them), and broadcast needs
-// no peer table entry.  target_id inside the payload does the
-// addressing: 0 means every beacon.
-static bool s_bcast_peer_ready = false;
-// Enforcement is suppressed until this time so the rate EMA can
-// converge after a rate change (17 frames at alpha=0.15).
-static uint32_t s_rate_settle_until_ms = 0;
-
-static void ensure_broadcast_peer() {
-    if (s_bcast_peer_ready) return;
-    const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    if (!esp_now_is_peer_exist(bcast)) {
-        esp_now_peer_info_t p = {};
-        memcpy(p.peer_addr, bcast, 6);
-        p.channel = CSI_CHANNEL;
-        p.ifidx   = WIFI_IF_STA;
-        p.encrypt = false;
-        esp_now_add_peer(&p);
-    }
-    s_bcast_peer_ready = true;
-}
-
-void csi_beacon_command(uint8_t target_id, uint8_t op,
-                        uint16_t arg_u16, uint32_t arg_u32) {
-    ensure_broadcast_peer();
-    BeaconCommand c = {};
-    c.magic     = BEACON_CMD_MAGIC;
-    c.target_id = target_id;
-    c.op        = op;
-    c.arg_u16   = arg_u16;
-    c.arg_u32   = arg_u32;
-    WiFi.macAddress(c.sender_mac);          // so PONGs come back to us
-    const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    esp_now_send(bcast, (const uint8_t*)&c, sizeof(c));
-}
-
-void csi_beacon_ping_all() {
-    csi_beacon_command(0, BEACON_OP_PING);
-}
-
-void csi_beacon_set_rate_all(uint16_t hz) {
-    if (hz < 1)   hz = 1;
-    if (hz > 200) hz = 200;
-    csi_beacon_command(0, BEACON_OP_SET_RATE, hz);
-    // Record what we asked for, per beacon, so the UI can show
-    // commanded against observed instead of only observed.
-    for (int i = 0; i < MAX_BEACONS; i++)
-        if (g_app.beacon[i].active) g_app.beacon[i].cmd_rate_hz = hz;
-    MSLOG("[csi] commanded all beacons to %u Hz\n", (unsigned)hz);
-}
-
-// Compile-time guard: the beacon rate and the filter design frequency
-// are the same number by construction now, but if either is ever edited
-// independently this stops the build instead of silently detuning the
-// whole signal chain.
-void csi_beacon_apply_run_config() {
-    // Ask who they are first (fw_marker tells extended from stock), then
-    // set the run rate.  Both are broadcast, so one call covers 1..6.
-    // Ping first so fw_marker in the PONG tells us which beacons are
-    // extended firmware, then command the operating rate AND light
-    // sleep.  A beacon that never answers stays at its 100 Hz
-    // compatibility default and the links view shows it "no-ack" --
-    // visible, not silent.
-    //
-    // Sent REDUNDANTLY.  These are ESP-NOW broadcasts, which are
-    // unacknowledged: a single send that collides with beacon traffic is
-    // simply lost, and the beacon would sit at 100 Hz until the periodic
-    // enforcement below noticed.  Three spaced sends make that
-    // vanishingly unlikely, and this runs once at a state transition so
-    // the few ms cost is free.
-    for (int rep = 0; rep < BEACON_CMD_REPEATS; rep++) {
-        csi_beacon_ping_all();
-        csi_beacon_set_rate_all(BEACON_REQUEST_RATE_HZ);
-        csi_beacon_command(0, BEACON_OP_SET_SLEEP, BEACON_REQUEST_SLEEP ? 1 : 0);
-        if (rep + 1 < BEACON_CMD_REPEATS) delay(BEACON_CMD_REPEAT_MS);
-    }
-    // Give the inter-arrival EMA time to reflect the NEW rate before the
-    // enforcer is allowed to judge it.  Without this the first check
-    // fires while the EMA still reads 100 Hz and re-commands a beacon
-    // that already obeyed.
-    s_rate_settle_until_ms = millis() + BEACON_RATE_SETTLE_MS;
-}
-
-// Re-command any beacon that is not running what we asked for.
-//
-// There is no reason a beacon should ever sit at the compatibility
-// default during operation, but a beacon can reboot, be powered on
-// late, or miss the original broadcast -- and the original code sent
-// the command exactly once at discovery, so any of those left it at
-// 100 Hz forever.  Called from the main loop; cheap, and it only
-// transmits when something is actually wrong.
-void csi_beacon_enforce_rate() {
-    uint32_t now = millis();
-    if (now < s_rate_settle_until_ms) return;      // EMA still converging
-    static uint32_t last_check = 0;
-    if (now - last_check < BEACON_RATE_RECHECK_MS) return;
-    last_check = now;
-
-    const int want = BEACON_REQUEST_RATE_HZ;
-    for (int i = 0; i < MAX_BEACONS; i++) {
-        BeaconState &b = g_app.beacon[i];
-        if (!b.active) continue;
-
-        // Prefer what the beacon SAID over what we inferred: a PONG's
-        // current_rate_hz is authoritative, the inter-arrival EMA is an
-        // estimate that noise and dropped frames can skew.
-        int observed;
-        if (b.reported_rate_hz > 0 && (now - b.last_pong_ms) < 30000) {
-            observed = (int)b.reported_rate_hz;
-        } else if (b.inter_arrival_ms_ema > 0.5f) {
-            observed = (int)(1000.0f / b.inter_arrival_ms_ema + 0.5f);
-        } else {
-            continue;                              // nothing to judge yet
-        }
-
-        int err = observed > want ? observed - want : want - observed;
-        if (err <= BEACON_RATE_TOLERANCE) continue;
-
-        MSLOG("[csi] b%u off-rate: %d Hz, want %d Hz - re-commanding\n",
-                      (unsigned)b.id, observed, want);
-        // Address this beacon specifically rather than broadcasting, so
-        // one stray unit does not re-command the whole set.
-        csi_beacon_command(b.id, BEACON_OP_SET_RATE, (uint16_t)want);
-        csi_beacon_command(b.id, BEACON_OP_SET_SLEEP, BEACON_REQUEST_SLEEP ? 1 : 0);
-        csi_beacon_command(b.id, BEACON_OP_PING);
-        b.cmd_rate_hz = (uint16_t)want;
-        // Re-arm the settle window so we do not immediately re-judge it.
-        s_rate_settle_until_ms = now + BEACON_RATE_SETTLE_MS;
-    }
-}
-
-// PONG ingest.  Called from the ESP-NOW rx path alongside the peer
-// demux; returns true if the payload was ours.
-bool csi_beacon_try_consume_pong(const uint8_t *data, int len) {
-    if (len < (int)sizeof(BeaconPong)) return false;
-    uint32_t magic;
-    memcpy(&magic, data, sizeof(magic));
-    if (magic != BEACON_PONG_MAGIC) return false;
-    BeaconPong p;
-    memcpy(&p, data, sizeof(p));
-    for (int i = 0; i < MAX_BEACONS; i++) {
-        if (!g_app.beacon[i].active) continue;
-        if (g_app.beacon[i].id != p.beacon_id) continue;
-        g_app.beacon[i].reported_rate_hz = p.current_rate_hz;
-        g_app.beacon[i].fw_marker        = p.fw_marker;
-        g_app.beacon[i].sleep_enabled    = p.sleep_enabled;
-        g_app.beacon[i].last_pong_ms     = millis();
-        MSLOG("[csi] PONG b%u fw=%u rate=%uHz sleep=%u\n",
-                      (unsigned)p.beacon_id, (unsigned)p.fw_marker,
-                      (unsigned)p.current_rate_hz, (unsigned)p.sleep_enabled);
-        break;
-    }
-    return true;
-}
-
 void csi_choose_mode(RadarMode m) {
     g_app.mode = m;
 }
 
 void csi_assign_default_geometry(float side_cm) {
-    // Coordinate frame: T-Display sits at (0, 0); beacons are placed
-    // around it.
-    //
-    // side_cm sets the SHAPE only, never the scale of anything the model
-    // sees.  scene_derive_landmarks_from_geometry() divides through by the
-    // mean vertex radius, so every normalized landmark is identical whether
-    // the polygon is half a metre or fifty metres across (verified over a
-    // 100x range).  The user is asked to approximate a shape, not to measure
-    // anything.  Do not add per-count "recommended" edge lengths here — they
-    // would imply a precision the system neither needs nor uses.
-    //
-    // v0.8: RM_TRIANGLE_3 now means "3 or more beacons" and lays the
-    // beacons out as a regular N-gon centred on the receivers.  The
-    // enum name is deliberately unchanged (see config.h).
-    //
-    // n is clamped to [3, MAX_BEACONS] in the polygon branch so a mode
-    // that was picked by hand from Settings (which cycles the mode
-    // without changing beacon_count) can never index past the array.
+    // Coordinate frame: T-Display sits at (0, 0). Beacons live in +Y half-plane.
+    // Units: centimetres. UI scales as needed.
     switch (g_app.mode) {
         case RM_TRIANGLE_3: {
-            int n = g_app.beacon_count;
-            if (n < 3) n = 3;
-            if (n > MAX_BEACONS) n = MAX_BEACONS;
-
-            if (n == 3) {
-                // Historical vertex order, preserved verbatim so that a
-                // v0.7 calibration stays valid: B0 top, B1 bottom-left,
-                // B2 bottom-right (counter-clockwise).  The general
-                // formula below winds the other way, which would silently
-                // mirror an existing 3-beacon install.
-                float r = side_cm / sqrtf(3.0f);          // circumradius
-                g_app.beacon[0].pos_x =  0.0f;             g_app.beacon[0].pos_y =  r;
-                g_app.beacon[1].pos_x = -side_cm * 0.5f;   g_app.beacon[1].pos_y = -r * 0.5f;
-                g_app.beacon[2].pos_x =  side_cm * 0.5f;   g_app.beacon[2].pos_y = -r * 0.5f;
-                break;
-            }
-
-            // Regular N-gon, first vertex at the top of the screen.
-            //   edge = 2 * R * sin(pi / N)  →  R = side_cm / (2 sin(pi/N))
-            // Vertices are numbered counter-clockwise to match the
-            // 3-beacon convention above (B1 front, B2 to the LEFT), so
-            // the walk script's "B1 → B2 → ..." always traces the
-            // perimeter in one consistent direction.
-            float R = side_cm / (2.0f * sinf((float)M_PI / (float)n));
-            for (int i = 0; i < n; i++) {
-                float theta = (float)M_PI / 2.0f
-                            + (2.0f * (float)M_PI * (float)i) / (float)n;
-                g_app.beacon[i].pos_x = R * cosf(theta);
-                g_app.beacon[i].pos_y = R * sinf(theta);
-            }
+            // Equilateral triangle around origin, apex at top of screen.
+            // B0 top, B1 bottom-left, B2 bottom-right.
+            float r = side_cm / sqrtf(3.0f);          // circumradius
+            g_app.beacon[0].pos_x =  0.0f;             g_app.beacon[0].pos_y =  r;
+            g_app.beacon[1].pos_x = -side_cm * 0.5f;   g_app.beacon[1].pos_y = -r * 0.5f;
+            g_app.beacon[2].pos_x =  side_cm * 0.5f;   g_app.beacon[2].pos_y = -r * 0.5f;
             break;
         }
         case RM_LINE_2: {
@@ -670,20 +361,17 @@ void csi_reset_filters(bool hard) {
         b.hampel_idx = b.hampel_count = 0;
         b.mv_idx = b.mv_count = 0;
         b.lp_x_prev = b.lp_y_prev = 0;
-        // Force the filter to be re-designed on the next frame: after a
-        // reset the beacon may be running a different rate than when the
-        // coefficients were last computed.
-        b.lp_design_fs = 0;
         b.filtered = 0;
         b.moving_variance = 0;
         b.link_metric_raw = 0;
         b.link_metric_ema = 0;
         b.cal_count = 0;
-        b.cal_top_n = 0;
         b.last_cal_frame = b.frames;    // "no new frames yet" for accumulator
         b.status = LS_IDLE;
         // Zero phase accumulators so a fresh baseline pass has a clean sum.
         for (int sc = 0; sc < CSI_NUM_SUBCARRIERS; sc++) {
+            b.cal_phase_i[sc] = 0;
+            b.cal_phase_q[sc] = 0;
         }
         if (hard) {
             b.baseline_valid = false;
@@ -703,47 +391,11 @@ void csi_reset_filters(bool hard) {
     }
 }
 
-// v0.9: seqlock reader.  Takes a consistent snapshot of the raw I/Q the
-// core-0 callback published, then does the float conversion here on core
-// 1.  Retries if the writer landed mid-read; bounded so a pathological
-// beacon can never stall the loop.
-static bool decode_iq_snapshot(BeaconState &b) {
-    for (int attempt = 0; attempt < 4; attempt++) {
-        uint32_t s0 = b.iq_seq;
-        if (s0 & 1u) continue;                  // write in flight
-        uint8_t  slot  = b.iq_slot;
-        uint16_t pairs = b.iq_pairs;
-        if (pairs > CSI_NUM_SUBCARRIERS) pairs = CSI_NUM_SUBCARRIERS;
-        int8_t local[CSI_NUM_SUBCARRIERS * 2];
-        memcpy(local, b.iq_raw[slot & 1u], (size_t)pairs * 2);
-        if (b.iq_seq != s0) continue;           // torn; writer moved
-        // Consistent snapshot in hand -- now the float work, on core 1.
-        for (int k = 0; k < pairs; k++) {
-            float q  = (float)local[k * 2];
-            float ii = (float)local[k * 2 + 1];
-            b.amplitude[k] = sqrtf(q * q + ii * ii);
-            b.phase[k]     = atan2f(q, ii);
-        }
-        for (int k = pairs; k < CSI_NUM_SUBCARRIERS; k++) {
-            b.amplitude[k] = 0.0f;
-            b.phase[k]     = 0.0f;
-        }
-        return true;
-    }
-    return false;   // writer is hammering; skip this frame, try next tick
-}
-
 int csi_process_frames() {
     int processed = 0;
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active || !b.dirty) continue;
-        // Convert the raw I/Q the callback published before anything
-        // downstream touches amplitude[]/phase[].  Clear `dirty` only
-        // AFTER a successful decode: if the writer was mid-publish for
-        // all four retries we want to re-try on the next pass rather
-        // than silently discard the frame.
-        if (!decode_iq_snapshot(b)) continue;
         b.dirty = false;
 
         // 1. Feature extraction — kept independently, NOT reduced yet.
@@ -844,62 +496,19 @@ int csi_process_frames() {
 // Baseline pass: accumulate moving_variance (for threshold) AND per-subcarrier
 // mean amplitude (for baseline vector).
 
-// Baseline target is a SAMPLE COUNT, not a duration.
-//
-// BASELINE_FRAMES samples is what the p95 presence threshold was tuned
-// against: the p95 of 500 samples is the 26th largest, and cutting the
-// count to hold a fixed 5 s at 20 Hz would make it the 6th largest --
-// a far noisier estimate of the number that gates presence detection.
-// Statistical resolution is the invariant; the DURATION is what varies
-// with rate, and csi_baseline_expected_seconds() reports it so the UI
-// can tell the user the real figure instead of a hardcoded one.
-static int baseline_target_frames(const BeaconState &b) {
-    (void)b;
-    return BASELINE_FRAMES;
-}
-
-// How long the baseline will actually take at the rate beacons are
-// currently transmitting.  100 Hz stock -> 5 s; 20 Hz -> 25 s.
-int csi_baseline_expected_seconds() {
-    float slowest = SAMPLE_RATE_HZ;
-    bool any = false;
-    for (int i = 0; i < MAX_BEACONS; i++) {
-        if (!g_app.beacon[i].active) continue;
-        float hz = beacon_rate_hz(g_app.beacon[i]);
-        if (!any || hz < slowest) { slowest = hz; any = true; }
-    }
-    if (slowest < 1.0f) slowest = 1.0f;
-    int secs = (int)((float)BASELINE_FRAMES / slowest + 0.5f);
-    return secs < 1 ? 1 : secs;
-}
-
 void csi_baseline_accumulate() {
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active) continue;
-        if (b.cal_count >= baseline_target_frames(b)) continue;
+        if (b.cal_count >= BASELINE_FRAMES) continue;
         // Only advance if this beacon actually received a new frame since
         // the last accumulator tick — prevents double-counting a stale
         // moving_variance value.
         if (b.frames == b.last_cal_frame) continue;
         b.last_cal_frame = b.frames;
 
-        // Retain only the largest P95_TOPK moving-variance samples, kept
-        // ascending.  cal_top[0] is the smallest of the retained set, so
-        // a new sample only matters if it beats that.  This yields the
-        // exact same p95 the full 500-sample buffer produced.
-        {
-            float x = b.moving_variance;
-            if (b.cal_top_n < P95_TOPK) {
-                int i = b.cal_top_n++;
-                while (i > 0 && b.cal_top[i-1] > x) { b.cal_top[i] = b.cal_top[i-1]; i--; }
-                b.cal_top[i] = x;
-            } else if (x > b.cal_top[0]) {
-                int i = 0;
-                while (i + 1 < P95_TOPK && b.cal_top[i+1] < x) { b.cal_top[i] = b.cal_top[i+1]; i++; }
-                b.cal_top[i] = x;
-            }
-        }
+        // Store MV sample
+        b.cal_values[b.cal_count] = b.moving_variance;
 
         // Running mean of amplitudes → baseline[]
         // Use incremental mean so we don't need a second buffer.
@@ -922,26 +531,29 @@ void csi_baseline_finalize() {
         BeaconState &b = g_app.beacon[i];
         if (!b.active || b.cal_count < 30) continue;
         // Threshold = P95 of the MV samples, with a small safety headroom
-        b.threshold = p95_from_top(b.cal_top, b.cal_top_n, b.cal_count) * 1.1f;
+        b.threshold = percentile(b.cal_values, b.cal_count, 95.0f) * 1.1f;
         if (b.threshold < 1e-6f) b.threshold = 1e-6f;
 
         // Baseline std as a coarse per-sc variability (last 64 samples if any).
         // For now, seed with a small floor so delta_base normalizes sanely.
         for (int sc = 0; sc < CSI_NUM_SUBCARRIERS; sc++) {
             if (b.baseline[sc] < 0.1f) b.baseline[sc] = 0.1f;
+            b.baseline_std[sc] = 1.0f;
         }
         b.baseline_valid = true;
 
-        // Per-subcarrier mean phase via mean-of-unit-vectors: atan2 of
-        // the accumulated cos/sin sums is wraparound-safe.  Feeds
-        // stereo_snapshot_baseline() below.
+        // Compute per-subcarrier mean phase via mean-of-unit-vectors.
+        // Σ(cos φ) and Σ(sin φ) were accumulated in csi_baseline_accumulate;
+        // atan2 of the two sums gives a wraparound-safe mean.
         for (int sc = 0; sc < CSI_NUM_SUBCARRIERS; sc++) {
             float ci = b.cal_phase_i[sc];
             float qi = b.cal_phase_q[sc];
-            b.phase_baseline[sc] = ((ci*ci + qi*qi) > 1e-6f)
-                                 ? atan2f(qi, ci) : 0.0f;
+            if ((ci*ci + qi*qi) > 1e-6f) {
+                b.phase_baseline[sc] = atan2f(qi, ci);
+            } else {
+                b.phase_baseline[sc] = 0.0f;
+            }
         }
-
         // Snapshot line-fit of local phase baseline.  On SECONDARY that's
         // the value we'll send to PRIMARY.  On PRIMARY, this fills local
         // baseline; stereo_on_baseline_finalized will fold the peer's
@@ -984,7 +596,7 @@ float csi_baseline_progress() {
         BeaconState &b = g_app.beacon[i];
         if (!b.active) continue;
         any = true;
-        float p = (float)b.cal_count / (float)baseline_target_frames(b);
+        float p = (float)b.cal_count / (float)BASELINE_FRAMES;
         if (p > 1.0f) p = 1.0f;
         if (p < minp) minp = p;
     }
