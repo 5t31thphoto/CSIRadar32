@@ -14,41 +14,48 @@
 #include "peer.h"
 #include <Arduino.h>
 
+// ── Script tables, one per beacon count (v0.8) ────────────────
+// Every script follows the same shape:
+//   INTRO → stand at RX → (walk to Bi, stand at Bi) for i = 1..N
+//   → walk to centroid, stand, rotate 360
+//   → (walk to perimeter midpoint, stand) for each of the N edges
+//   → walk past RX to the far side, stand → return to RX, stand → END
+// which is 4N + 10 entries.  N=3 → 22, N=4 → 26, N=5 → 30, N=6 → 34.
+//
+// SCRIPT_STEREO_3 / SCRIPT_SOLO_3 are the v0.7 scripts VERBATIM —
+// text, ordering and hold_ms all unchanged, because the docs and the
+// user's muscle memory both assume them.  Do not "tidy" them to match
+// the generated ones.
+
 // ── Script table (STEREO) ─────────────────────────────────────
 // PROBE runs this; ANCHOR observes and captures kernel samples for
 // each of PROBE's declared positions.  hold_ms is the "hold still"
 // countdown for STAND/ROTATE (was min_duration in v0.3).
-static const WizardStep SCRIPT_STEREO[] = {
+static const WizardStep SCRIPT_STEREO_3[] = {
     { STEP_INTRO,  LM_RX, LM_RX, 0,
       "CAL WALK",
-      "You'll visit\n9 landmarks.\nGates: BEGIN,\nARRIVED, NEXT.",
+      "You'll visit\n9 landmarks and\nturn in place 3x.\nGates: BEGIN,\nARRIVED, NEXT.",
       "Press RIGHT\nto start." },
 
     { STEP_STAND,  LM_RX, LM_RX, 4000,
       "AT RX",
       "Stand next to\nANCHOR.\nHold still.",
       "OK - press\nRIGHT for next." },
-
     { STEP_WALK,   LM_RX, LM_BEACON_1, 0,
-      "-> B1",
-      "Walk to\nBEACON 1.\nRIGHT = BEGIN\nRIGHT again =\nARRIVED",
-      nullptr },
+      "-> B1", "Walk to\nBEACON 1.", nullptr },
 
     { STEP_STAND,  LM_BEACON_1, LM_BEACON_1, 4000,
       "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
-
     { STEP_WALK,   LM_BEACON_1, LM_BEACON_2, 0,
       "-> B2", "Walk to\nBEACON 2.", nullptr },
 
     { STEP_STAND,  LM_BEACON_2, LM_BEACON_2, 4000,
       "AT B2", "Hold still\nat BEACON 2.", "OK - RIGHT." },
-
     { STEP_WALK,   LM_BEACON_2, LM_BEACON_3, 0,
       "-> B3", "Walk to\nBEACON 3.", nullptr },
 
     { STEP_STAND,  LM_BEACON_3, LM_BEACON_3, 4000,
       "AT B3", "Hold still\nat BEACON 3.", "OK - RIGHT." },
-
     { STEP_WALK,   LM_BEACON_3, LM_CENTROID, 0,
       "-> CENTER", "Walk to the\ncentroid.", nullptr },
 
@@ -59,32 +66,37 @@ static const WizardStep SCRIPT_STEREO[] = {
       "ROTATE 360",
       "Rotate slowly\nin place over\n10 seconds.\nStart facing B1.",
       "Done rotating.\nPress RIGHT." },
-
     { STEP_WALK,   LM_CENTROID, LM_MID_12, 0,
       "-> MID12", "Walk to midpoint\nof edge B1-B2.", nullptr },
 
     { STEP_STAND,  LM_MID_12, LM_MID_12, 3000,
       "AT MID12", "Hold still.", "OK - RIGHT." },
-
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12",
+      "Turn slowly all\nthe way around,\n10 seconds.",
+      "Done - RIGHT." },
     { STEP_WALK,   LM_MID_12, LM_MID_23, 0,
       "-> MID23", "Walk to midpoint\nof edge B2-B3.", nullptr },
 
     { STEP_STAND,  LM_MID_23, LM_MID_23, 3000,
       "AT MID23", "Hold still.", "OK - RIGHT." },
-
     { STEP_WALK,   LM_MID_23, LM_MID_13, 0,
       "-> MID13", "Walk to midpoint\nof edge B1-B3.", nullptr },
 
     { STEP_STAND,  LM_MID_13, LM_MID_13, 3000,
       "AT MID13", "Hold still.", "OK - RIGHT." },
-
     { STEP_WALK,   LM_MID_13, LM_OPPOSITE_RX, 0,
-      "-> OPP RX",
-      "Walk past RX to\nthe opposite side\nof the triangle.",
+      "-> OUTSIDE",
+      "Walk OUT past the\nbeacon ring to the\nfar side. Through a\ndoorway is fine.",
       nullptr },
 
     { STEP_STAND,  LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
-      "AT OPP", "Hold still\nbehind sensor.", "OK - RIGHT." },
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT",
+      "Turn slowly all\nthe way around,\n10 seconds.\nThis teaches the\nperimeter alert.",
+      "Done - RIGHT." },
 
     { STEP_WALK,   LM_OPPOSITE_RX, LM_RX, 0,
       "-> RX", "Return to RX.\nLoop closes.", nullptr },
@@ -93,15 +105,17 @@ static const WizardStep SCRIPT_STEREO[] = {
       "AT RX", "Hold still\n(loop close).", "Done!\nPress RIGHT." },
 
     { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
 };
 
 // ── Script table (SOLO) ───────────────────────────────────────
 // User holds the single T-Display against their chest.
-static const WizardStep SCRIPT_SOLO[] = {
+static const WizardStep SCRIPT_SOLO_3[] = {
     { STEP_INTRO, LM_RX, LM_RX, 0,
       "SOLO CAL",
       "Hold T-Display\nnear your chest\nthroughout the walk.",
       "Press RIGHT." },
+
     { STEP_STAND, LM_BEACON_1, LM_BEACON_1, 4000,
       "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
     { STEP_WALK,  LM_BEACON_1, LM_BEACON_2, 0,
@@ -124,6 +138,8 @@ static const WizardStep SCRIPT_SOLO[] = {
       "-> MID12", "Walk to mid B1-B2.", nullptr },
     { STEP_STAND, LM_MID_12, LM_MID_12, 3000,
       "AT MID12", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12", "Turn slowly all\nthe way around.", "Done - RIGHT." },
     { STEP_WALK,  LM_MID_12, LM_MID_23, 0,
       "-> MID23", "Walk to mid B2-B3.", nullptr },
     { STEP_STAND, LM_MID_23, LM_MID_23, 3000,
@@ -132,7 +148,523 @@ static const WizardStep SCRIPT_SOLO[] = {
       "-> MID13", "Walk to mid B1-B3.", nullptr },
     { STEP_STAND, LM_MID_13, LM_MID_13, 3000,
       "AT MID13", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_13, LM_OPPOSITE_RX, 0,
+      "-> OUTSIDE", "Walk OUT past the\nbeacon ring.", nullptr },
+    { STEP_STAND, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT", "Turn slowly all\nthe way around.", "Done - RIGHT." },
     { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
+};
+
+static const WizardStep SCRIPT_STEREO_4[] = {
+    { STEP_INTRO,  LM_RX, LM_RX, 0,
+      "CAL WALK",
+      "You'll visit\n11 landmarks and\nturn in place 3x.\nGates: BEGIN,\nARRIVED, NEXT.",
+      "Press RIGHT\nto start." },
+
+    { STEP_STAND,  LM_RX, LM_RX, 4000,
+      "AT RX",
+      "Stand next to\nANCHOR.\nHold still.",
+      "OK - press\nRIGHT for next." },
+    { STEP_WALK,   LM_RX, LM_BEACON_1, 0,
+      "-> B1", "Walk to\nBEACON 1.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_1, LM_BEACON_1, 4000,
+      "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_1, LM_BEACON_2, 0,
+      "-> B2", "Walk to\nBEACON 2.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_2, LM_BEACON_2, 4000,
+      "AT B2", "Hold still\nat BEACON 2.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_2, LM_BEACON_3, 0,
+      "-> B3", "Walk to\nBEACON 3.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_3, LM_BEACON_3, 4000,
+      "AT B3", "Hold still\nat BEACON 3.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_3, LM_BEACON_4, 0,
+      "-> B4", "Walk to\nBEACON 4.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_4, LM_BEACON_4, 4000,
+      "AT B4", "Hold still\nat BEACON 4.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_4, LM_CENTROID, 0,
+      "-> CENTER", "Walk to the\ncentroid.", nullptr },
+
+    { STEP_STAND,  LM_CENTROID, LM_CENTROID, 4000,
+      "AT CENTER", "Hold still\nat centroid.", "OK - RIGHT." },
+
+    { STEP_ROTATE, LM_CENTROID, LM_CENTROID, 10000,
+      "ROTATE 360",
+      "Rotate slowly\nin place over\n10 seconds.\nStart facing B1.",
+      "Done rotating.\nPress RIGHT." },
+    { STEP_WALK,   LM_CENTROID, LM_MID_12, 0,
+      "-> MID12", "Walk to midpoint\nof edge B1-B2.", nullptr },
+
+    { STEP_STAND,  LM_MID_12, LM_MID_12, 3000,
+      "AT MID12", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12",
+      "Turn slowly all\nthe way around,\n10 seconds.",
+      "Done - RIGHT." },
+    { STEP_WALK,   LM_MID_12, LM_MID_23, 0,
+      "-> MID23", "Walk to midpoint\nof edge B2-B3.", nullptr },
+
+    { STEP_STAND,  LM_MID_23, LM_MID_23, 3000,
+      "AT MID23", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_23, LM_MID_34, 0,
+      "-> MID34", "Walk to midpoint\nof edge B3-B4.", nullptr },
+
+    { STEP_STAND,  LM_MID_34, LM_MID_34, 3000,
+      "AT MID34", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_34, LM_MID_41, 0,
+      "-> MID41", "Walk to midpoint\nof edge B4-B1.", nullptr },
+
+    { STEP_STAND,  LM_MID_41, LM_MID_41, 3000,
+      "AT MID41", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_41, LM_OPPOSITE_RX, 0,
+      "-> OUTSIDE",
+      "Walk OUT past the\nbeacon ring to the\nfar side. Through a\ndoorway is fine.",
+      nullptr },
+
+    { STEP_STAND,  LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT",
+      "Turn slowly all\nthe way around,\n10 seconds.\nThis teaches the\nperimeter alert.",
+      "Done - RIGHT." },
+
+    { STEP_WALK,   LM_OPPOSITE_RX, LM_RX, 0,
+      "-> RX", "Return to RX.\nLoop closes.", nullptr },
+
+    { STEP_STAND,  LM_RX, LM_RX, 3000,
+      "AT RX", "Hold still\n(loop close).", "Done!\nPress RIGHT." },
+
+    { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
+};
+
+static const WizardStep SCRIPT_STEREO_5[] = {
+    { STEP_INTRO,  LM_RX, LM_RX, 0,
+      "CAL WALK",
+      "You'll visit\n13 landmarks and\nturn in place 3x.\nGates: BEGIN,\nARRIVED, NEXT.",
+      "Press RIGHT\nto start." },
+
+    { STEP_STAND,  LM_RX, LM_RX, 4000,
+      "AT RX",
+      "Stand next to\nANCHOR.\nHold still.",
+      "OK - press\nRIGHT for next." },
+    { STEP_WALK,   LM_RX, LM_BEACON_1, 0,
+      "-> B1", "Walk to\nBEACON 1.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_1, LM_BEACON_1, 4000,
+      "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_1, LM_BEACON_2, 0,
+      "-> B2", "Walk to\nBEACON 2.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_2, LM_BEACON_2, 4000,
+      "AT B2", "Hold still\nat BEACON 2.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_2, LM_BEACON_3, 0,
+      "-> B3", "Walk to\nBEACON 3.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_3, LM_BEACON_3, 4000,
+      "AT B3", "Hold still\nat BEACON 3.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_3, LM_BEACON_4, 0,
+      "-> B4", "Walk to\nBEACON 4.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_4, LM_BEACON_4, 4000,
+      "AT B4", "Hold still\nat BEACON 4.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_4, LM_BEACON_5, 0,
+      "-> B5", "Walk to\nBEACON 5.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_5, LM_BEACON_5, 4000,
+      "AT B5", "Hold still\nat BEACON 5.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_5, LM_CENTROID, 0,
+      "-> CENTER", "Walk to the\ncentroid.", nullptr },
+
+    { STEP_STAND,  LM_CENTROID, LM_CENTROID, 4000,
+      "AT CENTER", "Hold still\nat centroid.", "OK - RIGHT." },
+
+    { STEP_ROTATE, LM_CENTROID, LM_CENTROID, 10000,
+      "ROTATE 360",
+      "Rotate slowly\nin place over\n10 seconds.\nStart facing B1.",
+      "Done rotating.\nPress RIGHT." },
+    { STEP_WALK,   LM_CENTROID, LM_MID_12, 0,
+      "-> MID12", "Walk to midpoint\nof edge B1-B2.", nullptr },
+
+    { STEP_STAND,  LM_MID_12, LM_MID_12, 3000,
+      "AT MID12", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12",
+      "Turn slowly all\nthe way around,\n10 seconds.",
+      "Done - RIGHT." },
+    { STEP_WALK,   LM_MID_12, LM_MID_23, 0,
+      "-> MID23", "Walk to midpoint\nof edge B2-B3.", nullptr },
+
+    { STEP_STAND,  LM_MID_23, LM_MID_23, 3000,
+      "AT MID23", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_23, LM_MID_34, 0,
+      "-> MID34", "Walk to midpoint\nof edge B3-B4.", nullptr },
+
+    { STEP_STAND,  LM_MID_34, LM_MID_34, 3000,
+      "AT MID34", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_34, LM_MID_45, 0,
+      "-> MID45", "Walk to midpoint\nof edge B4-B5.", nullptr },
+
+    { STEP_STAND,  LM_MID_45, LM_MID_45, 3000,
+      "AT MID45", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_45, LM_MID_51, 0,
+      "-> MID51", "Walk to midpoint\nof edge B5-B1.", nullptr },
+
+    { STEP_STAND,  LM_MID_51, LM_MID_51, 3000,
+      "AT MID51", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_51, LM_OPPOSITE_RX, 0,
+      "-> OUTSIDE",
+      "Walk OUT past the\nbeacon ring to the\nfar side. Through a\ndoorway is fine.",
+      nullptr },
+
+    { STEP_STAND,  LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT",
+      "Turn slowly all\nthe way around,\n10 seconds.\nThis teaches the\nperimeter alert.",
+      "Done - RIGHT." },
+
+    { STEP_WALK,   LM_OPPOSITE_RX, LM_RX, 0,
+      "-> RX", "Return to RX.\nLoop closes.", nullptr },
+
+    { STEP_STAND,  LM_RX, LM_RX, 3000,
+      "AT RX", "Hold still\n(loop close).", "Done!\nPress RIGHT." },
+
+    { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
+};
+
+static const WizardStep SCRIPT_STEREO_6[] = {
+    { STEP_INTRO,  LM_RX, LM_RX, 0,
+      "CAL WALK",
+      "You'll visit\n15 landmarks and\nturn in place 3x.\nGates: BEGIN,\nARRIVED, NEXT.",
+      "Press RIGHT\nto start." },
+
+    { STEP_STAND,  LM_RX, LM_RX, 4000,
+      "AT RX",
+      "Stand next to\nANCHOR.\nHold still.",
+      "OK - press\nRIGHT for next." },
+    { STEP_WALK,   LM_RX, LM_BEACON_1, 0,
+      "-> B1", "Walk to\nBEACON 1.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_1, LM_BEACON_1, 4000,
+      "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_1, LM_BEACON_2, 0,
+      "-> B2", "Walk to\nBEACON 2.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_2, LM_BEACON_2, 4000,
+      "AT B2", "Hold still\nat BEACON 2.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_2, LM_BEACON_3, 0,
+      "-> B3", "Walk to\nBEACON 3.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_3, LM_BEACON_3, 4000,
+      "AT B3", "Hold still\nat BEACON 3.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_3, LM_BEACON_4, 0,
+      "-> B4", "Walk to\nBEACON 4.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_4, LM_BEACON_4, 4000,
+      "AT B4", "Hold still\nat BEACON 4.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_4, LM_BEACON_5, 0,
+      "-> B5", "Walk to\nBEACON 5.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_5, LM_BEACON_5, 4000,
+      "AT B5", "Hold still\nat BEACON 5.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_5, LM_BEACON_6, 0,
+      "-> B6", "Walk to\nBEACON 6.", nullptr },
+
+    { STEP_STAND,  LM_BEACON_6, LM_BEACON_6, 4000,
+      "AT B6", "Hold still\nat BEACON 6.", "OK - RIGHT." },
+    { STEP_WALK,   LM_BEACON_6, LM_CENTROID, 0,
+      "-> CENTER", "Walk to the\ncentroid.", nullptr },
+
+    { STEP_STAND,  LM_CENTROID, LM_CENTROID, 4000,
+      "AT CENTER", "Hold still\nat centroid.", "OK - RIGHT." },
+
+    { STEP_ROTATE, LM_CENTROID, LM_CENTROID, 10000,
+      "ROTATE 360",
+      "Rotate slowly\nin place over\n10 seconds.\nStart facing B1.",
+      "Done rotating.\nPress RIGHT." },
+    { STEP_WALK,   LM_CENTROID, LM_MID_12, 0,
+      "-> MID12", "Walk to midpoint\nof edge B1-B2.", nullptr },
+
+    { STEP_STAND,  LM_MID_12, LM_MID_12, 3000,
+      "AT MID12", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12",
+      "Turn slowly all\nthe way around,\n10 seconds.",
+      "Done - RIGHT." },
+    { STEP_WALK,   LM_MID_12, LM_MID_23, 0,
+      "-> MID23", "Walk to midpoint\nof edge B2-B3.", nullptr },
+
+    { STEP_STAND,  LM_MID_23, LM_MID_23, 3000,
+      "AT MID23", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_23, LM_MID_34, 0,
+      "-> MID34", "Walk to midpoint\nof edge B3-B4.", nullptr },
+
+    { STEP_STAND,  LM_MID_34, LM_MID_34, 3000,
+      "AT MID34", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_34, LM_MID_45, 0,
+      "-> MID45", "Walk to midpoint\nof edge B4-B5.", nullptr },
+
+    { STEP_STAND,  LM_MID_45, LM_MID_45, 3000,
+      "AT MID45", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_45, LM_MID_56, 0,
+      "-> MID56", "Walk to midpoint\nof edge B5-B6.", nullptr },
+
+    { STEP_STAND,  LM_MID_56, LM_MID_56, 3000,
+      "AT MID56", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_56, LM_MID_61, 0,
+      "-> MID61", "Walk to midpoint\nof edge B6-B1.", nullptr },
+
+    { STEP_STAND,  LM_MID_61, LM_MID_61, 3000,
+      "AT MID61", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,   LM_MID_61, LM_OPPOSITE_RX, 0,
+      "-> OUTSIDE",
+      "Walk OUT past the\nbeacon ring to the\nfar side. Through a\ndoorway is fine.",
+      nullptr },
+
+    { STEP_STAND,  LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT",
+      "Turn slowly all\nthe way around,\n10 seconds.\nThis teaches the\nperimeter alert.",
+      "Done - RIGHT." },
+
+    { STEP_WALK,   LM_OPPOSITE_RX, LM_RX, 0,
+      "-> RX", "Return to RX.\nLoop closes.", nullptr },
+
+    { STEP_STAND,  LM_RX, LM_RX, 3000,
+      "AT RX", "Hold still\n(loop close).", "Done!\nPress RIGHT." },
+
+    { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
+};
+
+static const WizardStep SCRIPT_SOLO_4[] = {
+    { STEP_INTRO, LM_RX, LM_RX, 0,
+      "SOLO CAL",
+      "Hold T-Display\nnear your chest\nthroughout the walk.",
+      "Press RIGHT." },
+
+    { STEP_STAND, LM_BEACON_1, LM_BEACON_1, 4000,
+      "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_1, LM_BEACON_2, 0,
+      "-> B2", "Walk to B2.", nullptr },
+    { STEP_STAND, LM_BEACON_2, LM_BEACON_2, 4000,
+      "AT B2", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_2, LM_BEACON_3, 0,
+      "-> B3", "Walk to B3.", nullptr },
+    { STEP_STAND, LM_BEACON_3, LM_BEACON_3, 4000,
+      "AT B3", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_3, LM_BEACON_4, 0,
+      "-> B4", "Walk to B4.", nullptr },
+    { STEP_STAND, LM_BEACON_4, LM_BEACON_4, 4000,
+      "AT B4", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_4, LM_CENTROID, 0,
+      "-> CENTER", "Walk to centroid.", nullptr },
+    { STEP_STAND, LM_CENTROID, LM_CENTROID, 4000,
+      "AT CENTER", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_CENTROID, LM_CENTROID, 10000,
+      "ROTATE 360",
+      "Rotate slowly\nin place over\n10 seconds.",
+      "Done - RIGHT." },
+    { STEP_WALK,  LM_CENTROID, LM_MID_12, 0,
+      "-> MID12", "Walk to mid B1-B2.", nullptr },
+    { STEP_STAND, LM_MID_12, LM_MID_12, 3000,
+      "AT MID12", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12", "Turn slowly all\nthe way around.", "Done - RIGHT." },
+    { STEP_WALK,  LM_MID_12, LM_MID_23, 0,
+      "-> MID23", "Walk to mid B2-B3.", nullptr },
+    { STEP_STAND, LM_MID_23, LM_MID_23, 3000,
+      "AT MID23", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_23, LM_MID_34, 0,
+      "-> MID34", "Walk to mid B3-B4.", nullptr },
+    { STEP_STAND, LM_MID_34, LM_MID_34, 3000,
+      "AT MID34", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_34, LM_MID_41, 0,
+      "-> MID41", "Walk to mid B4-B1.", nullptr },
+    { STEP_STAND, LM_MID_41, LM_MID_41, 3000,
+      "AT MID41", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_41, LM_OPPOSITE_RX, 0,
+      "-> OUTSIDE", "Walk OUT past the\nbeacon ring.", nullptr },
+    { STEP_STAND, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT", "Turn slowly all\nthe way around.", "Done - RIGHT." },
+    { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
+};
+
+static const WizardStep SCRIPT_SOLO_5[] = {
+    { STEP_INTRO, LM_RX, LM_RX, 0,
+      "SOLO CAL",
+      "Hold T-Display\nnear your chest\nthroughout the walk.",
+      "Press RIGHT." },
+
+    { STEP_STAND, LM_BEACON_1, LM_BEACON_1, 4000,
+      "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_1, LM_BEACON_2, 0,
+      "-> B2", "Walk to B2.", nullptr },
+    { STEP_STAND, LM_BEACON_2, LM_BEACON_2, 4000,
+      "AT B2", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_2, LM_BEACON_3, 0,
+      "-> B3", "Walk to B3.", nullptr },
+    { STEP_STAND, LM_BEACON_3, LM_BEACON_3, 4000,
+      "AT B3", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_3, LM_BEACON_4, 0,
+      "-> B4", "Walk to B4.", nullptr },
+    { STEP_STAND, LM_BEACON_4, LM_BEACON_4, 4000,
+      "AT B4", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_4, LM_BEACON_5, 0,
+      "-> B5", "Walk to B5.", nullptr },
+    { STEP_STAND, LM_BEACON_5, LM_BEACON_5, 4000,
+      "AT B5", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_5, LM_CENTROID, 0,
+      "-> CENTER", "Walk to centroid.", nullptr },
+    { STEP_STAND, LM_CENTROID, LM_CENTROID, 4000,
+      "AT CENTER", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_CENTROID, LM_CENTROID, 10000,
+      "ROTATE 360",
+      "Rotate slowly\nin place over\n10 seconds.",
+      "Done - RIGHT." },
+    { STEP_WALK,  LM_CENTROID, LM_MID_12, 0,
+      "-> MID12", "Walk to mid B1-B2.", nullptr },
+    { STEP_STAND, LM_MID_12, LM_MID_12, 3000,
+      "AT MID12", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12", "Turn slowly all\nthe way around.", "Done - RIGHT." },
+    { STEP_WALK,  LM_MID_12, LM_MID_23, 0,
+      "-> MID23", "Walk to mid B2-B3.", nullptr },
+    { STEP_STAND, LM_MID_23, LM_MID_23, 3000,
+      "AT MID23", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_23, LM_MID_34, 0,
+      "-> MID34", "Walk to mid B3-B4.", nullptr },
+    { STEP_STAND, LM_MID_34, LM_MID_34, 3000,
+      "AT MID34", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_34, LM_MID_45, 0,
+      "-> MID45", "Walk to mid B4-B5.", nullptr },
+    { STEP_STAND, LM_MID_45, LM_MID_45, 3000,
+      "AT MID45", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_45, LM_MID_51, 0,
+      "-> MID51", "Walk to mid B5-B1.", nullptr },
+    { STEP_STAND, LM_MID_51, LM_MID_51, 3000,
+      "AT MID51", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_51, LM_OPPOSITE_RX, 0,
+      "-> OUTSIDE", "Walk OUT past the\nbeacon ring.", nullptr },
+    { STEP_STAND, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT", "Turn slowly all\nthe way around.", "Done - RIGHT." },
+    { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
+};
+
+static const WizardStep SCRIPT_SOLO_6[] = {
+    { STEP_INTRO, LM_RX, LM_RX, 0,
+      "SOLO CAL",
+      "Hold T-Display\nnear your chest\nthroughout the walk.",
+      "Press RIGHT." },
+
+    { STEP_STAND, LM_BEACON_1, LM_BEACON_1, 4000,
+      "AT B1", "Hold still\nat BEACON 1.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_1, LM_BEACON_2, 0,
+      "-> B2", "Walk to B2.", nullptr },
+    { STEP_STAND, LM_BEACON_2, LM_BEACON_2, 4000,
+      "AT B2", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_2, LM_BEACON_3, 0,
+      "-> B3", "Walk to B3.", nullptr },
+    { STEP_STAND, LM_BEACON_3, LM_BEACON_3, 4000,
+      "AT B3", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_3, LM_BEACON_4, 0,
+      "-> B4", "Walk to B4.", nullptr },
+    { STEP_STAND, LM_BEACON_4, LM_BEACON_4, 4000,
+      "AT B4", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_4, LM_BEACON_5, 0,
+      "-> B5", "Walk to B5.", nullptr },
+    { STEP_STAND, LM_BEACON_5, LM_BEACON_5, 4000,
+      "AT B5", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_5, LM_BEACON_6, 0,
+      "-> B6", "Walk to B6.", nullptr },
+    { STEP_STAND, LM_BEACON_6, LM_BEACON_6, 4000,
+      "AT B6", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_BEACON_6, LM_CENTROID, 0,
+      "-> CENTER", "Walk to centroid.", nullptr },
+    { STEP_STAND, LM_CENTROID, LM_CENTROID, 4000,
+      "AT CENTER", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_CENTROID, LM_CENTROID, 10000,
+      "ROTATE 360",
+      "Rotate slowly\nin place over\n10 seconds.",
+      "Done - RIGHT." },
+    { STEP_WALK,  LM_CENTROID, LM_MID_12, 0,
+      "-> MID12", "Walk to mid B1-B2.", nullptr },
+    { STEP_STAND, LM_MID_12, LM_MID_12, 3000,
+      "AT MID12", "Hold still.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_MID_12, LM_MID_12, 10000,
+      "ROTATE MID12", "Turn slowly all\nthe way around.", "Done - RIGHT." },
+    { STEP_WALK,  LM_MID_12, LM_MID_23, 0,
+      "-> MID23", "Walk to mid B2-B3.", nullptr },
+    { STEP_STAND, LM_MID_23, LM_MID_23, 3000,
+      "AT MID23", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_23, LM_MID_34, 0,
+      "-> MID34", "Walk to mid B3-B4.", nullptr },
+    { STEP_STAND, LM_MID_34, LM_MID_34, 3000,
+      "AT MID34", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_34, LM_MID_45, 0,
+      "-> MID45", "Walk to mid B4-B5.", nullptr },
+    { STEP_STAND, LM_MID_45, LM_MID_45, 3000,
+      "AT MID45", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_45, LM_MID_56, 0,
+      "-> MID56", "Walk to mid B5-B6.", nullptr },
+    { STEP_STAND, LM_MID_56, LM_MID_56, 3000,
+      "AT MID56", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_56, LM_MID_61, 0,
+      "-> MID61", "Walk to mid B6-B1.", nullptr },
+    { STEP_STAND, LM_MID_61, LM_MID_61, 3000,
+      "AT MID61", "Hold still.", "OK - RIGHT." },
+    { STEP_WALK,  LM_MID_61, LM_OPPOSITE_RX, 0,
+      "-> OUTSIDE", "Walk OUT past the\nbeacon ring.", nullptr },
+    { STEP_STAND, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 4000,
+      "AT OUTSIDE", "Hold still\noutside the ring.", "OK - RIGHT." },
+    { STEP_ROTATE, LM_OPPOSITE_RX, LM_OPPOSITE_RX, 10000,
+      "ROTATE OUT", "Turn slowly all\nthe way around.", "Done - RIGHT." },
+    { STEP_END, LM_RX, LM_RX, 0, "DONE", "", "" },
+
+};
+
+// Dispatch by beacon count.  Index 0..2 are null: 1 beacon uses the
+// tripwire shortcut (no walk cal at all) and 2 beacons have no walk
+// script yet, so both fall through to the guard in wizard_begin().
+struct ScriptEntry { const WizardStep *steps; int len; };
+#define SCRIPT_ENTRY(a) { a, (int)(sizeof(a) / sizeof(WizardStep)) }
+
+static const ScriptEntry SCRIPTS_STEREO[MAX_BEACONS + 1] = {
+    { nullptr, 0 },                 // 0 beacons
+    { nullptr, 0 },                 // 1 — tripwire, no walk
+    { nullptr, 0 },                 // 2 — line mode, no walk script yet
+    SCRIPT_ENTRY(SCRIPT_STEREO_3),
+    SCRIPT_ENTRY(SCRIPT_STEREO_4),
+    SCRIPT_ENTRY(SCRIPT_STEREO_5),
+    SCRIPT_ENTRY(SCRIPT_STEREO_6),
+};
+
+static const ScriptEntry SCRIPTS_SOLO[MAX_BEACONS + 1] = {
+    { nullptr, 0 },
+    { nullptr, 0 },
+    { nullptr, 0 },
+    SCRIPT_ENTRY(SCRIPT_SOLO_3),
+    SCRIPT_ENTRY(SCRIPT_SOLO_4),
+    SCRIPT_ENTRY(SCRIPT_SOLO_5),
+    SCRIPT_ENTRY(SCRIPT_SOLO_6),
 };
 
 // ── Module state ──────────────────────────────────────────────
@@ -177,7 +709,7 @@ static void set_phase(WizardPhase p) {
 static void enter_step(int idx) {
     s_cur_idx = idx;
     const WizardStep &s = s_script[idx];
-    Serial.printf("[wizard] step %d/%d kind=%d lm_a=%u lm_b=%u title=%s\n",
+    MSLOG("[wizard] step %d/%d kind=%d lm_a=%u lm_b=%u title=%s\n",
                   idx, s_script_len, (int)s.kind,
                   (unsigned)s.landmark_a, (unsigned)s.landmark_b,
                   s.title ? s.title : "-");
@@ -216,25 +748,49 @@ static void exit_step(int idx) {
 
 // ── Public API ────────────────────────────────────────────────
 void wizard_begin(CalMode mode) {
-    if (mode == CAL_MODE_STEREO) {
-        s_script     = SCRIPT_STEREO;
-        s_script_len = sizeof(SCRIPT_STEREO) / sizeof(SCRIPT_STEREO[0]);
+    // Script is chosen by MODE first, beacon count second.
+    //
+    // v0.9 fix: the count-based lookup used to fall back to
+    // SCRIPT_STEREO_3 for any count outside 3..6 -- including in SOLO
+    // mode, so a solo cal with 1 or 2 beacons ran the STEREO script and
+    // read out stereo instructions ("Carry PROBE", "ANCHOR stays put")
+    // to a user holding one device.  v0.7 had no count dependency and
+    // was always right about the mode; the fallback must never cross
+    // modes.
+    const bool solo = (mode == CAL_MODE_SOLO);
+    const ScriptEntry *table = solo ? SCRIPTS_SOLO : SCRIPTS_STEREO;
+    const int n = g_app.beacon_count;
+
+    if (n >= 3 && n <= MAX_BEACONS && table[n].steps != nullptr) {
+        s_script     = table[n].steps;
+        s_script_len = table[n].len;
     } else {
-        s_script     = SCRIPT_SOLO;
-        s_script_len = sizeof(SCRIPT_SOLO) / sizeof(SCRIPT_SOLO[0]);
+        // Fewer than 3 beacons: no polygon script exists.  Use the
+        // 3-beacon script FOR THIS MODE -- degraded coverage, but the
+        // instructions match what the user is actually holding.
+        if (solo) {
+            s_script     = SCRIPT_SOLO_3;
+            s_script_len = (int)(sizeof(SCRIPT_SOLO_3) / sizeof(WizardStep));
+        } else {
+            s_script     = SCRIPT_STEREO_3;
+            s_script_len = (int)(sizeof(SCRIPT_STEREO_3) / sizeof(WizardStep));
+        }
+        MSLOG("[wizard] no %s script for %d beacons - using the 3-beacon one\n",
+              solo ? "solo" : "stereo", n);
     }
     s_active   = true;
     s_finished = false;
     s_capture_open = false;
     enter_step(0);
-    Serial.printf("[wizard] begin mode=%d steps=%d\n", (int)mode, s_script_len);
+    MSLOG("[wizard] begin mode=%d beacons=%d steps=%d\n",
+                  (int)mode, g_app.beacon_count, s_script_len);
 }
 
 void wizard_abort() {
     if (s_active) exit_step(s_cur_idx);
     s_active = false;
     s_finished = false;
-    Serial.println("[wizard] abort");
+    MSLOGLN("[wizard] abort");
 }
 
 bool wizard_active()   { return s_active; }
@@ -278,7 +834,7 @@ bool wizard_try_advance() {
         s_active   = false;
         s_finished = true;
         s_cur_idx  = next;
-        Serial.println("[wizard] finished");
+        MSLOGLN("[wizard] finished");
         return true;
     }
     enter_step(next);
@@ -361,7 +917,7 @@ void wizard_jump_to_step(int idx) {
         s_active   = false;
         s_finished = true;
         s_cur_idx  = idx;
-        Serial.println("[wizard] jump to END (from step hint)");
+        MSLOGLN("[wizard] jump to END (from step hint)");
         return;
     }
     if (!s_active) { s_active = true; s_finished = false; }

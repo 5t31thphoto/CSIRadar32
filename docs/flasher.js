@@ -34,6 +34,12 @@
         'beacon-2|xiao-s3':         'manifests/beacon-2.json',
         'beacon-3|xiao-c3':         'manifests/beacon-3.json',
         'beacon-3|xiao-s3':         'manifests/beacon-3.json',
+        'beacon-4|xiao-c3':         'manifests/beacon-4.json',
+        'beacon-4|xiao-s3':         'manifests/beacon-4.json',
+        'beacon-5|xiao-c3':         'manifests/beacon-5.json',
+        'beacon-5|xiao-s3':         'manifests/beacon-5.json',
+        'beacon-6|xiao-c3':         'manifests/beacon-6.json',
+        'beacon-6|xiao-s3':         'manifests/beacon-6.json',
     };
 
     // Which boards go with which role
@@ -50,6 +56,18 @@
             { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
         ],
         'beacon-3': [
+            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
+            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
+        ],
+        'beacon-4': [
+            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
+            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
+        ],
+        'beacon-5': [
+            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
+            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
+        ],
+        'beacon-6': [
             { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
             { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
         ],

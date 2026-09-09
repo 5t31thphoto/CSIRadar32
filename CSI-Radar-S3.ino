@@ -78,18 +78,30 @@ static bool is_cal_state(AppState s) {
         || s == ST_CAL_FINALIZE  || s == ST_CAL_RESULTS
         || s == ST_RX_ASSEMBLY;
 }
+// v0.8: ST_MOBILE_PROBE is a LOCAL state of the probe unit only.  It
+// must never travel over the state-hint channel: if a forced role
+// override ever makes the probe the PRIMARY, it would become the
+// broadcast authority and drag the anchor into mobile-probe mode too,
+// leaving nobody running the target inference.  Guarded on both the
+// send side (maybe_broadcast_state) and the receive side
+// (follow_peer_state).
+// Broadcast authority: the device in the user's hand, for the WHOLE
+// session.  It does not depend on the current state, so there is no
+// boundary at which it changes hands and no transition that can fall
+// between two owners.
 static bool this_unit_is_broadcast_authority() {
-    // During cal, the PROBE drives (whichever role it is).
-    if (is_cal_state(g_app.state)) {
-        return g_app.peer.cal_role == CAL_ROLE_PROBE
-            || g_app.cal_mode == CAL_MODE_SOLO;
-    }
-    // Outside cal, PRIMARY drives.
-    return g_app.peer.role == ROLE_PRIMARY;
+    if (g_app.cal_mode == CAL_MODE_SOLO)      return true;
+    if (g_app.peer.cal_role != CAL_ROLE_NONE) return g_app.peer.cal_role == CAL_ROLE_PROBE;
+    return g_app.peer.role == ROLE_PRIMARY;   // before cal roles exist
 }
+
 static void maybe_broadcast_state() {
-    if (!this_unit_is_broadcast_authority()) return;
+    if (g_app.state == ST_MOBILE_PROBE) return;   // v0.8: local-only state
+    if (g_app.state == ST_DEBUG_LOG)    return;   // v0.9: local-only state
     if (g_app.state == s_last_broadcast_state) return;
+
+    if (!this_unit_is_broadcast_authority()) return;
+
     peer_send_command(PEER_OP_STATE_HINT, (uint8_t)g_app.state);
     s_last_broadcast_state = g_app.state;
 }
@@ -102,6 +114,24 @@ static void follow_peer_state() {
     if (hint == 0) return;
     g_app.peer.primary_state_hint = 0;
     if (this_unit_is_broadcast_authority()) return;   // I'm the authority; ignore
+    // v0.85: undocking is a LOCAL decision and only the user ends it.
+    // Outside cal the anchor is the broadcast authority, so any time it
+    // re-entered ST_DASHBOARD (e.g. backing out of its own settings) it
+    // would broadcast that state and drag the undocked probe back to the
+    // docked dashboard mid-session.  Ignore the routine run-state hints
+    // while mobile; still honour re-cal and sleep, which must win.
+    if (g_app.state == ST_MOBILE_PROBE
+        && (hint == ST_DASHBOARD || hint == ST_RX_ASSEMBLY)) return;
+
+    // Same protection for anything the user is ACTIVELY looking at on
+    // this unit.  If you walk over to the anchor and open its settings
+    // or the debug log, the other unit bouncing through its own settings
+    // and back would re-broadcast ST_DASHBOARD and yank you out of the
+    // screen you deliberately opened.  Routine run-state hints do not
+    // get to interrupt a local menu; re-cal and sleep still win, because
+    // those genuinely have to move both units.
+    if ((g_app.state == ST_SETTINGS || g_app.state == ST_DEBUG_LOG)
+        && (hint == ST_DASHBOARD || hint == ST_RX_ASSEMBLY)) return;
     switch (hint) {
         case ST_CAL_INTRO:
         case ST_CAL_ANCHOR_PLACE:
@@ -115,6 +145,11 @@ static void follow_peer_state() {
             break;
         case ST_SLEEP_ARM:
             enter_state(ST_SLEEP_ARM);
+            break;
+        case ST_MOBILE_PROBE:
+        case ST_DEBUG_LOG:
+            // Never follow a peer into either of these.  Both are local
+            // decisions made from this unit's own settings menu.
             break;
         default:
             break;
@@ -143,12 +178,12 @@ static void assign_cal_roles() {
         g_app.cal_mode = CAL_MODE_STEREO;
         return;
     }
-    // AUTO: lower MAC = ANCHOR (PRIMARY).
-    if (g_app.peer.role == ROLE_PRIMARY) {
-        g_app.peer.cal_role = CAL_ROLE_ANCHOR;
-    } else {
-        g_app.peer.cal_role = CAL_ROLE_PROBE;
-    }
+    // NO AUTO-ASSIGNMENT.  The firmware does not get to decide which
+    // physical box you carry -- that was a MAC-order coin flip, and it
+    // guessed wrong every time you happened to be holding the other one.
+    // Leave the roles unset; ST_PICK_CARRY asks the user to press the
+    // unit they are holding, and that unit becomes the PROBE.
+    g_app.peer.cal_role = CAL_ROLE_NONE;
     g_app.cal_mode = CAL_MODE_STEREO;
 }
 
@@ -160,7 +195,7 @@ static bool this_unit_drives_wizard() {
 
 // ── Deep sleep ────────────────────────────────────────────────
 static void enter_deep_sleep() {
-    Serial.println("[sleep] entering deep sleep");
+    MSLOGLN("[sleep] entering deep sleep");
     if (g_app.peer.role == ROLE_PRIMARY && g_app.peer.peer_present) {
         peer_send_command(PEER_OP_SLEEP);
         delay(50);
@@ -188,12 +223,23 @@ static void enter_deep_sleep() {
 // ═══════════════════════════════════════════════════════════════
 static void state_splash() {
     ui_splash();
-    uint32_t splash_timeout = g_app.woke_from_deep_sleep ? 900 : 4000;
-    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)
-        || (state_age_ms() > splash_timeout)) {
+    // The splash is NOT skippable.  It runs to its timeout every boot.
+    //
+    // It used to exit on wasShortPressed(BTN_RIGHT), which is how a
+    // phantom boot edge could eat the whole animation -- but removing
+    // the button path is the right fix regardless of that bug: this
+    // screen is the only place the version and identity are shown, and
+    // it is short.  No button reaches it now, so no edge, real or
+    // spurious, can cut it short.
+    const uint32_t splash_timeout = g_app.woke_from_deep_sleep ? 900 : 4000;
+    if (state_age_ms() > splash_timeout) {
         g_app.woke_from_deep_sleep = false;
         csi_engine_begin();
         peer_begin();
+        // v0.9: bring up the wired peer link.  Harmless with no cable
+        // attached — peer_active_transport() only prefers the wire once
+        // a valid frame has actually arrived on it.
+        peer_wire_begin();
         scene_begin();
         csi_reset_discovery();
         peer_start_discovery();
@@ -231,15 +277,41 @@ static void state_role_confirm() {
 
 static void state_discovery() {
     const uint32_t deadline = 12000;
+
+    // Keep listening while the count is still RISING.  A beacon that
+    // powers up late, or comes back after a dropout, used to arrive
+    // after the deadline had already locked the mode.
+    static int      s_last_count   = -1;
+    static uint32_t s_last_new_ms  = 0;
+    if ((int)g_app.beacon_count != s_last_count) {
+        s_last_count  = (int)g_app.beacon_count;
+        s_last_new_ms = millis();
+    }
+    const bool settled = (millis() - s_last_new_ms) > 3000;
+
     ui_discovery(g_app.beacon_count, state_age_ms(), deadline);
 
     if (wasShortPressed(BTN_LEFT)) {
         csi_reset_discovery();
+        s_last_count = -1;
         g_app.state_enter_ms = millis();
     }
 
-    if ((wasShortPressed(BTN_RIGHT) && g_app.beacon_count > 0)
-        || (state_age_ms() >= deadline && g_app.beacon_count > 0)) {
+    // AUTO-ADVANCE ONLY WITH A FULL SET.
+    //
+    // This used to advance on any count > 0 after the deadline, and then
+    // pick the mode from that count -- so if two of three beacons were
+    // asleep or had dropped out, the system SILENTLY downgraded itself
+    // to tripwire and skipped the walk.  The user never chose that; a
+    // dropout chose it for them, and the only symptom was a cal that
+    // behaved wrongly much later.
+    //
+    // Fewer than three now REQUIRES a deliberate press, so a degraded
+    // mode is always an explicit decision.
+    const int n_found   = (int)g_app.beacon_count;
+    const bool full_set = (n_found >= 3);
+    if ((wasShortPressed(BTN_RIGHT) && n_found > 0)
+        || (state_age_ms() >= deadline && full_set && settled)) {
         int n = g_app.beacon_count;
         if (n >= 3)      g_app.mode = RM_TRIANGLE_3;
         else if (n == 2) g_app.mode = RM_LINE_2;
@@ -249,6 +321,12 @@ static void state_discovery() {
         csi_assign_default_geometry(300.0f);
         // Derive normalized landmark positions now that we know the geometry.
         scene_derive_landmarks_from_geometry();
+        // v0.9: now that we know which beacons are out there, actually
+        // TELL them how to run.  This is the step that was missing: the
+        // beacon firmware has always accepted these commands and the
+        // receiver never sent any, so every beacon stayed at its
+        // compiled 100 Hz default while the capture path used 20.
+        csi_beacon_apply_run_config();
         enter_state(ST_GEOMETRY_GUIDE);
     }
 }
@@ -257,10 +335,59 @@ static void state_geometry_guide() {
     ui_geometry_guide();
     if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
         assign_cal_roles();
-        enter_state(ST_CAL_INTRO);
+        // With a peer present the ROLES ARE THE USER'S CHOICE: go ask
+        // which box they are holding instead of picking one by MAC.
+        // Solo has one device, so there is nothing to ask.
+        s_empty_started = false;
+        if (g_app.peer.peer_present && g_app.cal_mode != CAL_MODE_SOLO
+            && g_app.peer.cal_role == CAL_ROLE_NONE) {
+            enter_state(ST_PICK_CARRY);
+        } else {
+            enter_state(ST_CAL_INTRO);
+        }
     }
     if (wasShortPressed(BTN_LEFT) || wasLongPressed(BTN_LEFT))
         enter_state(ST_DISCOVERY);
+}
+
+// v0.9 — the user picks which box they carry, by pressing it.
+// Both units show the same prompt; whichever is pressed becomes the
+// PROBE and tells the other it is the ANCHOR.  No MAC order, no guess.
+static void state_pick_carry() {
+    // The anchor never NEEDS a press -- it follows the unit in your hand
+    // automatically.  But its buttons still work.  Locking them out
+    // would mean that the moment anything goes wrong, the device sitting
+    // in the middle of the room is unreachable and you have to power
+    // cycle it.  Following by default, overridable always.
+    if (g_app.peer.cal_role == CAL_ROLE_ANCHOR) {
+        ui_pick_carry_anchor();
+        // Pressing THIS unit claims it as the one you are carrying --
+        // useful if you picked up the wrong box, or if the other one is
+        // wedged and you need to drive from here instead.
+        if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+            g_app.peer.cal_role      = CAL_ROLE_PROBE;
+            g_app.peer.role_override = RO_FORCE_PROBE;
+            peer_send_command(PEER_OP_CAL_ROLE_ANCHOR, 0);   // other one takes it
+            MSLOGLN("[cal] role swapped by press on the anchor");
+            enter_state(ST_CAL_INTRO);
+            return;
+        }
+        if (wasShortPressed(BTN_LEFT)) enter_state(ST_RX_ASSEMBLY);
+        return;
+    }
+    ui_pick_carry();
+
+    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+        g_app.peer.cal_role      = CAL_ROLE_PROBE;
+        g_app.peer.role_override = RO_FORCE_PROBE;
+        g_app.cal_mode           = CAL_MODE_STEREO;
+        // Tell the other unit it is the anchor.
+        peer_send_command(PEER_OP_STATE_HINT, (uint8_t)ST_CAL_INTRO);
+        peer_send_command(PEER_OP_CAL_ROLE_ANCHOR, 0);
+        enter_state(ST_CAL_INTRO);
+        return;
+    }
+    if (wasShortPressed(BTN_LEFT)) enter_state(ST_RX_ASSEMBLY);
 }
 
 static void state_cal_intro() {
@@ -273,32 +400,87 @@ static void state_cal_intro() {
         enter_state(ST_GEOMETRY_GUIDE);
 }
 
-static void state_cal_anchor_place() {
-    ui_cal_anchor_place();
-    // Only PROBE (in the user's hand) can advance this step.
-    if (this_unit_drives_wizard()) {
-        if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
-            csi_reset_filters(true);      // clear old baseline before recap
-            enter_state(ST_CAL_EMPTY_ROOM);
-        }
-        if (wasShortPressed(BTN_LEFT))
-            enter_state(ST_CAL_INTRO);
-    }
+// A USER PRESSED A BUTTON.  That intent must reach the other unit no
+// matter which box it happened on.
+//
+// Broadcast authority governs AUTOMATIC transitions -- it decides who
+// narrates the ceremony so the two units do not fight.  It must not
+// decide whose buttons are allowed to work.  Gating input on authority
+// turned the anchor into a locked-out slave: the moment anything went
+// wrong, the device sitting in the middle of the room could not be
+// touched and the only recourse was a power cycle.
+static void user_advance(AppState st) {
+    enter_state(st);
+    peer_send_command(PEER_OP_STATE_HINT, (uint8_t)st);
+    s_last_broadcast_state = st;
 }
 
+static void state_cal_anchor_place() {
+    ui_cal_anchor_place();
+    // Either unit may advance.  The probe normally does, because that is
+    // the one in your hand -- but the anchor's buttons still work.
+    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+        csi_reset_filters(true);          // clear old baseline before recap
+        user_advance(ST_CAL_EMPTY_ROOM);
+    }
+    if (wasShortPressed(BTN_LEFT))
+        user_advance(ST_CAL_INTRO);
+}
+
+// Empty-room step state: whether the user has pressed START from
+// outside the room (stereo) or the countdown has expired (solo).
+static bool     s_empty_started  = false;
+static uint32_t s_empty_start_ms = 0;
+
 static void state_cal_empty_room() {
+    // THE SEQUENCE, as the user actually performs it:
+    //
+    //   STEREO: the anchor is already placed and is never touched again.
+    //           You carry the probe OUT of the room, and press START
+    //           from outside.  Sampling only begins then, so the room is
+    //           genuinely empty and nobody had to guess a countdown.
+    //           When it finishes, you are told to come back.
+    //
+    //   SOLO:   there is only one device and it has to stay in the room,
+    //           so you cannot press anything from outside.  That case
+    //           gets the timed countdown instead.
+    //
+    // Previously this said "leave the room" and started sampling
+    // immediately, with no instruction about pressing anything and no
+    // statement of what to do afterwards.
+    const bool stereo = (g_app.cal_mode == CAL_MODE_STEREO);
+    const uint32_t age = state_age_ms();
+
+    if (stereo) {
+        if (!s_empty_started) {
+            ui_cal_empty_prompt();            // "walk out, then press START"
+            if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+                s_empty_started = true;
+                s_empty_start_ms = millis();
+            }
+            if (wasShortPressed(BTN_LEFT)) enter_state(ST_CAL_ANCHOR_PLACE);
+            return;
+        }
+    } else {
+        // Solo: nobody outside to press anything, so time it.
+        if (age < CAL_LEAVE_GRACE_MS) {
+            ui_cal_leave_countdown((CAL_LEAVE_GRACE_MS - age + 999) / 1000);
+            return;
+        }
+        s_empty_started = true;
+    }
+
     // Reuse the v0.2 empty-room baseline mechanism verbatim: csi.cpp
     // accumulates samples into per-beacon baseline; when done, we
     // signal scene that background is captured.
     csi_baseline_accumulate();
     float p = csi_baseline_progress();
-    ui_cal_empty_room(state_age_ms());
+    ui_cal_empty_room(millis() - s_empty_start_ms);
 
-    if (this_unit_drives_wizard()) {
-        if (wasShortPressed(BTN_LEFT))
-            enter_state(g_app.cal_mode == CAL_MODE_STEREO
-                        ? ST_CAL_ANCHOR_PLACE : ST_CAL_INTRO);
-    }
+    // Back out from either unit.
+    if (wasShortPressed(BTN_LEFT))
+        user_advance(g_app.cal_mode == CAL_MODE_STEREO
+                     ? ST_CAL_ANCHOR_PLACE : ST_CAL_INTRO);
     if (p >= 1.0f) {
         csi_baseline_finalize();
         scene_cal_ack_empty_room();
@@ -340,9 +522,12 @@ static void state_cal_empty_room() {
 static void state_cal_landmark_walk() {
     ui_cal_landmark_walk();
 
+    // The WALK is the one step that must stay single-driver: the script
+    // advances landmark by landmark and both units stepping it
+    // independently would desync the capture.  The unit in your hand
+    // owns it -- which after ST_PICK_CARRY is the one you chose.
     if (this_unit_drives_wizard()) {
-        // PROBE drives the wizard from its buttons.  wizard_tick reads
-        // wasShortPressed(BTN_RIGHT/LEFT) internally.
+        // wizard_tick reads wasShortPressed(BTN_RIGHT/LEFT) internally.
         wizard_tick();
 
         // If wizard advanced this tick, send the new step index to ANCHOR.
@@ -379,6 +564,13 @@ static void state_cal_finalize() {
             s_report.valid = true;
             s_report.mode = g_app.cal_mode;
             s_report.total_kernel_samples = scene_kernel_sample_count();
+            // v0.8: the probe DOES have a kernel of its own — every unit
+            // folds its own frames into its own s_kernel[] during the
+            // walk.  It just never had the per-beacon weights computed,
+            // because that happens inside scene_finalize_cal() which
+            // only the anchor runs.  Doing it here is what makes the
+            // probe able to localize itself after undocking.
+            scene_finalize_probe_kernel();
         }
         ui_cal_stash_report(s_report);
         s_finalize_ran = true;
@@ -391,13 +583,13 @@ static void state_cal_finalize() {
 
 static void state_cal_results() {
     ui_cal_results();
-    if (this_unit_drives_wizard()) {
+    // Accept or redo from EITHER unit.  This is the screen the user is
+    // most likely to reach with the wrong box in hand.
+    {
         if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
             // Accept — move to RX_ASSEMBLY (stereo) or dashboard (solo)
-            if (g_app.cal_mode == CAL_MODE_STEREO)
-                enter_state(ST_RX_ASSEMBLY);
-            else
-                enter_state(ST_DASHBOARD);
+            user_advance(g_app.cal_mode == CAL_MODE_STEREO
+                         ? ST_RX_ASSEMBLY : ST_DASHBOARD);
         }
         if (wasShortPressed(BTN_LEFT)) {
             // Redo cal from the empty-room step
@@ -444,10 +636,161 @@ static void state_dashboard() {
     ui_dashboard();
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  v0.8 — ST_MOBILE_PROBE (probe unit only)
+// ═══════════════════════════════════════════════════════════════
+static uint32_t s_probe_undock_ts_ms   = 0;
+static uint32_t s_probe_pos_last_tx_ms = 0;
+static float    s_probe_pos[2]  = {0, 0};
+static float    s_probe_cov[3]  = {0.1f, 0.1f, 0};
+static float    s_probe_conf    = 0;
+
+// Spec 2.9: the first fixes after undocking are noisy, because the
+// kernel only ever saw the probe at landmarks and it is now somewhere
+// between them.  For the first 3 s we show "acquiring", keep the fix to
+// ourselves, and let the anchor carry on with no self-suppression at
+// all.  After that we additionally require the confidence gate.
+#define PROBE_ACQUIRE_MS        3000
+#define PROBE_CONF_GATE         0.30f
+
+static bool probe_fix_is_publishable() {
+    if (millis() - s_probe_undock_ts_ms < PROBE_ACQUIRE_MS) return false;
+    return s_probe_conf > PROBE_CONF_GATE;
+}
+
+static void enter_mobile_probe() {
+    g_app.probe_undocked   = true;
+    s_probe_undock_ts_ms   = millis();
+    s_probe_pos_last_tx_ms = 0;
+    // Spec 2.9: seed at the RX origin — where the probe demonstrably was
+    // a moment ago, while docked on the bar.
+    s_probe_pos[0] = 0; s_probe_pos[1] = 0;
+    s_probe_cov[0] = 0.1f; s_probe_cov[1] = 0.1f; s_probe_cov[2] = 0;
+    s_probe_conf   = 0;
+    peer_send_command(PEER_OP_UNDOCK_PROBE);
+    enter_state(ST_MOBILE_PROBE);
+}
+
+static void exit_mobile_probe() {
+    g_app.probe_undocked = false;
+    peer_send_command(PEER_OP_REDOCK_PROBE);
+    peer_reset_probe_undock();
+    enter_state(ST_DASHBOARD);
+}
+
+static void state_mobile_probe() {
+    // 1) Self-locate from this unit's own observations against its own
+    //    (probe-perspective) kernel.  scene_observe has already stashed
+    //    the latest frame; g_last_obs is what it holds.
+    extern FrameObservation g_last_obs;
+    float pos[2], cov[3], conf;
+    if (scene_estimate_probe_position(g_last_obs, pos, cov, &conf)) {
+        s_probe_pos[0] = pos[0]; s_probe_pos[1] = pos[1];
+        s_probe_cov[0] = cov[0]; s_probe_cov[1] = cov[1]; s_probe_cov[2] = cov[2];
+        s_probe_conf   = conf;
+    }
+
+    // 2) Stream the fix to the anchor at ~10 Hz, but only once it is
+    //    trustworthy — publishing a bad fix would make the anchor tag
+    //    the wrong track as "YOU", and mislabelling a NEW presence is
+    //    the one failure mode that is explicitly not acceptable.
+    uint32_t now = millis();
+    if (probe_fix_is_publishable() && (now - s_probe_pos_last_tx_ms) >= 100) {
+        PeerProbePositionPacket pkt = {};
+        pkt.magic       = PEER_PROBE_POS_MAGIC;
+        pkt.rx_stamp_ms = now;
+        pkt.pos_x       = s_probe_pos[0];
+        pkt.pos_y       = s_probe_pos[1];
+        pkt.cov_xx      = s_probe_cov[0];
+        pkt.cov_yy      = s_probe_cov[1];
+        pkt.cov_xy      = s_probe_cov[2];
+        pkt.confidence  = s_probe_conf;
+        peer_send_probe_position(pkt);
+        s_probe_pos_last_tx_ms = now;
+    }
+
+    // 3) Render the anchor's tracks plus our own "you are here" marker.
+    ui_mobile_probe_view(peer_last_track_state(),
+                         peer_track_state_age_ms(),
+                         s_probe_pos, s_probe_cov, s_probe_conf,
+                         !probe_fix_is_publishable());
+
+    // 4) LEFT returns to settings, where "Return to stereo" lives.
+    if (wasShortPressed(BTN_LEFT) || wasLongPressed(BTN_LEFT)) {
+        s_settings_row = 0;
+        enter_state(ST_SETTINGS);
+    }
+}
+
+// ── ANCHOR side: stream track state down to the undocked probe ──
+static uint32_t s_track_state_last_tx_ms = 0;
+
+static void anchor_service_undocked_probe() {
+    if (!peer_probe_is_undocked()) return;
+
+    // Self-suppression: tag any track sitting on top of the probe's
+    // reported position.  A stale fix (probe out of range, or gone quiet
+    // because its own confidence dropped) clears every tag rather than
+    // freezing the last one — a "YOU" label stuck on a track after the
+    // probe has stopped reporting would be worse than no label.
+    float ppos[2], pcov[3];
+    if (peer_get_probe_position(ppos, pcov, nullptr))
+        scene_apply_self_suppression(ppos, pcov);
+    else
+        scene_clear_self_suppression();
+
+    uint32_t now = millis();
+    if ((now - s_track_state_last_tx_ms) < 200) return;   // ~5 Hz
+    s_track_state_last_tx_ms = now;
+
+    PeerTrackStatePacket pkt = {};
+    pkt.magic       = PEER_TRACK_STATE_MAGIC;
+    pkt.rx_stamp_ms = now;
+    pkt.n_tracks    = TRACK_MAX;
+    for (int t = 0; t < TRACK_MAX; t++) {
+        const TargetTrack *tr = scene_get_track(t);
+        if (!tr) continue;
+        pkt.tracks[t].active     = tr->active ? 1 : 0;
+        pkt.tracks[t].is_self    = tr->is_self;
+        pkt.tracks[t].pos_x      = tr->pos[0];
+        pkt.tracks[t].pos_y      = tr->pos[1];
+        pkt.tracks[t].cov_xx     = tr->cov_xx;
+        pkt.tracks[t].cov_yy     = tr->cov_yy;
+        pkt.tracks[t].cov_xy     = tr->cov_xy;
+        pkt.tracks[t].confidence = tr->confidence;
+    }
+    peer_send_track_state(pkt);
+}
+
+// v0.9 — in-RAM log viewer.  LEFT scrolls a page, long LEFT exits,
+// RIGHT clears.  Local-only, like ST_MOBILE_PROBE: never broadcast.
+static int s_debug_scroll = 0;
+static void state_debug_log() {
+    ui_debug_log(s_debug_scroll);
+    if (wasLongPressed(BTN_LEFT)) {
+        s_settings_row = UI_SETTINGS_ROW_DEBUG;
+        enter_state(ST_SETTINGS);
+        return;
+    }
+    if (wasShortPressed(BTN_LEFT)) {
+        s_debug_scroll += 10;
+        if (s_debug_scroll >= ms_log_count()) s_debug_scroll = 0;   // wrap
+    }
+    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+        ms_log_clear();
+        s_debug_scroll = 0;
+    }
+}
+
 static void state_settings() {
+    // The undock row can disappear underneath the cursor (e.g. the peer
+    // drops), so clamp before drawing rather than indexing off the end.
+    if (s_settings_row >= ui_settings_row_count()) s_settings_row = 0;
     ui_settings(s_settings_row);
     if (wasShortPressed(BTN_LEFT)) {
-        s_settings_row = (s_settings_row + 1) % 6;
+        // v0.8: the row count is dynamic — the probe gains an "Undock
+        // probe" row once it has a kernel to localize against.
+        s_settings_row = (s_settings_row + 1) % ui_settings_row_count();
     }
     if (wasShortPressed(BTN_RIGHT)) {
         switch (s_settings_row) {
@@ -495,6 +838,17 @@ static void state_settings() {
             case 5:
                 enter_state(ST_DASHBOARD);
                 return;
+            case UI_SETTINGS_ROW_DEBUG:
+                s_debug_scroll = 0;
+                enter_state(ST_DEBUG_LOG);
+                return;
+            case UI_SETTINGS_ROW_UNDOCK:
+                // v0.8.  Only reachable when the row is visible, which
+                // already requires PROBE role + a ready kernel.
+                if (!ui_settings_undock_row_visible()) break;
+                if (g_app.probe_undocked) exit_mobile_probe();
+                else                      enter_mobile_probe();
+                return;
         }
     }
     if (wasLongPressed(BTN_LEFT)) enter_state(ST_DASHBOARD);
@@ -531,7 +885,7 @@ static void state_sleep_arm() {
 //  setup()
 // ═══════════════════════════════════════════════════════════════
 void setup() {
-    Serial.begin(115200);
+    MSLOG_BEGIN();
     delay(100);
 
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
@@ -557,6 +911,7 @@ void setup() {
     g_app.peer.cal_role            = CAL_ROLE_NONE;
     g_app.peer.role_override       = RO_AUTO;
     g_app.cal_mode                 = CAL_MODE_UNKNOWN;
+    g_app.probe_undocked           = false;   // v0.8
 
     rtc_gpio_deinit((gpio_num_t)PIN_BTN_LEFT);
     rtc_gpio_deinit((gpio_num_t)PIN_BTN_RIGHT);
@@ -564,7 +919,7 @@ void setup() {
     input_begin();
     ui_begin();
 
-    Serial.printf("\n%s v%s booting (wake=%d, woke=%d)\n",
+    MSLOG("\n%s v%s booting (wake=%d, woke=%d)\n",
                   FW_NAME, FW_VERSION, (int)wake_cause, (int)woke);
 
     enter_state(ST_SPLASH);
@@ -588,7 +943,23 @@ void loop() {
     csi_process_frames();
 
     // Peer tick — heartbeats, timeouts
-    if (g_app.state != ST_SPLASH) peer_tick();
+    if (g_app.state != ST_SPLASH) {
+        peer_tick();
+        peer_wire_poll();   // v0.9: drain the wired link, if present
+        // v0.9: keep beacons on the commanded rate. A beacon that reboots
+        // or powers up late would otherwise stay at the 100 Hz
+        // compatibility default indefinitely.
+        //
+        // NOT during calibration: re-commanding changes a beacon's TX
+        // rate mid-capture, so a single kernel sample would span two
+        // rates, and the command itself is extra ESP-NOW airtime during
+        // the measurement we are trying to make.  Anything off-rate gets
+        // corrected as soon as cal finishes.
+        if (g_app.beacon_count > 0 && !is_cal_state(g_app.state)) {
+            csi_beacon_service();        // retries only unconfirmed beacons
+            csi_beacon_enforce_rate();   // periodic re-verify
+        }
+    }
 
     // Both units follow peer state hints; authority check is inside.
     follow_peer_state();
@@ -606,14 +977,33 @@ void loop() {
     // Feed frame observations to scene — always during cal windows,
     // AND at runtime so scene_observe stashes the latest frame for
     // scene_update to consume.
-    if (g_app.state == ST_CAL_LANDMARK_WALK
-        || g_app.state == ST_DASHBOARD) {
-        csi_update_spatial();   // internally calls scene_observe()
+    // v0.9: rate-gate this.  loop() yields only every 15 ms (see bottom
+    // of this function), so it free-runs at hundreds of Hz, and this was
+    // rebuilding a FrameObservation and calling scene_observe() on every
+    // single iteration.  scene_update() already caps itself at
+    // SCENE_UPDATE_MS, and the cal capture is decimated to CAP_HZ, so
+    // everything downstream is throwing most of that work away.  Sample
+    // slightly faster than the fastest consumer and no faster.
+    {
+        static uint32_t s_spatial_last_ms = 0;
+        const uint32_t SPATIAL_MIN_MS = 10;   // 100 Hz ceiling
+        uint32_t now_sp = millis();
+        if ((g_app.state == ST_CAL_LANDMARK_WALK
+             || g_app.state == ST_DASHBOARD
+             || g_app.state == ST_MOBILE_PROBE)
+            && (now_sp - s_spatial_last_ms) >= SPATIAL_MIN_MS) {
+            s_spatial_last_ms = now_sp;
+            csi_update_spatial();   // internally calls scene_observe()
+        }
     }
 
     // Runtime reconstruction — only in dashboard, only after cal
     if (g_app.state == ST_DASHBOARD && scene_cal_complete()) {
         scene_update();
+        // v0.8: on the anchor, fold in the undocked probe's reported
+        // position and stream the resulting track list back to it.
+        // No-ops entirely when no probe has undocked.
+        anchor_service_undocked_probe();
     }
 
     switch (g_app.state) {
@@ -631,6 +1021,9 @@ void loop() {
         case ST_RX_ASSEMBLY:        state_rx_assembly();        break;
         case ST_DASHBOARD:          state_dashboard();          break;
         case ST_SETTINGS:           state_settings();           break;
+        case ST_MOBILE_PROBE:       state_mobile_probe();       break;
+        case ST_DEBUG_LOG:          state_debug_log();          break;
+        case ST_PICK_CARRY:         state_pick_carry();         break;
         case ST_SLEEP_ARM:          state_sleep_arm();          break;
         default:                    break;
     }

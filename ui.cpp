@@ -62,10 +62,14 @@ static void draw_header(const char *title) {
     int x = SCREEN_W - 6;
     for (int i = MAX_BEACONS - 1; i >= 0; i--) {
         if (!g_app.beacon[i].active) continue;
+        // The `else` here used to bind to the LS_PRESENCE test, so a
+        // beacon in LS_MOTION had its amber overwritten by lime as soon
+        // as baseline_valid went true -- motion never showed in the
+        // header. Explicit chain.
         uint16_t c = COL_DIM;
-        if (g_app.beacon[i].status == LS_MOTION)   c = COL_WARN;
-        if (g_app.beacon[i].status == LS_PRESENCE) c = COL_ALERT;
-        else if (g_app.beacon[i].baseline_valid)   c = COL_FG;
+        if      (g_app.beacon[i].status == LS_PRESENCE) c = COL_ALERT;
+        else if (g_app.beacon[i].status == LS_MOTION)   c = COL_WARN;
+        else if (g_app.beacon[i].baseline_valid)        c = COL_FG;
         g.fillCircle(x - 4, HEADER_H / 2, 3, c);
         g.drawCircle(x - 4, HEADER_H / 2, 3, COL_TEXT);
         x -= 10;
@@ -115,7 +119,16 @@ void ui_begin() {
     g_lcd.setBrightness(200);
     g_lcd.fillScreen(COL_BG);
 
-    // Full-screen off-screen sprite for flicker-free rendering
+    // Full-screen off-screen sprite for flicker-free rendering.
+    //
+    // Deliberately INTERNAL DRAM.  This is 106 KB, the largest single
+    // allocation in the firmware, and it is also the one thing that must
+    // work on every boot -- so it does not get placed behind PSRAM, which
+    // has never successfully initialized on this hardware across many
+    // attempts.  The v0.85 static-memory reductions (capture decimator,
+    // exact top-K percentile, right-sized kernel) recovered ~37 KB of
+    // headroom, which is what makes MAX_BEACONS=6 fit here WITHOUT PSRAM.
+    // Do not "optimize" this into SPIRAM.
     g_canvas.setColorDepth(16);
     g_canvas_ok = g_canvas.createSprite(SCREEN_W, SCREEN_H);
     if (!g_canvas_ok) {
@@ -124,6 +137,46 @@ void ui_begin() {
         g_lcd.setTextColor(COL_WARN);
         g_lcd.print("[ui] no sprite RAM");
     }
+    // ── Read-only report.  Reports what IS; nothing depends on it. ──
+    MSLOG("[ui] canvas=%s  free heap %u (min ever %u)\n",
+          g_canvas_ok ? "sprite" : "DIRECT-DRAW",
+          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+    const PsramProbe &pp = psram_probe();
+    MSLOG("[psram] %s  size=%u  %s\n",
+          pp.status == PSRAM_OK ? "OK" :
+          pp.status == PSRAM_NOT_COMPILED ? "NOT COMPILED" : "NO RESPONSE",
+          (unsigned)pp.size_bytes, pp.hint);
+}
+
+// Evaluated once, at first call.  PSRAM is enabled in the build but used
+// by nothing -- this exists purely to answer "did the experiment work",
+// and to say WHY when it did not, because the two failure modes need
+// completely different fixes.
+const PsramProbe &psram_probe() {
+    static PsramProbe p;
+    static bool done = false;
+    if (done) return p;
+    done = true;
+#if !defined(BOARD_HAS_PSRAM)
+    p.status = PSRAM_NOT_COMPILED;
+    p.size_bytes = 0;
+    p.hint = "build flag missing: fqbn needs PSRAM=opi";
+#else
+    if (psramFound()) {
+        p.status = PSRAM_OK;
+        p.size_bytes = (uint32_t)ESP.getPsramSize();
+        p.hint = "available for future use";
+    } else {
+        p.status = PSRAM_NO_RESPONSE;
+        p.size_bytes = 0;
+        // Compiled in and still silent: the flag reached the build, so
+        // this is the chip/mode side.  T-Display-S3 is an S3R8 (octal),
+        // and octal PSRAM only initializes with QIO flash -- a mismatch
+        // here is the usual cause.
+        p.hint = "enabled but chip silent: check OPI vs QUAD, or FlashMode=qio";
+    }
+#endif
+    return p;
 }
 
 // ── Splash ─────────────────────────────────────────────────────
@@ -229,10 +282,14 @@ void ui_splash() {
     uint32_t elapsed = millis() - g_app.state_enter_ms;
     // Reveal phases
     float reveal_mantis = elapsed / 1400.0f;       if (reveal_mantis > 1) reveal_mantis = 1;
-    float reveal_word   = (elapsed - 800) / 1200.0f;
+    // elapsed is uint32_t: (elapsed - 800) underflows to ~4.29e9 for the
+    // first 800 ms, which the clamp below turns into 1.0 -- so the
+    // wordmark appeared instantly instead of after the mantis. Same for
+    // the subtitle. Signed arithmetic before the divide.
+    float reveal_word   = ((float)((int32_t)elapsed - 800)) / 1200.0f;
     if (reveal_word < 0) reveal_word = 0;
     if (reveal_word > 1) reveal_word = 1;
-    float reveal_sub    = (elapsed - 1800) / 600.0f;
+    float reveal_sub    = ((float)((int32_t)elapsed - 1800)) / 600.0f;
     if (reveal_sub < 0) reveal_sub = 0;
     if (reveal_sub > 1) reveal_sub = 1;
     bool  fully_revealed = elapsed > 2600;
@@ -314,10 +371,14 @@ void ui_splash() {
         g.print(FW_VERSION);
 
         g.setFont(&fonts::Font2);
-        // Prompt pulses via lime<->violet
+        // No button does anything on this screen -- it is not skippable
+        // -- so the prompt must not name one.  It previously read
+        // "> hold RIGHT to arm", which was wrong on both counts: RIGHT
+        // did not arm, it skipped, and the screen advanced on its own
+        // anyway.  Show what is actually happening instead.
         uint32_t p = (millis() / 400) % 2;
         g.setTextColor(p ? COL_MS_LIME : COL_MS_VIOLET_BRIGHT, COL_MS_BG);
-        const char *prompt = "> hold RIGHT to arm";
+        const char *prompt = "> starting up";
         int pw = g.textWidth(prompt);
         g.setCursor((SCREEN_W - pw) / 2, 268);
         g.print(prompt);
@@ -345,6 +406,49 @@ void ui_discovery(int found, uint32_t elapsed_ms, uint32_t deadline_ms) {
     g.setCursor(6, CONTENT_Y + 26);
     g.setTextColor(COL_MUTED, COL_BG);
     g.print("for CSI-Beacon TX...");
+
+    // v0.9: PSRAM probe result.  Serial is compiled out on this build, so
+    // the only place this can surface is the screen.  Discovery is the
+    // right place: it is on screen for seconds at every boot, before the
+    // user is asked to do anything.  Nothing depends on PSRAM -- this
+    // reports whether the safe experiment worked, and why if it didn't.
+    {
+        // Firmware version, first thing on this screen.  Without it there
+        // is no way to tell which build is actually flashed -- and a
+        // failed CI job silently leaves the previous build on the
+        // flasher, which looks exactly like "the new code does nothing".
+        g.setFont(&fonts::Font0);
+        g.setTextColor(COL_ACCENT, COL_BG);
+        g.setCursor(6, CONTENT_Y + 32);
+        g.print("fw " FW_VERSION);
+
+        const PsramProbe &pp = psram_probe();
+        char ln[40];
+        uint16_t c;
+        if (pp.status == PSRAM_OK) {
+            snprintf(ln, sizeof(ln), "PSRAM ok  %u MB",
+                     (unsigned)(pp.size_bytes / (1024u * 1024u)));
+            c = COL_FG;
+        } else if (pp.status == PSRAM_NOT_COMPILED) {
+            snprintf(ln, sizeof(ln), "PSRAM off (not built in)");
+            c = COL_MUTED;
+        } else {
+            snprintf(ln, sizeof(ln), "PSRAM FAIL (chip silent)");
+            c = COL_WARN;
+        }
+        g.setFont(&fonts::Font0);
+        g.setTextColor(c, COL_BG);
+        g.setCursor(6, CONTENT_Y + 42);
+        g.print(ln);
+        // The reason matters more than the fact -- the two failure modes
+        // need completely different fixes.
+        if (pp.status != PSRAM_OK) {
+            g.setTextColor(COL_MUTED, COL_BG);
+            g.setCursor(6, CONTENT_Y + 52);
+            g.print(pp.hint);
+        }
+        g.setFont(&fonts::Font2);
+    }
 
     g.setFont(&fonts::Font7);
     g.setTextColor(found > 0 ? COL_FG : COL_WARN, COL_BG);
@@ -380,6 +484,26 @@ void ui_discovery(int found, uint32_t elapsed_ms, uint32_t deadline_ms) {
     if (p > 1.0f) p = 1.0f;
     progress_bar(8, CONTENT_H + HEADER_H - 20, SCREEN_W - 16, 8, p, COL_ACCENT);
 
+    // v0.9: say what mode this count will produce, and flag a short set.
+    // A silent downgrade to tripwire because two beacons were asleep is
+    // the failure this is meant to make impossible to miss.
+    {
+        g.setFont(&fonts::Font2);
+        char m[36];
+        if (found >= 3)      snprintf(m, sizeof(m), "-> %d beacons, full", found);
+        else if (found == 2) snprintf(m, sizeof(m), "-> 2: LINE mode only");
+        else if (found == 1) snprintf(m, sizeof(m), "-> 1: TRIPWIRE only");
+        else                 snprintf(m, sizeof(m), "-> none yet");
+        g.setTextColor(found >= 3 ? COL_FG : COL_WARN, COL_BG);
+        g.setCursor(6, SCREEN_H - FOOTER_H - 34);
+        g.print(m);
+        if (found > 0 && found < 3) {
+            g.setTextColor(COL_MUTED, COL_BG);
+            g.setCursor(6, SCREEN_H - FOOTER_H - 18);
+            g.print("press to accept");
+        }
+    }
+
     draw_footer(found > 0 ? "recount" : "wait",
                 found > 0 ? "accept"  : "-");
     flush();
@@ -400,6 +524,12 @@ void ui_geometry_guide() {
 
     switch (g_app.mode) {
         case RM_TRIANGLE_3: {
+            // v0.8: RM_TRIANGLE_3 now covers 3..6 beacons.  The 3-beacon
+            // branch below is the v0.7 drawing VERBATIM so an existing
+            // install's setup screen is pixel-identical; the N-gon branch
+            // is only reached at 4+ beacons, which v0.7 could not do.
+            const int n_disc = g_app.beacon_count;
+            if (n_disc <= 3) {
             g.print("3 beacons detected.");
             g.setCursor(6, CONTENT_Y + 26);
             g.setTextColor(COL_MUTED, COL_BG);
@@ -432,6 +562,55 @@ void ui_geometry_guide() {
             g.fillCircle(x2, y2, 6, COL_FG); g.setCursor(x2 + 8, y2);       g.print(lb2);
             g.fillRect(cx - 6, cy - 4, 12, 20, COL_ACCENT);
             g.setTextColor(COL_ACCENT); g.setCursor(cx + 10, cy);            g.print("YOU");
+            break;
+            }
+
+            // ── 4..6 beacons: regular N-gon ──
+            const int n = (n_disc > MAX_BEACONS) ? MAX_BEACONS : n_disc;
+            char l0[28];
+            snprintf(l0, sizeof(l0), "%d beacons detected.", n);
+            g.print(l0);
+            g.setCursor(6, CONTENT_Y + 26);
+            g.setTextColor(COL_MUTED, COL_BG);
+            char l1[32];
+            snprintf(l1, sizeof(l1), "Space evenly in a ring,");
+            g.print(l1);
+            g.setCursor(6, CONTENT_Y + 42);
+            snprintf(l1, sizeof(l1), "%d roughly equal gaps.", n);
+            g.print(l1);
+            g.setCursor(6, CONTENT_Y + 58);
+            g.print("T-Display goes in the");
+            g.setCursor(6, CONTENT_Y + 74);
+            g.print("centre, facing up.");
+
+            // Vertices from the same formula csi_assign_default_geometry
+            // uses, so the picture always matches the geometry actually
+            // assigned: first vertex at the top, then counter-clockwise.
+            int vx[MAX_BEACONS], vy[MAX_BEACONS];
+            for (int i = 0; i < n; i++) {
+                float th = (float)M_PI / 2.0f
+                         + (2.0f * (float)M_PI * (float)i) / (float)n;
+                vx[i] = cx + (int)(R * cosf(th));
+                vy[i] = cy - (int)(R * sinf(th));
+            }
+            for (int i = 0; i < n; i++) {
+                int j = (i + 1) % n;
+                g.drawLine(vx[i], vy[i], vx[j], vy[j], COL_DIM);
+            }
+            for (int i = 0; i < n; i++) {
+                char lb[6];
+                snprintf(lb, sizeof(lb), "B%u",
+                         (unsigned)(g_app.beacon[i].active ? g_app.beacon[i].id : 0));
+                g.fillCircle(vx[i], vy[i], 6, COL_FG);
+                g.setTextColor(COL_FG);
+                // Nudge each label outward from the centre so it never
+                // lands on its own dot or a polygon edge.
+                g.setCursor(vx[i] + (vx[i] - cx) / 5 - 6,
+                            vy[i] + (vy[i] - cy) / 5 - 6);
+                g.print(lb);
+            }
+            g.fillRect(cx - 6, cy - 4, 12, 20, COL_ACCENT);
+            g.setTextColor(COL_ACCENT); g.setCursor(cx + 10, cy); g.print("YOU");
             break;
         }
         case RM_LINE_2: {
@@ -978,10 +1157,9 @@ static void draw_view_radar() {
     int mid = scope_y + scope_h / 2;
     g.drawFastHLine(1, mid, SCREEN_W - 2, COL_GRID_DARK);
 
-    uint16_t bcols[3] = {COL_MS_CH_A, COL_MS_CH_B, COL_MS_CH_C};
     for (int i = 0; i < MAX_BEACONS; i++) {
         if (!g_app.beacon[i].active) continue;
-        uint16_t c = bcols[i % 3];
+        uint16_t c = beacon_color(i);
         int prev_x = 0, prev_y = 0;
         int n = RADAR_SCOPE_LEN < SCREEN_W ? RADAR_SCOPE_LEN : SCREEN_W;
         for (int k = 0; k < n; k++) {
@@ -1049,20 +1227,34 @@ static void draw_view_tripwire() {
     }
 
     // Per-beacon dots
+    // v0.9: this used slot index i with 40 px spacing, so the 5th and 6th
+    // beacons landed at x=180 and 220 on a 170 px panel -- off-screen.
+    // It also spaced by SLOT, so beacons in slots 0/2/4 drew with gaps.
+    // Pack by active order and divide the width by the count.
     int y = CONTENT_Y + 170;
     g.setFont(&fonts::Font2);
-    for (int i = 0; i < MAX_BEACONS; i++) {
-        BeaconState &b = g_app.beacon[i];
-        if (!b.active) continue;
-        uint16_t dc = COL_FG;
-        if (b.status == LS_MOTION)   dc = COL_WARN;
-        if (b.status == LS_PRESENCE) dc = COL_ALERT;
-        g.fillCircle(20 + i * 40, y, 10, dc);
-        g.drawCircle(20 + i * 40, y, 10, COL_TEXT);
-        g.setTextColor(COL_TEXT, COL_BG);
-        char lbl[8]; snprintf(lbl, sizeof(lbl), "B%u", (unsigned)g_app.beacon[i].id);
-        g.setCursor(12 + i * 40, y + 14);
-        g.print(lbl);
+    int n_act = 0;
+    for (int i = 0; i < MAX_BEACONS; i++) if (g_app.beacon[i].active) n_act++;
+    if (n_act > 0) {
+        int step = (SCREEN_W - 24) / n_act;
+        if (step > 40) step = 40;
+        int r = (step < 26) ? 7 : 10;
+        int k = 0;
+        for (int i = 0; i < MAX_BEACONS; i++) {
+            BeaconState &b = g_app.beacon[i];
+            if (!b.active) continue;
+            int x = 14 + step / 2 + k * step;
+            uint16_t dc = COL_FG;
+            if (b.status == LS_MOTION)   dc = COL_WARN;
+            if (b.status == LS_PRESENCE) dc = COL_ALERT;
+            g.fillCircle(x, y, r, dc);
+            g.drawCircle(x, y, r, COL_TEXT);
+            g.setTextColor(COL_TEXT, COL_BG);
+            char lbl[8]; snprintf(lbl, sizeof(lbl), "B%u", (unsigned)b.id);
+            g.setCursor(x - 8, y + r + 4);
+            g.print(lbl);
+            k++;
+        }
     }
 }
 
@@ -1072,6 +1264,16 @@ static void draw_view_links() {
     g.setTextColor(COL_TEXT, COL_BG);
     g.setCursor(6, CONTENT_Y + 4);
     g.print("Per-link metrics");
+
+    // v0.8: the full 66 px per-beacon block fits at most 4 beacons on a
+    // 320 px screen, and the loop below used to just `break` — so at 5 or
+    // 6 beacons the last ones silently vanished from the diagnostic view.
+    // Beacon count is now 3..6, so pick the layout that actually fits:
+    // <=4 keeps the v0.7 block verbatim (3-beacon view is unchanged),
+    // 5-6 drops the MAC line and tightens spacing.
+    int n_active = 0;
+    for (int i = 0; i < MAX_BEACONS; i++) if (g_app.beacon[i].active) n_active++;
+    const bool compact = (n_active > 4);
 
     int y = CONTENT_Y + 24;
     for (int i = 0; i < MAX_BEACONS; i++) {
@@ -1083,33 +1285,68 @@ static void draw_view_links() {
         g.setCursor(6, y);
         g.print(hdr);
 
-        // MAC
-        char mac[24];
-        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 b.mac[0], b.mac[1], b.mac[2], b.mac[3], b.mac[4], b.mac[5]);
-        g.setTextColor(COL_MUTED, COL_BG);
-        g.setFont(&fonts::Font0);
-        g.setCursor(6, y + 14);
-        g.print(mac);
-        g.setFont(&fonts::Font2);
-
-        // Turbulence / MV / metric
-        char l1[40]; snprintf(l1, sizeof(l1), "turb %.3f  MV %.4f", b.feat_turbulence, b.moving_variance);
-        g.setTextColor(COL_TEXT, COL_BG);
-        g.setCursor(6, y + 26);
-        g.print(l1);
-
         uint16_t c = COL_FG;
         if (b.status == LS_MOTION)   c = COL_WARN;
         if (b.status == LS_PRESENCE) c = COL_ALERT;
-        progress_bar(6, y + 42, SCREEN_W - 40, 10, b.link_metric_ema, c);
-        char pct[8]; snprintf(pct, sizeof(pct), "%3d%%", (int)(b.link_metric_ema * 100));
-        g.setTextColor(COL_MUTED, COL_BG);
-        g.setCursor(SCREEN_W - 30, y + 40);
-        g.print(pct);
 
-        y += 66;
-        if (y > SCREEN_H - FOOTER_H - 20) break;
+        // v0.9: commanded rate vs what the beacon reports/behaves like.
+        // The old UI only had the inter-arrival EMA, which reads the same
+        // whether a command landed or was never sent -- so a beacon
+        // ignoring us was indistinguishable from one obeying us.
+        char rate[24];
+        {
+            int obs_hz = (b.inter_arrival_ms_ema > 0.5f)
+                       ? (int)(1000.0f / b.inter_arrival_ms_ema + 0.5f) : 0;
+            if (b.cmd_rate_hz == 0)
+                snprintf(rate, sizeof(rate), "%dHz uncmd", obs_hz);
+            else if (b.reported_rate_hz == 0)
+                snprintf(rate, sizeof(rate), "%d/%dHz no-ack",
+                         obs_hz, (int)b.cmd_rate_hz);
+            else
+                snprintf(rate, sizeof(rate), "%d/%dHz%s", obs_hz,
+                         (int)b.reported_rate_hz, b.fw_marker ? " x" : "");
+        }
+
+        if (compact) {
+            // One line of numbers + the bar, 40 px total.
+            char l1[40];
+            snprintf(l1, sizeof(l1), "%s t%.3f", rate, b.feat_turbulence);
+            g.setTextColor(COL_TEXT, COL_BG);
+            g.setCursor(30, y);
+            g.print(l1);
+            progress_bar(6, y + 16, SCREEN_W - 40, 10, b.link_metric_ema, c);
+            char pct[8]; snprintf(pct, sizeof(pct), "%3d%%",
+                                  (int)(b.link_metric_ema * 100));
+            g.setTextColor(COL_MUTED, COL_BG);
+            g.setCursor(SCREEN_W - 30, y + 14);
+            g.print(pct);
+            y += 40;
+        } else {
+            // MAC
+            char mac[24];
+            snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     b.mac[0], b.mac[1], b.mac[2], b.mac[3], b.mac[4], b.mac[5]);
+            g.setTextColor(COL_MUTED, COL_BG);
+            g.setFont(&fonts::Font0);
+            g.setCursor(6, y + 14);
+            g.print(mac);
+            g.setFont(&fonts::Font2);
+
+            // Turbulence / MV / metric
+            char l1[40]; snprintf(l1, sizeof(l1), "turb %.3f  %s", b.feat_turbulence, rate);
+            g.setTextColor(COL_TEXT, COL_BG);
+            g.setCursor(6, y + 26);
+            g.print(l1);
+
+            progress_bar(6, y + 42, SCREEN_W - 40, 10, b.link_metric_ema, c);
+            char pct[8]; snprintf(pct, sizeof(pct), "%3d%%", (int)(b.link_metric_ema * 100));
+            g.setTextColor(COL_MUTED, COL_BG);
+            g.setCursor(SCREEN_W - 30, y + 40);
+            g.print(pct);
+
+            y += 66;
+        }
+        if (y > SCREEN_H - FOOTER_H - 12) break;
     }
 }
 
@@ -1237,30 +1474,64 @@ void ui_dashboard() {
 }
 
 // ── Settings ──────────────────────────────────────────────────
+// v0.8: the settings menu grew a conditional row.  The "Undock probe"
+// row only exists on the PROBE unit, and only once a walk cal has
+// actually produced a kernel to localize against — undocking before
+// then would put the probe into a state where it can never get a fix.
+// The anchor never shows the row at all.
+bool ui_settings_undock_row_visible() {
+    if (g_app.peer.cal_role != CAL_ROLE_PROBE) return false;
+    if (!g_app.peer.peer_present) return false;
+    if (g_app.mode != RM_TRIANGLE_3) return false;   // needs 3+ beacons
+    return scene_probe_kernel_ready();
+}
+
+int ui_settings_row_count() {
+    // Debug row is always present; the undock row only on a probe with a
+    // usable kernel, and it sits last so its presence never shifts the
+    // index of anything above it.
+    return ui_settings_undock_row_visible() ? UI_SETTINGS_MAX_ROWS
+                                            : UI_SETTINGS_MAX_ROWS - 1;
+}
+
 void ui_settings(int selected_row) {
     clear();
     draw_header("SETTINGS");
     auto &g = gfx();
     g.setFont(&fonts::Font2);
 
-    const int rows = 6;
-    const char *labels[rows] = {
+    const int rows = ui_settings_row_count();
+    const char *labels[UI_SETTINGS_MAX_ROWS] = {
         "Sensitivity",
         "Redo full cal",           // wipes kernel + baseline, walk again
         "Redo baseline only",      // keep kernel, only re-do empty room
         "Change mode",
         "Cal role",                // AUTO / force PROBE / force ANCHOR
         "Exit",
+        nullptr,                   // v0.8 undock row, label set below
     };
-    char values[rows][24] = {};
+    char values[UI_SETTINGS_MAX_ROWS][24] = {};
     snprintf(values[0], 24, "%.1fx", g_app.sensitivity);
     strcpy(values[1], "");
     strcpy(values[2], "");
-    const char *mode_names[] = {"none", "1-tripwire", "2-line", "3-triangle"};
-    snprintf(values[3], 24, "%s", mode_names[g_app.mode]);
+    // v0.8: RM_TRIANGLE_3 covers 3..6 beacons, so the label reports the
+    // live count rather than the historical "3-triangle".  The enum name
+    // is deliberately unchanged; only what the user reads changes.
+    const char *mode_names[] = {"none", "1-tripwire", "2-line", "multi"};
+    if (g_app.mode == RM_TRIANGLE_3)
+        snprintf(values[3], 24, "%d beacons", g_app.beacon_count);
+    else
+        snprintf(values[3], 24, "%s", mode_names[g_app.mode]);
     const char *ro_names[] = {"AUTO", "PROBE", "ANCHOR"};
     snprintf(values[4], 24, "%s", ro_names[g_app.peer.role_override]);
     strcpy(values[5], "");
+    labels[UI_SETTINGS_ROW_DEBUG] = "Debug log";
+    snprintf(values[UI_SETTINGS_ROW_DEBUG], 24, "%d", ms_log_count());
+    if (rows > UI_SETTINGS_ROW_UNDOCK) {
+        labels[UI_SETTINGS_ROW_UNDOCK] =
+            g_app.probe_undocked ? "Return to stereo" : "Undock probe";
+        strcpy(values[UI_SETTINGS_ROW_UNDOCK], "");
+    }
 
     int y = CONTENT_Y + 10;
     for (int i = 0; i < rows; i++) {
@@ -1269,7 +1540,7 @@ void ui_settings(int selected_row) {
         if (sel) g.fillRect(0, y - 2, SCREEN_W, 18, COL_MS_CHROME);
         g.setTextColor(c, sel ? COL_MS_CHROME : COL_BG);
         g.setCursor(8, y);
-        g.print(labels[i]);
+        g.print(labels[i] ? labels[i] : "");
         if (values[i][0]) {
             int tw = g.textWidth(values[i]);
             g.setCursor(SCREEN_W - tw - 8, y);
@@ -1565,8 +1836,16 @@ void ui_rx_assembly() {
     // Distance line
     g.drawLine(lx + box_w, cy + box_h/2, rx, cy + box_h/2, COL_DIM);
     g.setTextColor(COL_TEXT, COL_BG);
-    g.setCursor(cx - 10, cy + box_h/2 - 12);
-    g.print("6cm");
+    // v0.9: was the literal "6cm". If STEREO_BASELINE_CM is ever changed
+    // (it MUST match the physical spacing or every bearing is scaled
+    // wrong) this label has to follow it, or the setup screen instructs
+    // the user to build something the solver is not expecting.
+    {
+        char bl[12];
+        snprintf(bl, sizeof(bl), "%.1fcm", (double)STEREO_BASELINE_CM);
+        g.setCursor(cx - 12, cy + box_h/2 - 12);
+        g.print(bl);
+    }
 
     g.setTextColor(COL_MUTED, COL_BG);
     g.setCursor(6, CONTENT_Y + 210);
@@ -1614,6 +1893,9 @@ void ui_secondary_active() {
     g.setCursor(6, CONTENT_Y + 90);
     g.print("beacons:");
 
+    // v0.9: 14 px per row from CONTENT_Y+110 reaches y=216 at six
+    // beacons, and the cal line below was pinned at CONTENT_Y+190 (=212)
+    // -- they overlapped. Track the running y instead of assuming.
     int y = CONTENT_Y + 110;
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
@@ -1628,8 +1910,10 @@ void ui_secondary_active() {
         y += 14;
     }
 
-    // Cal status
-    y = CONTENT_Y + 190;
+    // Cal status — below whatever the table actually used.
+    y += 8;
+    if (y < CONTENT_Y + 190) y = CONTENT_Y + 190;
+    if (y > SCREEN_H - FOOTER_H - 16) y = SCREEN_H - FOOTER_H - 16;
     g.setTextColor(COL_MUTED, COL_BG);
     int cal_ok = 0, cal_total = 0;
     for (int i = 0; i < MAX_BEACONS; i++) {
@@ -1699,14 +1983,13 @@ static void draw_view_aoa() {
     }
 
     // Per-beacon needles
-    uint16_t bcols[3] = {COL_MS_CH_A, COL_MS_CH_B, COL_MS_CH_C};
     int label_y = cy + R + 12;
     int col = 0;
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active) continue;
         if (b.aoa_conf < 0.02f) continue;
-        uint16_t c = bcols[col % 3];
+        uint16_t c = beacon_color(col);
         // Draw needle
         float a = b.aoa_rad;
         // Clamp to ±90° for compass display
@@ -1728,7 +2011,7 @@ static void draw_view_aoa() {
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active) continue;
-        uint16_t c = bcols[col % 3];
+        uint16_t c = beacon_color(col);
         char line[32];
         float deg = b.aoa_rad * 180.0f / (float)M_PI;
         snprintf(line, sizeof(line), "B%u %+4.0fdeg", (unsigned)b.id, (double)deg);
@@ -1865,9 +2148,58 @@ static void draw_multiline(int x, int y, int line_h, uint16_t col,
     if (bi > 0) { buf[bi] = 0; g.setCursor(x, cy); g.print(buf); }
 }
 
+// Per-beacon identity colour.  ONE definition, because there were three
+// copies of this table and two of them only had three entries with a
+// `% 3` -- so B1/B4, B2/B5 and B3/B6 rendered identically and the
+// colour told the user nothing at 4+ beacons.
+// Human name for a landmark.  The results screen printed raw enum
+// indices ("worst lm: 14") which mean nothing to anyone standing in the
+// room -- the whole point of that line is to say WHERE the model is
+// weakest so it can be re-walked.
+static const char *landmark_name(uint8_t lm) {
+    switch (lm) {
+        case LM_RX:          return "RX bar";
+        case LM_BEACON_1:    return "B1";
+        case LM_BEACON_2:    return "B2";
+        case LM_BEACON_3:    return "B3";
+        case LM_BEACON_4:    return "B4";
+        case LM_BEACON_5:    return "B5";
+        case LM_BEACON_6:    return "B6";
+        case LM_CENTROID:    return "centre";
+        case LM_MID_12:      return "B1-B2 mid";
+        case LM_MID_23:      return "B2-B3 mid";
+        case LM_MID_13:      return "B1-B3 mid";
+        case LM_MID_34:      return "B3-B4 mid";
+        case LM_MID_45:      return "B4-B5 mid";
+        case LM_MID_56:      return "B5-B6 mid";
+        case LM_MID_41:      return "B4-B1 mid";
+        case LM_MID_51:      return "B5-B1 mid";
+        case LM_MID_61:      return "B6-B1 mid";
+        case LM_OPPOSITE_RX: return "outside";
+        default:             return "?";
+    }
+}
+
+static uint16_t beacon_color(int idx) {
+    static const uint16_t C[6] = {
+        COL_MS_CH_A, COL_MS_CH_B, COL_MS_CH_C,
+        COL_MS_CH_D, COL_MS_CH_E, COL_MS_CH_F
+    };
+    if (idx < 0) idx = 0;
+    return C[idx % 6];
+}
+
 // Draw a small map (radar mini-view) into a rect showing beacon
 // triangle + RX + a highlighted landmark position.  Used inside
 // ui_cal_landmark_walk to help the user visualize where to walk.
+// Top-down room map for the cal walk.
+//
+// v0.9: beacons were unlabelled 2 px dots, so a step saying "walk to B3"
+// gave the user no way to tell WHICH physical box that was -- the walk
+// could not be executed correctly, which makes the whole cal suspect.
+// Each beacon is now drawn with its number and in ITS OWN colour, the
+// same COL_MS_CH_* used by the links view and AoA compass, so the
+// identity is consistent everywhere the beacon appears.
 static void draw_mini_landmark_map(int box_x, int box_y, int box_w, int box_h,
                                    LandmarkId highlight,
                                    LandmarkId next) {
@@ -1875,41 +2207,82 @@ static void draw_mini_landmark_map(int box_x, int box_y, int box_w, int box_h,
     g.drawRect(box_x, box_y, box_w, box_h, COL_MS_DIM);
     int cx = box_x + box_w / 2;
     int cy = box_y + box_h / 2;
-    int R  = (box_w < box_h ? box_w : box_h) / 2 - 6;
+    int R  = (box_w < box_h ? box_w : box_h) / 2 - 12;   // room for labels
     float pix_per_unit = (float)R / SCENE_EXTENT;
-    // Rings
-    for (float r = 0.5f; r <= SCENE_EXTENT; r += 0.5f) {
+
+    for (float r = 0.5f; r <= SCENE_EXTENT; r += 0.5f)
         g.drawCircle(cx, cy, (int)(r * pix_per_unit), COL_MS_DIM);
+
+    const int n_b = g_app.beacon_count < 1 ? 0
+                  : (g_app.beacon_count > MAX_BEACONS ? MAX_BEACONS
+                                                      : g_app.beacon_count);
+
+    // Where the user is being sent, resolved first so a beacon that IS
+    // the target can be drawn emphasised rather than drawn twice.
+    float hx = 0, hy = 0; bool have_h = false;
+    if (highlight < LM_COUNT) { scene_landmark_pos(highlight, &hx, &hy); have_h = true; }
+
+    // Route line to the next stop, under everything else.
+    if (next < LM_COUNT && highlight != next && have_h) {
+        float nx, ny; scene_landmark_pos(next, &nx, &ny);
+        g.drawLine(cx + (int)(hx * pix_per_unit), cy - (int)(hy * pix_per_unit),
+                   cx + (int)(nx * pix_per_unit), cy - (int)(ny * pix_per_unit),
+                   COL_MS_DIM);
     }
-    // Beacons
-    struct { LandmarkId id; } bs[3] = {{LM_BEACON_1}, {LM_BEACON_2}, {LM_BEACON_3}};
-    for (int i = 0; i < 3; i++) {
-        float bx, by; scene_landmark_pos(bs[i].id, &bx, &by);
+
+    // Beacons, numbered and colour-coded.
+    g.setFont(&fonts::Font0);
+    for (int i = 0; i < n_b; i++) {
+        float bx, by;
+        scene_landmark_pos((LandmarkId)(LM_BEACON_1 + i), &bx, &by);
         int px = cx + (int)(bx * pix_per_unit);
         int py = cy - (int)(by * pix_per_unit);
-        g.fillCircle(px, py, 2, COL_MS_LIME);
+
+        const bool is_target = have_h && (highlight == (LandmarkId)(LM_BEACON_1 + i));
+        uint16_t c = beacon_color(i);         // same hue as links / compass
+
+        if (is_target) {
+            // Pulse so the eye lands on it immediately.
+            if ((millis() / 350) % 2) {
+                g.fillCircle(px, py, 7, COL_MS_WARN);
+                g.drawCircle(px, py, 9, COL_MS_WARN);
+            } else {
+                g.fillCircle(px, py, 6, COL_MS_WARN);
+            }
+        } else {
+            g.fillCircle(px, py, 4, c);
+            g.drawCircle(px, py, 4, COL_MS_INK);
+        }
+
+        char lbl[4]; snprintf(lbl, sizeof(lbl), "B%d", i + 1);
+        // Push the label radially outward so it never sits on the dot.
+        int lx = px + (bx >= 0 ? 7 : -14);
+        int ly = py + (by >= 0 ? -12 : 5);
+        g.setTextColor(is_target ? COL_MS_WARN : c, COL_BG);
+        g.setCursor(lx, ly);
+        g.print(lbl);
     }
-    // RX
-    g.fillRect(cx - 2, cy - 2, 4, 4, COL_MS_TEAL);
-    // Highlighted (current) landmark - bright ring
-    if (highlight < LM_COUNT) {
-        float hx, hy; scene_landmark_pos(highlight, &hx, &hy);
+
+    // The receiver bar.
+    g.fillRect(cx - 4, cy - 2, 8, 4, COL_MS_TEAL);
+    g.setTextColor(COL_MS_TEAL, COL_BG);
+    g.setCursor(cx + 6, cy + 2);
+    g.print("RX");
+
+    // A non-beacon target (centroid, midpoint, exterior anchor) still
+    // needs marking -- those are the stops with no physical object to
+    // walk to, so they matter MORE, not less.
+    if (have_h && !(highlight >= LM_BEACON_1 && highlight < LM_BEACON_1 + n_b)) {
         int px = cx + (int)(hx * pix_per_unit);
         int py = cy - (int)(hy * pix_per_unit);
-        g.drawCircle(px, py, 4, COL_MS_WARN);
-        g.drawCircle(px, py, 5, COL_MS_WARN);
-    }
-    // Next landmark - arrow from highlight to next
-    if (next < LM_COUNT && highlight != next) {
-        float hx, hy; scene_landmark_pos(highlight, &hx, &hy);
-        float nx, ny; scene_landmark_pos(next, &nx, &ny);
-        int px1 = cx + (int)(hx * pix_per_unit);
-        int py1 = cy - (int)(hy * pix_per_unit);
-        int px2 = cx + (int)(nx * pix_per_unit);
-        int py2 = cy - (int)(ny * pix_per_unit);
-        g.drawLine(px1, py1, px2, py2, COL_MS_INK);
-        // Small arrowhead at target end
-        g.fillCircle(px2, py2, 2, COL_MS_INK);
+        uint16_t c = ((millis() / 350) % 2) ? COL_MS_WARN : COL_MS_ALERT;
+        g.drawCircle(px, py, 6, c);
+        g.drawCircle(px, py, 8, c);
+        g.drawLine(px - 4, py, px + 4, py, c);
+        g.drawLine(px, py - 4, px, py + 4, c);
+        g.setTextColor(c, COL_BG);
+        g.setCursor(px + 9, py - 4);
+        g.print("GO");
     }
 }
 
@@ -1930,30 +2303,61 @@ void ui_cal_intro() {
     g.print(t);
 
     g.setFont(&fonts::Font2);
-    const char *body_stereo =
-        "You will walk\n"
-        "a scripted path\n"
-        "through the room\n"
-        "to teach the model\n"
-        "the room's radio\n"
-        "response.\n"
-        "\n"
-        "Carry PROBE.\n"
-        "ANCHOR stays put.\n"
-        "~100 seconds.";
-    const char *body_solo =
-        "Hold the T-Display\n"
-        "against your chest\n"
-        "for the walk.\n"
-        "\n"
-        "Solo cal is a\n"
-        "degraded fallback.\n"
-        "Two receivers give\n"
-        "much better results.\n"
-        "\n"
-        "~90 seconds.";
-    draw_multiline(6, CONTENT_Y + 44, 14, COL_MS_INK,
-                   (g_app.cal_mode == CAL_MODE_STEREO) ? body_stereo : body_solo);
+    // v0.9: the duration is a function of beacon count now -- the script
+    // is 4N+12 steps with 2N+4 stands and 3 rotations, so quoting a flat
+    // "~100 seconds" understates a 6-beacon walk by about a minute.
+    int n_cal = g_app.beacon_count;
+    if (n_cal < 3) n_cal = 3;
+    if (n_cal > MAX_BEACONS) n_cal = MAX_BEACONS;
+    int est_s = (2 * n_cal + 4) * 4     // stands, ~4 s each
+              + 3 * 10                  // three 360 rotations
+              + n_cal * 8;              // walking between stops
+    char tail[24];
+    snprintf(tail, sizeof(tail), "~%d seconds.", est_s);
+
+    char body[256];
+    if (g_app.cal_mode == CAL_MODE_STEREO) {
+        snprintf(body, sizeof(body),
+            "You will walk\n"
+            "a scripted path\n"
+            "through the room\n"
+            "to teach the model\n"
+            "the room's radio\n"
+            "response.\n"
+            "\n"
+            "Carry PROBE.\n"
+            "ANCHOR stays put.\n"
+            "%s", tail);
+    } else {
+        snprintf(body, sizeof(body),
+            "Hold the T-Display\n"
+            "against your chest\n"
+            "for the walk.\n"
+            "\n"
+            "Solo cal is a\n"
+            "degraded fallback.\n"
+            "Two receivers give\n"
+            "much better results.\n"
+            "\n"
+            "%s", tail);
+    }
+    draw_multiline(6, CONTENT_Y + 44, 14, COL_MS_INK, body);
+
+    // v0.9: state the RADAR mode here.  It decides whether a walk cal
+    // happens at all -- tripwire skips it entirely -- and it was
+    // previously invisible, so a mode that did not match the beacons on
+    // the floor only revealed itself by the cal behaving unexpectedly.
+    {
+        static const char *RADAR_NAMES[] = {"none","tripwire","line-2","multi"};
+        char m[40];
+        snprintf(m, sizeof(m), "mode: %s  (%d beacons)",
+                 RADAR_NAMES[(int)g_app.mode <= 3 ? (int)g_app.mode : 0],
+                 (int)g_app.beacon_count);
+        g.setFont(&fonts::Font2);
+        g.setTextColor(g_app.mode == RM_TRIPWIRE_1 ? COL_WARN : COL_MUTED, COL_BG);
+        g.setCursor(6, SCREEN_H - FOOTER_H - 20);
+        g.print(m);
+    }
 
     draw_footer("cancel", "begin");
     flush();
@@ -1979,14 +2383,15 @@ void ui_cal_anchor_place() {
 
         g.setFont(&fonts::Font2);
         draw_multiline(6, CONTENT_Y + 36, 14, COL_MS_INK,
-            "1. Take ANCHOR\n"
-            "   (the other unit)\n"
-            "2. Place it at the\n"
-            "   center of the\n"
-            "   beacon triangle\n"
-            "3. Leave it there\n"
-            "4. Come back here\n"
-            "   with THIS unit");
+            "The OTHER unit\n"
+            "is the anchor.\n"
+            "\n"
+            "Set it down in\n"
+            "the middle of\n"
+            "the beacon ring\n"
+            "and leave it.\n"
+            "\n"
+            "Keep this one.");
         // Illustration: small triangle with a dot at center
         int cx = SCREEN_W / 2, cy = CONTENT_Y + 190, R = 30;
         for (int i = 0; i < 3; i++) {
@@ -2012,7 +2417,7 @@ void ui_cal_anchor_place() {
             "Place me at\n"
             "the center of\n"
             "the beacon\n"
-            "triangle.\n"
+            "ring.\n"
             "\n"
             "Then don't move\n"
             "me until cal\n"
@@ -2032,14 +2437,38 @@ void ui_cal_empty_room(uint32_t elapsed_ms) {
     auto &g = gfx();
     g.setFont(&fonts::Font2);
     g.setTextColor(COL_MS_INK, COL_BG);
-    draw_multiline(6, CONTENT_Y + 8, 14, COL_MS_INK,
-        "Leave the room\n"
-        "with the PROBE.\n"
-        "\n"
-        "ANCHOR is\n"
-        "learning what\n"
-        "the room looks\n"
-        "like empty.");
+    // The duration depends on the beacon transmit rate, so it is
+    // reported rather than hardcoded -- at 20 Hz this is 25 s, not the
+    // 5 s a 100 Hz beacon would give.
+    // Wording follows the CAL MODE.  This screen named "the PROBE" and
+    // "ANCHOR" unconditionally, but in solo and tripwire there is only
+    // one device in the user's hand and neither word means anything --
+    // it read as an instruction to fetch equipment that does not exist.
+    char body[224];
+    if (g_app.cal_mode == CAL_MODE_STEREO) {
+        snprintf(body, sizeof(body),
+            "Measuring the\n"
+            "empty room.\n"
+            "\n"
+            "Stay outside\n"
+            "until this\n"
+            "finishes.\n"
+            "\n"
+            "~%d seconds, then\n"
+            "come back in.", csi_baseline_expected_seconds());
+    } else {
+        snprintf(body, sizeof(body),
+            "Put this unit\n"
+            "down and leave\n"
+            "the room.\n"
+            "\n"
+            "It is measuring\n"
+            "the room with\n"
+            "nobody in it.\n"
+            "\n"
+            "~%d seconds.", csi_baseline_expected_seconds());
+    }
+    draw_multiline(6, CONTENT_Y + 8, 14, COL_MS_INK, body);
 
     // Big countdown / progress
     float p = csi_baseline_progress();
@@ -2126,7 +2555,9 @@ void ui_cal_landmark_walk() {
     }
     int map_y = CONTENT_Y + 154;
     int map_h = 96;
-    draw_mini_landmark_map(4, map_y, SCREEN_W - 8, map_h, highlight, next);
+    // v0.9: labels need vertical room; the map was sized for bare dots.
+    draw_mini_landmark_map(4, map_y, SCREEN_W - 8,
+                           map_h < 110 ? 110 : map_h, highlight, next);
 
     // Timer / status line right above footer — driven by wizard phase.
     WizardPhase phase = wizard_current_phase();
@@ -2246,7 +2677,14 @@ void ui_cal_results() {
     bool xval_ok  = r.cross_val_error < 0.35f;
     bool loop_ok  = r.loop_closure_error < 0.30f;
     bool obs_ok   = r.mean_observability > 0.05f;
-    bool alias_ok = r.alias_pair_count == 0;
+    // v0.85: grade on the RATE of confusable far-pairs, not the raw
+    // count.  The number of pairs tested grows quadratically with
+    // landmark count (39 at 3 beacons, 98 at 6), so demanding "zero"
+    // gets strictly harder as the array gets better — backwards.  The
+    // rate is dimensionless and comparable across beacon counts.
+    bool alias_ok = (r.far_pairs_tested == 0) ||
+                    ((uint32_t)r.alias_pairs_found * 100u
+                       < (uint32_t)r.far_pairs_tested * 2u);
     bool good = r.valid && xval_ok && loop_ok && obs_ok && alias_ok;
     bool marginal = r.valid && (xval_ok || loop_ok);
     const char *verdict = good     ? "OK"
@@ -2302,11 +2740,17 @@ void ui_cal_results() {
     g.setCursor(6, y); g.print(line); y += 14;
 
     // Alias pairs
-    uint16_t acol = r.alias_pair_count == 0 ? COL_MS_LIME
-                  : r.alias_pair_count < 3  ? COL_MS_WARN
+    uint16_t acol = r.alias_pairs_found == 0 ? COL_MS_LIME
+                  : alias_ok                  ? COL_MS_WARN
                                              : COL_MS_ALERT;
     g.setTextColor(acol, COL_MS_BG);
-    snprintf(line, sizeof(line), "alias : %u pairs", (unsigned)r.alias_pair_count);
+    // Show the margin (the permanent number: peak sidelobe of the
+    // array's ambiguity function, in sigma of the sensor's own noise)
+    // alongside the rate that produced the verdict.
+    snprintf(line, sizeof(line), "ambig : %.1f sd  %u/%u",
+             (double)r.ambiguity_margin_sigma,
+             (unsigned)r.alias_pairs_found,
+             (unsigned)r.far_pairs_tested);
     g.setCursor(6, y); g.print(line); y += 16;
 
     // Per-beacon effective weight = SNR × orientation reliability
@@ -2327,8 +2771,9 @@ void ui_cal_results() {
     // Worst landmark (if any)
     if (r.worst_landmark_error > 0.3f) {
         g.setTextColor(COL_MS_WARN, COL_MS_BG);
-        snprintf(line, sizeof(line), "worst lm: %u (%.2f)",
-                 (unsigned)r.worst_landmark, (double)r.worst_landmark_error);
+        snprintf(line, sizeof(line), "weakest: %s (%.2f)",
+                 landmark_name(r.worst_landmark),
+                 (double)r.worst_landmark_error);
         g.setCursor(6, y); g.print(line); y += 14;
     }
 
@@ -2337,20 +2782,382 @@ void ui_cal_results() {
     // which beacon(s) might be mispositioned or misidentified.
     if (r.geometry_validation_fail_mask) {
         g.setTextColor(COL_MS_ALERT, COL_MS_BG);
-        snprintf(line, sizeof(line), "geom warn: 0x%02X",
-                 (unsigned)r.geometry_validation_fail_mask);
+        // This printed a raw hex bitmask ("geom warn: 0x05"), which told
+        // the user nothing actionable.  The mask is one bit PER BEACON,
+        // flagging beacons that did not read strongest when the probe
+        // stood at them -- i.e. probably placed or numbered wrongly.
+        // Name them, because the fix is physical.
+        char blist[24]; int bi = 0;
+        blist[0] = 0;
+        for (int b = 0; b < MAX_BEACONS; b++) {
+            if (!(r.geometry_validation_fail_mask & (1u << b))) continue;
+            bi += snprintf(blist + bi, sizeof(blist) - bi,
+                           "%sB%d", bi ? "," : "", b + 1);
+            if (bi >= (int)sizeof(blist) - 4) break;
+        }
+        snprintf(line, sizeof(line), "check placement: %s", blist);
         g.setCursor(6, y); g.print(line); y += 12;
     }
 
     // v0.5: alias-pair preview (first pair only — space-limited screen)
     if (r.alias_pair_count > 0 && y < SCREEN_H - FOOTER_H - 12) {
         g.setTextColor(COL_MS_WARN, COL_MS_BG);
-        snprintf(line, sizeof(line), "alias: lm%u↔lm%u",
-                 (unsigned)r.alias_pairs[0].lm_a,
-                 (unsigned)r.alias_pairs[0].lm_b);
+        snprintf(line, sizeof(line), "closest: %s/%s %.1fsd",
+                 landmark_name(r.alias_pairs[0].lm_a),
+                 landmark_name(r.alias_pairs[0].lm_b),
+                 (double)r.alias_pairs[0].sigma_distance);
         g.setCursor(6, y); g.print(line); y += 12;
     }
 
     draw_footer("redo", good ? "accept" : "accept?");
+    flush();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  v0.8 — MOBILE PROBE VIEW (ST_MOBILE_PROBE)
+// ═══════════════════════════════════════════════════════════════
+//  Shown only on the undocked probe.  Two things on one screen:
+//    1. Where the anchor thinks everybody is (streamed track list).
+//    2. Where THIS unit thinks it is (its own self-localization).
+//  Self-tagged tracks are dimmed and labelled "YOU", matching exactly
+//  what the anchor's radar view draws, so the two screens agree.
+void ui_mobile_probe_view(const PeerTrackStatePacket *track_state,
+                          uint32_t track_state_age_ms,
+                          const float probe_pos[2],
+                          const float probe_cov[3],
+                          float probe_conf,
+                          bool acquiring) {
+    clear();
+    draw_header("MOBILE PROBE");
+    auto &g = gfx();
+    g.setFont(&fonts::Font2);
+
+    const int map_y = CONTENT_Y + 18;
+    const int map_h = 210;
+    const int cx = SCREEN_W / 2;
+    const int cy = map_y + map_h / 2;
+    const int usable_h = (SCREEN_W / 2) - 6;
+    const int usable_v = (map_h / 2) - 6;
+    const int R = (usable_h < usable_v) ? usable_h : usable_v;
+    const float ppu = (float)R / SCENE_EXTENT;
+
+    // ── Status line ──
+    // The link state is the first thing that matters here: a frozen
+    // picture and a live picture look identical, so say which it is.
+    const bool link_ok = (track_state != nullptr)
+                      && (track_state_age_ms < 1500);
+    const char *status;
+    uint16_t status_col;
+    if (acquiring)      { status = "acquiring pos..."; status_col = COL_WARN; }
+    else if (!link_ok)  { status = "anchor unreachable"; status_col = COL_ALERT; }
+    else                { status = "linked";           status_col = COL_FG; }
+    g.setTextColor(status_col, COL_BG);
+    g.setCursor(4, CONTENT_Y + 2);
+    g.print(status);
+
+    char cbuf[12];
+    snprintf(cbuf, sizeof(cbuf), "%3d%%", (int)(probe_conf * 100.0f));
+    int cw = g.textWidth(cbuf);
+    g.setTextColor(probe_conf > 0.5f ? COL_FG
+                 : probe_conf > 0.3f ? COL_WARN : COL_MUTED, COL_BG);
+    g.setCursor(SCREEN_W - cw - 4, CONTENT_Y + 2);
+    g.print(cbuf);
+
+    // ── Map frame + rings ──
+    g.drawRect(0, map_y, SCREEN_W, map_h, COL_GRID_DARK);
+    g.drawCircle(cx, cy, R / 2, COL_GRID_DARK);
+    g.drawCircle(cx, cy, R,     COL_GRID_DARK);
+    g.drawFastHLine(1, cy, SCREEN_W - 2, COL_GRID_DARK);
+    g.drawFastVLine(cx, map_y + 1, map_h - 2, COL_GRID_DARK);
+
+    // ── Beacons at their calibrated positions ──
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        if (!g_app.beacon[i].active) continue;
+        float lx, ly;
+        scene_landmark_pos((LandmarkId)(LM_BEACON_1 + i), &lx, &ly);
+        int bx = cx + (int)(lx * ppu);
+        int by = cy - (int)(ly * ppu);
+        g.fillCircle(bx, by, 3, COL_ACCENT);
+    }
+
+    // ── Anchor's tracks ──
+    if (track_state) {
+        for (int i = 0; i < track_state->n_tracks && i < TRACK_MAX; i++) {
+            const auto &t = track_state->tracks[i];
+            if (!t.active) continue;
+            int tx = cx + (int)(t.pos_x * ppu);
+            int ty = cy - (int)(t.pos_y * ppu);
+            // Stale link: draw what we last knew, but greyed, so the
+            // user can tell memory from measurement at a glance.
+            uint16_t tc = !link_ok  ? COL_GRID
+                        : t.is_self ? COL_MUTED
+                                    : COL_FG;
+            g.drawCircle(tx, ty, 6, tc);
+            g.drawCircle(tx, ty, 3, tc);
+            if (t.is_self) {
+                g.setTextColor(COL_MUTED, COL_BG);
+                g.setCursor(tx + 8, ty - 6);
+                g.print("YOU");
+            }
+        }
+    }
+
+    // ── This unit's own position estimate ──
+    // Drawn as a cross plus a 1-sigma ellipse.  While acquiring we draw
+    // the marker hollow so a not-yet-trusted fix never looks like a
+    // settled one.
+    int px = cx + (int)(probe_pos[0] * ppu);
+    int py = cy - (int)(probe_pos[1] * ppu);
+    uint16_t self_col = acquiring ? COL_WARN : COL_ACCENT;
+    g.drawLine(px - 6, py, px + 6, py, self_col);
+    g.drawLine(px, py - 6, px, py + 6, self_col);
+    if (!acquiring) g.fillCircle(px, py, 2, self_col);
+    // Hand-drawn as a polyline rather than drawEllipse(), to match how
+    // render.cpp draws its covariance ellipses — same visual weight,
+    // and no dependency on a primitive this build may not expose.
+    // Axis-aligned is enough here: the cross-term only skews the shape,
+    // and the user reads this as "roughly this uncertain", not as a
+    // precise orientation.
+    {
+        float ax = sqrtf(fmaxf(1e-6f, probe_cov[0])) * ppu;
+        float ay = sqrtf(fmaxf(1e-6f, probe_cov[1])) * ppu;
+        if (ax > 60) ax = 60;
+        if (ay > 60) ay = 60;
+        if (ax < 3)  ax = 3;
+        if (ay < 3)  ay = 3;
+        const int N = 20;
+        int prev_x = 0, prev_y = 0;
+        for (int i = 0; i <= N; i++) {
+            float t = (float)i / (float)N * 2.0f * (float)M_PI;
+            int ex = px + (int)(ax * cosf(t));
+            int ey = py - (int)(ay * sinf(t));
+            if (i > 0) g.drawLine(prev_x, prev_y, ex, ey, self_col);
+            prev_x = ex; prev_y = ey;
+        }
+    }
+
+    draw_footer("back", "");
+    flush();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  v0.9 — DEBUG LOG VIEW
+// ═══════════════════════════════════════════════════════════════
+// Renders the in-RAM ring.  Serial is compiled out on this build, so
+// this is the only place log lines surface.  Font0 is used to fit a
+// useful number of lines on a 170 px panel; these are diagnostics, so
+// density beats legibility.
+void ui_debug_log(int scroll) {
+    clear();
+    draw_header("DEBUG LOG");
+    auto &g = gfx();
+    g.setFont(&fonts::Font0);
+
+    const int line_h  = 9;
+    const int top     = CONTENT_Y + 4;
+    const int usable  = (SCREEN_H - FOOTER_H) - top - 4;
+    const int visible = usable / line_h;
+
+    const int total = ms_log_count();
+    if (total == 0) {
+        g.setFont(&fonts::Font2);
+        g.setTextColor(COL_MUTED, COL_BG);
+        g.setCursor(8, top + 20);
+        g.print("(no log lines)");
+        draw_footer("back", "clear");
+        flush();
+        return;
+    }
+
+    // Clamp scroll so the last page always sits flush with the bottom.
+    int max_scroll = total - visible;
+    if (max_scroll < 0)      max_scroll = 0;
+    if (scroll > max_scroll) scroll = max_scroll;
+    if (scroll < 0)          scroll = 0;
+
+    int y = top;
+    for (int i = 0; i < visible && (scroll + i) < total; i++) {
+        const char *ln = ms_log_line(scroll + i);
+        // Colour by severity so a fault is findable without reading.
+        uint16_t c = COL_TEXT;
+        if (strstr(ln, "WARNING") || strstr(ln, "no-ack") || strstr(ln, "off-rate"))
+            c = COL_WARN;
+        if (strstr(ln, "FULL") || strstr(ln, "unreachable") || strstr(ln, "NO CANVAS"))
+            c = COL_ALERT;
+        g.setTextColor(c, COL_BG);
+        g.setCursor(4, y);
+        g.print(ln);
+        y += line_h;
+    }
+
+    // Position indicator
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MUTED, COL_BG);
+    char pos[24];
+    snprintf(pos, sizeof(pos), "%d-%d/%d",
+             scroll + 1,
+             (scroll + visible) < total ? (scroll + visible) : total,
+             total);
+    int pw = g.textWidth(pos);
+    g.setCursor(SCREEN_W - pw - 4, SCREEN_H - FOOTER_H - 14);
+    g.print(pos);
+
+    draw_footer("scroll", "clear");
+    flush();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  v0.9 — LEAVE-THE-ROOM COUNTDOWN
+// ═══════════════════════════════════════════════════════════════
+// Shown before any baseline sample is taken.  Big numeral, because the
+// user is walking away from the device and needs to read it at a
+// distance and over their shoulder.
+void ui_cal_leave_countdown(uint32_t seconds_left) {
+    clear();
+    draw_header("EMPTY ROOM");
+    auto &g = gfx();
+
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MS_INK, COL_BG);
+    draw_multiline(6, CONTENT_Y + 10, 16, COL_MS_INK,
+        (g_app.cal_mode == CAL_MODE_STEREO)
+            ? "LEAVE THE ROOM\n"
+              "with the PROBE.\n"
+              "\n"
+              "Measuring starts\n"
+              "when this hits 0."
+            : "PUT THIS DOWN\n"
+              "and leave the\n"
+              "room.\n"
+              "\n"
+              "Measuring starts\n"
+              "when this hits 0.");
+
+    // Countdown numeral
+    g.setFont(&fonts::Font7);
+    g.setTextColor(seconds_left <= 2 ? COL_ALERT : COL_WARN, COL_BG);
+    char n[8]; snprintf(n, sizeof(n), "%u", (unsigned)seconds_left);
+    int nw = g.textWidth(n);
+    g.setCursor((SCREEN_W - nw) / 2, CONTENT_Y + 120);
+    g.print(n);
+
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MUTED, COL_BG);
+    g.setCursor(6, CONTENT_Y + 200);
+    g.print("Nothing is being");
+    g.setCursor(6, CONTENT_Y + 216);
+    g.print("recorded yet.");
+
+    draw_footer("back", "");
+    flush();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  v0.9 — PICK THE UNIT YOU CARRY
+// ═══════════════════════════════════════════════════════════════
+// Shown on BOTH units simultaneously.  Press the one in your hand; it
+// becomes the PROBE and the other becomes the ANCHOR.  The firmware
+// used to decide this by MAC order, which meant it told you to put down
+// whichever device you happened to be holding.
+void ui_pick_carry() {
+    clear();
+    draw_header("WHICH ONE?");
+    auto &g = gfx();
+
+    draw_multiline(6, CONTENT_Y + 12, 16, COL_MS_INK,
+        "Press the button\n"
+        "on the unit you\n"
+        "are HOLDING.\n"
+        "\n"
+        "That one comes\n"
+        "with you.\n"
+        "\n"
+        "The other stays\n"
+        "in the room.");
+
+    // Pulse so it is obvious this screen wants a press, not a wait.
+    g.setFont(&fonts::Font4);
+    uint32_t p = (millis() / 400) % 2;
+    g.setTextColor(p ? COL_MS_LIME : COL_MS_VIOLET_BRIGHT, COL_BG);
+    const char *cta = "PRESS ME";
+    int cw = g.textWidth(cta);
+    g.setCursor((SCREEN_W - cw) / 2, CONTENT_Y + 190);
+    g.print(cta);
+
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MUTED, COL_BG);
+    g.setCursor(6, CONTENT_Y + 220);
+    g.print("...on THIS unit");
+
+    draw_footer("back", "this one");
+    flush();
+}
+
+// Anchor-side view of the same moment: once the other unit has been
+// pressed, this one says what it is and asks for nothing.  You should
+// never have to touch the anchor except to change its display.
+void ui_pick_carry_anchor() {
+    clear();
+    draw_header("ANCHOR");
+    auto &g = gfx();
+    g.setFont(&fonts::Font4);
+    g.setTextColor(COL_MS_TEAL, COL_BG);
+    const char *t = "ANCHOR";
+    int tw = g.textWidth(t);
+    g.setCursor((SCREEN_W - tw) / 2, CONTENT_Y + 40);
+    g.print(t);
+
+    draw_multiline(6, CONTENT_Y + 90, 16, COL_MS_INK,
+        "This unit stays\n"
+        "in the room.\n"
+        "\n"
+        "It follows the\n"
+        "one you carry -\n"
+        "no need to press\n"
+        "anything here.");
+
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MUTED, COL_BG);
+    g.setCursor(6, CONTENT_Y + 210);
+    g.print("...but you still can.");
+
+    // Buttons work here even though nothing requires them: the anchor is
+    // a follower, not a locked-out slave.
+    draw_footer("back", "carry this");
+    flush();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  v0.9 — EMPTY ROOM: WALK OUT FIRST, THEN PRESS
+// ═══════════════════════════════════════════════════════════════
+// The old screen said "leave the room" and started measuring at once,
+// never telling the user to press anything and never saying what to do
+// when it finished.  You are holding the probe, so you can simply carry
+// it out and start the measurement from where you are standing.
+void ui_cal_empty_prompt() {
+    clear();
+    draw_header("EMPTY ROOM");
+    auto &g = gfx();
+
+    draw_multiline(6, CONTENT_Y + 10, 16, COL_MS_INK,
+        "1. Take this unit\n"
+        "   and walk out\n"
+        "   of the room.\n"
+        "\n"
+        "2. Standing\n"
+        "   outside, press\n"
+        "   START.\n"
+        "\n"
+        "3. Wait, then come\n"
+        "   back in.");
+
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MUTED, COL_BG);
+    g.setCursor(6, CONTENT_Y + 196);
+    g.print("The anchor stays put.");
+    g.setCursor(6, CONTENT_Y + 212);
+    g.print("Don't touch it.");
+
+    draw_footer("back", "START");
     flush();
 }

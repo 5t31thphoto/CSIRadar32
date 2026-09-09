@@ -37,6 +37,7 @@
 #include <esp_wifi.h>
 #include <esp_now.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>   // v0.9: microsecond clock for precise TX cadence
 
 // ── Firmware identity ─────────────────────────────────────────
 #define BEACON_FW_NAME     "CSI-Beacon-Extended"
@@ -83,6 +84,28 @@ struct BeaconPong {
 
 // ── Runtime state (only NEW stuff — original state below) ─────
 static uint32_t s_tx_period_ms   = 10;    // 100 Hz default (10 ms period)
+// v0.9 COMMANDED MODE ONLY.  Exact period in microseconds, and an
+// absolute next-transmit deadline.
+//
+// The stock path schedules with `last_tx = now` after each send, so
+// every period becomes (period + however late the poll was) and the
+// error is never corrected -- it random-walks.  Measured effect: slot
+// slip exceeds a 5.6 ms slot in under a second at six beacons, which is
+// why staggering transmits achieved nothing.
+//
+// It also truncated: 1000/30 = 33 ms, i.e. 30.30 Hz, not 30.
+//
+// Precise mode advances an ABSOLUTE deadline (next += period) at
+// microsecond resolution, so latency on one cycle does not push the
+// next one.  Enabled only once a rate command arrives, so an
+// uncommanded beacon behaves EXACTLY as stock for old receivers.
+// Number of interleave slots the transmit period is divided into.  Must
+// match the receiver's MAX_BEACONS so every possible id gets its own.
+#define BEACON_MAX_SLOTS 6
+static uint32_t s_tx_period_us   = 10000;
+static int64_t  s_next_tx_us     = 0;
+static bool     s_precise_timing = false;
+static uint8_t  s_sleep_fail_count = 0;
 static bool     s_sleep_between  = false;
 static uint32_t s_cmd_rx_count   = 0;     // diagnostic
 static uint32_t s_cmd_ignored    = 0;     // packets without our magic
@@ -170,18 +193,62 @@ static void apply_command(const BeaconCommand &c, const uint8_t src[6]) {
             if (hz > 200) hz = 200;
             s_tx_period_ms = 1000 / hz;
             if (s_tx_period_ms == 0) s_tx_period_ms = 1;
+            // Exact microsecond period: 1000000/30 = 33333 us is a true
+            // 30.000 Hz, where 1000/30 = 33 ms is 30.30 Hz.
+            s_tx_period_us   = 1000000UL / hz;
+            s_precise_timing = true;       // commanded => precise from now on
+
+            // ── SLOT ANCHORING ──────────────────────────────────────
+            // SET_RATE is a BROADCAST, so every beacon receives this same
+            // RF event within microseconds of the others.  That gives a
+            // shared epoch for free -- no sync protocol, no extra traffic.
+            //
+            // Each beacon offsets its first transmit by its own id, so
+            // the beacons interleave instead of piling up.  With the
+            // absolute-deadline scheduling above the offsets HOLD, which
+            // they could not do before: the old millis() cadence lost a
+            // 5.6 ms slot in under a second, which is why staggering had
+            // never been worth doing.
+            //
+            // Relative crystal drift (~20 ppm) moves neighbours by about
+            // 1.2 ms per minute against a 5.6 ms slot, and the receiver
+            // re-commands periodically, which re-anchors everyone.
+            {
+                uint32_t slot = s_tx_period_us / BEACON_MAX_SLOTS;
+                uint32_t mine = (beacon_id >= 1 && beacon_id <= BEACON_MAX_SLOTS)
+                              ? (uint32_t)(beacon_id - 1) : 0;
+                s_next_tx_us = esp_timer_get_time() + (int64_t)mine * slot;
+                Serial.printf("[BEACON] slot %u/%u, offset %lu us\n",
+                              (unsigned)mine + 1, (unsigned)BEACON_MAX_SLOTS,
+                              (unsigned long)(mine * slot));
+            }
             Serial.printf("[BEACON] SET_RATE %u Hz (period=%lu ms)\n",
                 hz, (unsigned long)s_tx_period_ms);
         } break;
 
         case BEACON_OP_SET_SLEEP: {
-            s_sleep_between = (c.arg_u16 != 0);
-            Serial.printf("[BEACON] SET_SLEEP %s\n", s_sleep_between ? "on" : "off");
+            s_sleep_between    = (c.arg_u16 != 0);
+            s_sleep_fail_count = 0;
+            // Wi-Fi power save MUST be MIN_MODEM for light sleep to keep
+            // the radio coherent across a wake.  Arming sleep while PS
+            // was NONE is what made beacons wake with a dead TX path and
+            // stay silent until power-cycled.
+            esp_wifi_set_ps(s_sleep_between ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
+            esp_wifi_set_channel(11, WIFI_SECOND_CHAN_BELOW);
+            Serial.printf("[BEACON] SET_SLEEP %s (ps=%s)\n",
+                          s_sleep_between ? "on" : "off",
+                          s_sleep_between ? "MIN_MODEM" : "NONE");
         } break;
 
         case BEACON_OP_RESTORE_DEFAULTS: {
-            s_tx_period_ms  = 10;
-            s_sleep_between = false;
+            s_tx_period_ms     = 10;
+            s_tx_period_us     = 10000;
+            s_precise_timing   = false;    // back to stock timing exactly
+            s_next_tx_us       = 0;
+            s_sleep_between    = false;
+            s_sleep_fail_count = 0;
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            esp_wifi_set_channel(11, WIFI_SECOND_CHAN_BELOW);
             Serial.println("[BEACON] RESTORE_DEFAULTS (100 Hz, no sleep)");
         } break;
 
@@ -292,9 +359,30 @@ void loop() {
     static unsigned long last_tx = 0;
     unsigned long now = millis();
 
-    // TX cadence — driven by s_tx_period_ms so commands can slow us down.
-    if (now - last_tx >= s_tx_period_ms) {
-        last_tx = now;
+    // TX cadence.
+    //
+    // PRECISE (commanded) path uses an absolute microsecond deadline so
+    // timing error cannot accumulate.  STOCK path is byte-for-byte the
+    // original millis() logic, so an uncommanded beacon is unchanged.
+    bool due;
+    if (s_precise_timing) {
+        int64_t now_us = esp_timer_get_time();
+        if (s_next_tx_us == 0) s_next_tx_us = now_us;
+        due = (now_us >= s_next_tx_us);
+        if (due) {
+            s_next_tx_us += (int64_t)s_tx_period_us;
+            // If we fell more than a whole period behind -- a long sleep
+            // overrun or a burst of command handling -- resync instead of
+            // firing a catch-up burst that would collide with everyone.
+            if (now_us - s_next_tx_us > (int64_t)s_tx_period_us)
+                s_next_tx_us = now_us + (int64_t)s_tx_period_us;
+            last_tx = now;                 // sleep block still uses millis
+        }
+    } else {
+        due = (now - last_tx >= s_tx_period_ms);
+        if (due) last_tx = now;
+    }
+    if (due) {
 
         uint32_t count = beacon_pkt_count;
         esp_now_send(broadcast_addr, (const uint8_t*)&count, sizeof(count));
@@ -333,19 +421,61 @@ void loop() {
     // Optional light sleep between bursts.  Only useful at slower rates —
     // at 100 Hz the 10 ms budget is dominated by TX + turnaround so
     // sleeping is counter-productive.  We only sleep when the effective
-    // period is > 30 ms.  Wake source is the timer; commands that arrive
-    // during sleep are queued by the Wi-Fi driver and processed on wake.
+    // period is > 30 ms.
+    //
+    // FIX: this used to call esp_light_sleep_start() while Wi-Fi power
+    // save was WIFI_PS_NONE.  Light sleep only maintains the Wi-Fi
+    // connection when PS is WIFI_PS_MIN_MODEM — with PS_NONE the radio
+    // is not kept coherent across the sleep, so the beacon woke with a
+    // dead TX path and went silent until it was power-cycled.  That is
+    // the "beacons drop out and don't come back" fault.
+    //
+    // Three things make it survivable now:
+    //   1. PS is switched to MIN_MODEM whenever sleep is armed (done in
+    //      apply_command), and back to NONE when it is disarmed.
+    //   2. The return value is CHECKED.  Consecutive rejections disarm
+    //      sleep automatically, so a beacon can never wedge itself.
+    //   3. The channel is re-asserted after every wake, because light
+    //      sleep can drop the channel configuration.
     if (s_sleep_between && s_tx_period_ms > 30) {
         uint32_t elapsed = millis() - last_tx;
         if (elapsed + 15 < s_tx_period_ms) {
             uint32_t sleep_us = (s_tx_period_ms - elapsed - 5) * 1000UL;
             esp_sleep_enable_timer_wakeup(sleep_us);
-            esp_light_sleep_start();
+            esp_err_t sr = esp_light_sleep_start();
+            if (sr != ESP_OK) {
+                // Sleep was rejected. Do not keep trying blindly.
+                if (++s_sleep_fail_count >= 5) {
+                    s_sleep_between = false;
+                    s_sleep_fail_count = 0;
+                    esp_wifi_set_ps(WIFI_PS_NONE);
+                    Serial.println("[beacon] light sleep rejected 5x - "
+                                   "sleep disabled, staying awake");
+                }
+                delay(1);
+            } else {
+                s_sleep_fail_count = 0;
+                // Light sleep can lose the channel; put it back before the
+                // next transmit or the frame goes out on the wrong one.
+                esp_wifi_set_channel(11, WIFI_SECOND_CHAN_BELOW);
+            }
         } else {
             delay(1);
         }
     } else {
         delay(1);
+    }
+
+    // Stall watchdog: if sleep is armed but nothing has actually gone out
+    // for a long time, the radio did not survive a wake.  Disarm sleep and
+    // recover rather than sitting silent until someone pulls the power.
+    if (s_sleep_between && (millis() - last_tx) > 2000) {
+        s_sleep_between = false;
+        s_sleep_fail_count = 0;
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_wifi_set_channel(11, WIFI_SECOND_CHAN_BELOW);
+        Serial.println("[beacon] TX stalled >2s with sleep on - "
+                       "sleep disabled, radio restored");
     }
 }
 

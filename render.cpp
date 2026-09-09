@@ -18,13 +18,17 @@ static bool  s_scope_init = false;
 
 // ── Track colors (stable per-track from the MantisSec channel palette) ─
 static uint16_t track_color(uint8_t id) {
+    // v0.85: SCENE_MAX_TARGETS is 6, so a 4-entry palette would give two
+    // simultaneously-tracked people the same colour.
     static const uint16_t palette[] = {
         COL_MS_CH_A,   // lime
         COL_MS_CH_B,   // bright teal
         COL_MS_CH_C,   // amber
         COL_MS_CH_D,   // violet-magenta
+        COL_MS_CH_E,   // deep teal
+        COL_MS_CH_F,   // hot pink
     };
-    return palette[id % 4];
+    return palette[id % 6];
 }
 
 // Occupancy heatmap: dim violet → teal → electric lime.
@@ -200,10 +204,12 @@ void render_radar_view() {
         BeaconState &b = g_app.beacon[i];
         if (!b.active) continue;
         float bx_n, by_n;
-        // Match beacon slot i (0,1,2) to LM_BEACON_i+1
-        if (i == 0) scene_landmark_pos(LM_BEACON_1, &bx_n, &by_n);
-        else if (i == 1) scene_landmark_pos(LM_BEACON_2, &bx_n, &by_n);
-        else if (i == 2) scene_landmark_pos(LM_BEACON_3, &bx_n, &by_n);
+        // Match beacon slot i to LM_BEACON_(i+1).  v0.8: was an explicit
+        // 0/1/2 chain that fell through to (0,0) for any higher slot,
+        // which at 4-6 beacons drew those beacons on top of the RX and
+        // collapsed their link lines to a point.  LM_BEACON_1..6 are
+        // contiguous by construction, so indexing is safe.
+        if (i < MAX_BEACONS) scene_landmark_pos((LandmarkId)(LM_BEACON_1 + i), &bx_n, &by_n);
         else { bx_n = 0; by_n = 0; }
         int bx = cx + (int)(bx_n * pix_per_unit);
         int by = cy - (int)(by_n * pix_per_unit);
@@ -243,6 +249,52 @@ void render_radar_view() {
         }
     }
 
+    // ── Exterior contacts: the perimeter wire ────────────────────
+    // Drawn as an ARC ON THE RIM, never as a dot.  Out here we have a
+    // bearing and no range, and the visual has to say exactly that —
+    // a dot would claim a position we did not earn, which is the
+    // failure mode this whole regime exists to remove.  Arc width is
+    // the real angular uncertainty: floored at pi/N (the array's own
+    // resolution) and widened by the aspect wander measured during the
+    // exterior rotation.
+    {
+        const int n_ext = scene_exterior_count();
+        for (int e = 0; e < n_ext; e++) {
+            const ExteriorContact *ec = scene_get_exterior(e);
+            if (!ec) continue;
+            // Self (the undocked operator standing outside) is dimmed and
+            // labelled, exactly like a self-tagged track — shown, never
+            // hidden.
+            uint16_t col = ec->is_self ? COL_MS_MID
+                         : (ec->confidence > 0.5f ? COL_MS_ALERT : COL_MS_WARN);
+            // Drawn just INSIDE the outer ring: the map is fitted with
+            // only a 6 px margin, so an arc outside R would clip off the
+            // panel.  Targets live within ~1.0 normalized (0.71*R), so
+            // this outer band is free.
+            const int r_in  = R - 5;
+            const int r_out = R - 1;
+            float a0 = ec->bearing_rad - ec->sector_half_rad;
+            float a1 = ec->bearing_rad + ec->sector_half_rad;
+            const int STEPS = 24;
+            for (int k = 0; k <= STEPS; k++) {
+                float a = a0 + (a1 - a0) * ((float)k / (float)STEPS);
+                // scene bearings are atan2(y,x); screen y is inverted.
+                int xi = cx + (int)(r_in  * cosf(a));
+                int yi = cy - (int)(r_in  * sinf(a));
+                int xo = cx + (int)(r_out * cosf(a));
+                int yo = cy - (int)(r_out * sinf(a));
+                g.drawLine(xi, yi, xo, yo, col);
+            }
+            // Label pulled inward along the bearing so it stays on-panel.
+            int lx = cx + (int)((r_in - 12) * cosf(ec->bearing_rad));
+            int ly = cy - (int)((r_in - 12) * sinf(ec->bearing_rad));
+            g.setFont(&fonts::Font0);
+            g.setTextColor(col, COL_MS_BG);
+            g.setCursor(lx - 8, ly - 3);
+            g.print(ec->is_self ? "YOU" : "CTC");
+        }
+    }
+
     // ── RX icon ──
     if (g_app.peer.role == ROLE_PRIMARY && g_app.peer.peer_present) {
         // Stereo pair: two small squares 6cm baseline visualized as ~4px apart
@@ -258,7 +310,14 @@ void render_radar_view() {
     for (int i = 0; i < TRACK_MAX; i++) {
         const TargetTrack *t = scene_get_track(i);
         if (!t || !t->active) continue;
-        uint16_t tc = track_color(t->id);
+        // v0.8: a track tagged is_self is the operator carrying the
+        // undocked probe.  It is DIMMED AND LABELLED, never hidden —
+        // the user explicitly wants to still see themselves, and an
+        // occasional mislabel of someone standing right next to them is
+        // an accepted trade.  What must never happen is a genuinely new
+        // presence being quietly suppressed, which is why nothing here
+        // skips drawing.
+        uint16_t tc = t->is_self ? COL_MS_MID : track_color(t->id);
 
         // Trail (age-faded)
         uint32_t now = millis();
@@ -301,6 +360,13 @@ void render_radar_view() {
         if (t->ambiguity_flag) {
             g.fillCircle(tx + 8, ty - 8, 2, COL_MS_ALERT);
         }
+        // v0.8: "YOU" label on the self-track.
+        if (t->is_self) {
+            g.setFont(&fonts::Font2);
+            g.setTextColor(COL_MS_MID, COL_MS_BG);
+            g.setCursor(tx + 8, ty - 6);
+            g.print("YOU");
+        }
     }
 
     // ── Alert border ──
@@ -333,10 +399,11 @@ void render_radar_view() {
         g.setCursor(SCREEN_W - lw - 4, scope_y + 2);
         g.print(lo);
     }
-    uint16_t bcols[3] = {COL_MS_CH_A, COL_MS_CH_B, COL_MS_CH_C};
+    uint16_t bcols[6] = {COL_MS_CH_A, COL_MS_CH_B, COL_MS_CH_C,
+                         COL_MS_CH_D, COL_MS_CH_E, COL_MS_CH_F};
     for (int i = 0; i < MAX_BEACONS; i++) {
         if (!g_app.beacon[i].active) continue;
-        uint16_t c = bcols[i % 3];
+        uint16_t c = bcols[i % 6];
         int n = RADAR_SCOPE_LEN < SCREEN_W ? RADAR_SCOPE_LEN : SCREEN_W;
         int prev_x = 0, prev_y = 0;
         for (int k = 0; k < n; k++) {

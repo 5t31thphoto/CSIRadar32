@@ -18,11 +18,41 @@ struct Btn {
 static Btn s_btn[BTN_COUNT];
 
 void input_begin() {
-    s_btn[BTN_LEFT]  = {PIN_BTN_LEFT,  false, false, 0, 0, false, false, false};
-    s_btn[BTN_RIGHT] = {PIN_BTN_RIGHT, false, false, 0, 0, false, false, false};
-
+    // Configure the pins FIRST, let the pull-ups settle, then seed the
+    // debounced state from what the pins ACTUALLY read.
+    //
+    // This used to initialise stable=false/raw=false before pinMode, so
+    // the first poll could sample a pin that had not finished charging
+    // through its pull-up.  A floating-low read looks like a press; when
+    // the pull-up settles the release edge fires ev_short -- a PHANTOM
+    // button event, delivered before any human touched anything.
+    //
+    // On the splash that is fatal, because the splash exits on
+    // wasShortPressed(BTN_RIGHT): the animation vanished on its own.
+    // Whether the low window outlasted BTN_DEBOUNCE_MS depended on pin
+    // settling, which varies with power-on vs reset vs USB state -- so it
+    // happened only sometimes, which is what made it look random.
     pinMode(PIN_BTN_LEFT,  INPUT_PULLUP);
     pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
+    delay(5);                       // pull-ups settle
+
+    const uint32_t now = millis();
+    const uint8_t pins[BTN_COUNT] = { PIN_BTN_LEFT, PIN_BTN_RIGHT };
+    for (int i = 0; i < BTN_COUNT; i++) {
+        // Seed raw AND stable to the real level: identical values mean
+        // the debouncer sees no transition and generates no edge.
+        const bool lvl = (digitalRead(pins[i]) == LOW);
+        s_btn[i].pin             = pins[i];
+        s_btn[i].raw             = lvl;
+        s_btn[i].stable          = lvl;
+        s_btn[i].last_change_ms  = now;
+        s_btn[i].press_start_ms  = now;
+        // If a button is genuinely held at boot, suppress the eventual
+        // release-short so a held BOOT button does not fire an action.
+        s_btn[i].long_fired      = lvl;
+        s_btn[i].ev_short        = false;
+        s_btn[i].ev_long         = false;
+    }
 }
 
 void input_poll() {
