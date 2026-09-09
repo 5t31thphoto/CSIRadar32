@@ -560,6 +560,16 @@ bool peer_try_consume(const uint8_t *src_mac, const uint8_t *data, int len) {
                 peer_handle_track_state(p);
             }
             return true;
+        case PEER_TRIPWIRE_MAGIC:
+            if (len >= (int)sizeof(PeerTripwirePacket)) {
+                PeerTripwirePacket p;
+                memcpy(&p, data, sizeof(p));
+                g_app.tw_remote_ms     = millis();
+                g_app.tw_remote_status = p.status;
+                g_app.tw_remote_beacon = p.beacon_id;
+                g_app.tw_remote_pct    = p.metric_pct;
+            }
+            return true;
         default:
             return false;
     }

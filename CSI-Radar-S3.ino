@@ -336,6 +336,11 @@ static void state_discovery() {
     }
 }
 
+// Empty-room step state: whether the user has pressed START from
+// outside the room (stereo) or the countdown has expired (solo).
+static bool     s_empty_started  = false;
+static uint32_t s_empty_start_ms = 0;
+
 static void state_geometry_guide() {
     ui_geometry_guide();
     if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
@@ -431,11 +436,6 @@ static void state_cal_anchor_place() {
     if (wasShortPressed(BTN_LEFT))
         user_advance(ST_CAL_INTRO);
 }
-
-// Empty-room step state: whether the user has pressed START from
-// outside the room (stereo) or the countdown has expired (solo).
-static bool     s_empty_started  = false;
-static uint32_t s_empty_start_ms = 0;
 
 static void state_cal_empty_room() {
     // THE SEQUENCE, as the user actually performs it:

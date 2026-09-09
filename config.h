@@ -1176,6 +1176,15 @@ struct AppContext {
     // the anchor tracks the probe's undock state separately (it
     // learns of it via PEER_OP_UNDOCK_PROBE).
     bool        probe_undocked;
+
+    // v0.9 — tripwire topology + anchor→probe mirror state.
+    // TW_REMOTE: the anchor owns the tripwire and mirrors it to the
+    // probe; the probe renders g_app.tw_remote_* instead of its own link.
+    TripwireMode tripwire_mode;      // TW_REMOTE (default 0) or TW_DUAL
+    uint32_t     tw_remote_ms;       // millis() of last tripwire mirror rx
+    uint8_t      tw_remote_status;   // LinkStatus of anchor's strongest link
+    uint8_t      tw_remote_beacon;   // beacon id of that link
+    uint16_t     tw_remote_pct;      // 0..100 metric, for the bar
 };
 
 extern AppContext g_app;
