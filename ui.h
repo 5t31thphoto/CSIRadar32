@@ -44,7 +44,30 @@ void ui_dashboard();
 void ui_csi_next_beacon();
 
 // Settings menu.
+// v0.8: the row count is dynamic — the probe gains an undock row once
+// it has a usable kernel.  The state machine must use these rather than
+// a hardcoded 6 when wrapping the selection.
+#define UI_SETTINGS_MAX_ROWS      8
+#define UI_SETTINGS_ROW_DEBUG     6   // always present
+#define UI_SETTINGS_ROW_UNDOCK    7   // probe only, once a kernel exists
+bool ui_settings_undock_row_visible();
+int  ui_settings_row_count();
 void ui_settings(int selected_row);
+
+// v0.9: in-RAM log viewer, reachable from Settings -> Debug log.
+// scroll = index of the first line shown (0 = oldest).
+void ui_debug_log(int scroll);
+
+// v0.8: full-screen view for ST_MOBILE_PROBE.  Renders the anchor's
+// track list (streamed over the peer link) plus a "you are here" marker
+// with a confidence ellipse at the probe's own estimated position.
+// track_state may be nullptr before the first packet arrives.
+void ui_mobile_probe_view(const PeerTrackStatePacket *track_state,
+                          uint32_t track_state_age_ms,
+                          const float probe_pos[2],
+                          const float probe_cov[3],
+                          float probe_conf,
+                          bool acquiring);
 
 // Utility (used by state machine for a full-screen message)
 void ui_message(const char *title, const char *line1, const char *line2 = nullptr,
