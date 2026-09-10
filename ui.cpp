@@ -2643,9 +2643,19 @@ void ui_cal_landmark_walk() {
     g.print(sbuf);
 
     if (!step) {
-        g.setTextColor(COL_MS_WARN, COL_BG);
-        g.setCursor(6, CONTENT_Y + 30);
-        g.print("(no step)");
+        // "(no step)" told the operator nothing.  This screen with no
+        // script means the wizard was never armed on this unit -- the
+        // landmine-A symptom -- and the useful thing is to say so and
+        // say what to do about it.
+        g.setFont(&fonts::Font2);
+        g.setTextColor(COL_MS_ALERT, COL_BG);
+        g.setCursor(6, CONTENT_Y + 50);
+        g.print("NO SCRIPT - unit not armed");
+        g.setTextColor(COL_MUTED, COL_BG);
+        g.setCursor(6, CONTENT_Y + 68);
+        g.print("Wait for peer sync");
+        g.setCursor(6, CONTENT_Y + 84);
+        g.print("or restart cal.");
         draw_footer("redo", "next");
         flush();
         return;
@@ -2691,6 +2701,46 @@ void ui_cal_landmark_walk() {
         // v0.9: labels need vertical room; the map was sized for bare dots.
         draw_mini_landmark_map(4, map_y, SCREEN_W - 8,
                                map_h < 110 ? 110 : map_h, highlight, next);
+    }
+
+    // ── HONEST CAPTURE FEEDBACK ───────────────────────────────────
+    // REC blinks only while a capture window is actually open, N is the
+    // real buffered frame count, and the strip shows which beacons are
+    // delivering RIGHT NOW.  REC lit with N frozen at 0 means the radio
+    // is not producing data, whatever the rest of the screen claims.
+    {
+        const bool rec = scene_capture_open();
+        const int  nfr = scene_capture_frame_count();
+        g.setFont(&fonts::Font0);
+        if (rec && ((millis() / 400) % 2)) {
+            g.setTextColor(COL_MS_ALERT, COL_BG);
+            g.setCursor(SCREEN_W - 64, CONTENT_Y + 2);
+            g.print("REC");
+        }
+        if (rec) {
+            char nb[16]; snprintf(nb, sizeof(nb), "N=%d", nfr);
+            g.setTextColor(nfr > 0 ? COL_MS_LIME : COL_MS_ALERT, COL_BG);
+            g.setCursor(SCREEN_W - 40, CONTENT_Y + 2);
+            g.print(nb);
+        }
+        // Per-beacon liveness: one pip each, lime = fresh, red = dead.
+        int px = 6, live = 0, tot = 0;
+        for (int i = 0; i < MAX_BEACONS; i++) {
+            const BeaconState &b = g_app.beacon[i];
+            if (!b.active) continue;
+            tot++;
+            const bool fresh = (millis() - b.last_frame_ms) < 400;
+            if (fresh) live++;
+            g.fillRect(px, CONTENT_Y + 3, 6, 5,
+                       fresh ? COL_MS_LIME : COL_MS_ALERT);
+            px += 9;
+        }
+        if (tot > 0) {
+            char rb[16]; snprintf(rb, sizeof(rb), "RF %d/%d", live, tot);
+            g.setTextColor(live == tot ? COL_MUTED : COL_MS_ALERT, COL_BG);
+            g.setCursor(px + 4, CONTENT_Y + 2);
+            g.print(rb);
+        }
     }
 
     // Timer / status line right above footer — driven by wizard phase.

@@ -138,7 +138,7 @@ const PsramProbe &psram_probe();   // evaluated once at boot
 
 // ── Version & identity ─────────────────────────────────────────
 #define FW_NAME     "MantisSec"
-#define FW_VERSION  "0.9.0"
+#define FW_VERSION  "0.9.5"
 
 // ── Wi-Fi / CSI (unchanged from v0.2) ─────────────────────────
 #define CSI_CHANNEL             11

@@ -48,6 +48,11 @@ void csi_beacon_apply_run_config();         // ping + set rate + set sleep
 // Periodically verify beacons are still on the requested rate and
 // re-command any that are not.  Call from the main loop.
 void csi_beacon_enforce_rate();
+// PING-only upkeep, safe to run DURING calibration: carries no config so
+// it cannot change a beacon's rate mid-capture.
+void csi_beacon_keepalive();
+// One-shot: arm beacon light-sleep AFTER cal is accepted.  Never during.
+void csi_beacon_enable_sleep_after_cal();
 // Non-blocking driver for beacon configuration. Call every loop.
 void csi_beacon_service();
 bool csi_beacon_try_consume_pong(const uint8_t *data, int len);

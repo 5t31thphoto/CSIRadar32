@@ -569,8 +569,18 @@ void csi_beacon_service() {
         // the other beacons' replies.
         csi_beacon_command(b.id, BEACON_OP_SET_RATE,
                            (uint16_t)BEACON_REQUEST_RATE_HZ);
-        csi_beacon_command(b.id, BEACON_OP_SET_SLEEP,
-                           BEACON_REQUEST_SLEEP ? 1 : 0);
+        // NEVER arm light-sleep here.  Sleep at 30 Hz sits right on the
+        // beacon's own >30 ms guard (period is 33 ms) and has been seen
+        // to drop RF coherence mid-ceremony: beacons alive at discovery
+        // going silent the moment SET_SLEEP landed.
+        //
+        // My first attempt gated this on scene_cal_complete(), which was
+        // wrong in a way worth recording: this runs inside
+        // csi_beacon_service(), which only ever retries UNCONFIRMED
+        // beacons.  Once a beacon confirms its rate it is never visited
+        // again, so sleep would never have been armed at all.  It needs
+        // to be an explicit one-shot -- see below.
+        csi_beacon_command(b.id, BEACON_OP_SET_SLEEP, 0);
         csi_beacon_command(b.id, BEACON_OP_PING);
     }
 #endif
@@ -584,6 +594,44 @@ void csi_beacon_service() {
 // the command exactly once at discovery, so any of those left it at
 // 100 Hz forever.  Called from the main loop; cheap, and it only
 // transmits when something is actually wrong.
+// ── RF DURING CAL ─────────────────────────────────────────────
+// PING only.  Beacon upkeep was suppressed entirely during cal, on the
+// reasoning that a SET_RATE mid-capture would make one kernel sample
+// span two rates.  That reasoning is right about SET_RATE and wrong
+// about the whole subsystem: with no traffic at all, a beacon that goes
+// quiet during the walk is never re-acquired, so the anchor sits there
+// losing beacons that are healthy and sitting on the floor working.
+//
+// A PING carries no configuration.  It cannot change the rate, so it
+// cannot corrupt a sample -- it just keeps the link alive and refreshes
+// last_seen so the beacon does not age out mid-ceremony.
+// Arm light-sleep once, deliberately, after calibration is accepted.
+// Deferred until then so the CSI stream cannot be killed mid-ceremony by
+// a SET_SLEEP landing at the 30 Hz boundary.
+void csi_beacon_enable_sleep_after_cal() {
+#if MS_BEACON_CONTROL
+    if (!BEACON_REQUEST_SLEEP) return;
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        if (!g_app.beacon[i].active) continue;
+        csi_beacon_command(g_app.beacon[i].id, BEACON_OP_SET_SLEEP, 1);
+    }
+    MSLOGLN("[csi] post-cal: light-sleep armed on beacons");
+#endif
+}
+
+void csi_beacon_keepalive() {
+#if MS_BEACON_CONTROL
+    const uint32_t now = millis();
+    static uint32_t last = 0;
+    if (now - last < 1500) return;
+    last = now;
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        if (!g_app.beacon[i].active) continue;
+        csi_beacon_command(g_app.beacon[i].id, BEACON_OP_PING);
+    }
+#endif
+}
+
 void csi_beacon_enforce_rate() {
 #if !MS_BEACON_CONTROL
     return;

@@ -218,6 +218,11 @@ void scene_cal_abort();
 // Empty-room baseline is captured separately by csi.cpp (existing v0.2
 // mechanism).  scene_cal_ack_empty_room() marks that phase complete.
 void scene_cal_ack_empty_room();
+// Honest cal feedback for the UI: is a capture window open, and how many
+// frames has it actually buffered?
+bool scene_capture_open();
+int  scene_capture_frame_count();
+int  scene_capture_kind();  // 0=none 1=stand 2=walk 3=rotate
 
 // Landmark (STAND) capture — averaged fingerprint at a known point.
 void scene_begin_landmark_capture(LandmarkId lm);

@@ -43,9 +43,40 @@
 
 AppContext g_app = {};
 
+// Forward decls needed by enter_state's arming logic.
+static bool is_cal_state(AppState s);
+
 static void enter_state(AppState s) {
+    const AppState prev = g_app.state;
     g_app.state = s;
     g_app.state_enter_ms = millis();
+
+    // ── LANDMINE A ────────────────────────────────────────────────
+    // The ANCHOR reaches ST_CAL_LANDMARK_WALK by following a peer state
+    // hint, which only assigned g_app.state.  None of the work the state
+    // IMPLIES ever ran: scene_cal_begin() and wizard_begin() were called
+    // from the PROBE's button handler, which the anchor never executes.
+    // The anchor therefore walked the whole ceremony with an unarmed
+    // wizard -- "(no step) 1/0" on screen and an empty kernel at the end.
+    //
+    // Arming belongs on ENTRY, because entry is the one thing both paths
+    // share, whether you got here by pressing a button or by being told.
+    if (s == ST_CAL_LANDMARK_WALK && prev != ST_CAL_LANDMARK_WALK) {
+        // Seal a still-running empty-room baseline first.  If the probe
+        // advanced while this unit was mid-accumulation, the samples are
+        // real and usable -- they must be committed, not discarded, or
+        // the walk runs against no reference at all.
+        if (prev == ST_CAL_EMPTY_ROOM && csi_baseline_progress() > 0.05f) {
+            csi_baseline_finalize();
+            scene_cal_ack_empty_room();
+            MSLOGLN("[cal] sealed partial baseline on walk entry");
+        }
+        if (!wizard_active()) {
+            scene_cal_begin(g_app.cal_mode);
+            wizard_begin(g_app.cal_mode);
+            MSLOGLN("[cal] armed wizard on walk entry");
+        }
+    }
 }
 static uint32_t state_age_ms() { return millis() - g_app.state_enter_ms; }
 
@@ -592,7 +623,10 @@ static void state_cal_results() {
     // most likely to reach with the wrong box in hand.
     {
         if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
-            // Accept — move to RX_ASSEMBLY (stereo) or dashboard (solo)
+            // Accept — move to RX_ASSEMBLY (stereo) or dashboard (solo).
+            // Beacon light-sleep is armed HERE and only here: it is safe
+            // once no capture window can be open.
+            csi_beacon_enable_sleep_after_cal();
             user_advance(g_app.cal_mode == CAL_MODE_STEREO
                          ? ST_RX_ASSEMBLY : ST_DASHBOARD);
         }
@@ -990,9 +1024,14 @@ void loop() {
             }
         }
 
-        if (g_app.beacon_count > 0 && !is_cal_state(g_app.state)) {
-            csi_beacon_service();        // retries only unconfirmed beacons
-            csi_beacon_enforce_rate();   // periodic re-verify
+        if (g_app.beacon_count > 0) {
+            if (is_cal_state(g_app.state)) {
+                // During cal: keep the link alive, change nothing.
+                csi_beacon_keepalive();
+            } else {
+                csi_beacon_service();        // retries only unconfirmed beacons
+                csi_beacon_enforce_rate();   // periodic re-verify
+            }
         }
     }
 
@@ -1023,10 +1062,29 @@ void loop() {
         static uint32_t s_spatial_last_ms = 0;
         const uint32_t SPATIAL_MIN_MS = 10;   // 100 Hz ceiling
         uint32_t now_sp = millis();
-        if ((g_app.state == ST_CAL_LANDMARK_WALK
-             || g_app.state == ST_DASHBOARD
-             || g_app.state == ST_MOBILE_PROBE)
-            && (now_sp - s_spatial_last_ms) >= SPATIAL_MIN_MS) {
+        // ── SUSPENDERS ────────────────────────────────────────────
+        // csi_update_spatial() is what builds the FrameObservation and
+        // stamps per-beacon freshness.  It used to run ONLY in the walk,
+        // the dashboard and mobile-probe.
+        //
+        // So the moment cal began -- ST_CAL_INTRO, ST_CAL_ANCHOR_PLACE,
+        // ST_CAL_EMPTY_ROOM -- observation stopped dead.  Frames kept
+        // arriving and csi_process_frames() kept filtering them, but
+        // nothing consumed them into an observation, so every beacon
+        // aged past its freshness window and the anchor showed the
+        // beacons "lost" while they sat on the floor transmitting
+        // perfectly.  The keepalive PING I added keeps the LINK alive;
+        // it cannot help when the problem is that nobody is looking.
+        //
+        // Observation now runs wherever a beacon reading is meaningful:
+        // every cal state (the empty-room baseline is measurement too),
+        // plus the live views.  It is rate-limited exactly as before, so
+        // this costs nothing extra per unit time.
+        const bool observe_here =
+               is_cal_state(g_app.state)
+            || g_app.state == ST_DASHBOARD
+            || g_app.state == ST_MOBILE_PROBE;
+        if (observe_here && (now_sp - s_spatial_last_ms) >= SPATIAL_MIN_MS) {
             s_spatial_last_ms = now_sp;
             csi_update_spatial();   // internally calls scene_observe()
         }

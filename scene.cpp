@@ -410,6 +410,12 @@ void scene_landmark_pos(LandmarkId id, float *out_x, float *out_y) {
 //  CAL LIFECYCLE
 // ═══════════════════════════════════════════════════════════════
 void scene_cal_begin(CalMode mode) {
+    // ── LANDMINE E ────────────────────────────────────────────────
+    // scene_reset() zeroes s_lm_pos[].  Nothing re-derived it, so every
+    // landmark and beacon icon collapsed to the origin for the rest of
+    // the session -- the walk map showed all beacons stacked at the
+    // centre and the operator had nothing to navigate by.
+    scene_derive_landmarks_from_geometry();
     scene_reset();
     s_cal_mode = mode;
     s_cal_active = true;
@@ -432,6 +438,14 @@ void scene_cal_abort() {
     s_cap_probe_len = 0;
     MSLOGLN("[scene] cal aborted");
 }
+
+// ── Honest cal feedback ───────────────────────────────────────
+// The operator had no way to tell a working capture from a dead one.
+// If REC is lit and N stays at 0, the radio is lying and the walk is
+// worthless -- better to know at step 3 than at the results screen.
+bool scene_capture_open()        { return s_cal_active && s_cap_kind != CAP_NONE; }
+int  scene_capture_frame_count() { return s_cap_anchor_len; }
+int  scene_capture_kind()        { return (int)s_cap_kind; }
 
 void scene_cal_ack_empty_room() {
     s_empty_room_ready = true;
@@ -588,6 +602,23 @@ static bool write_kernel_sample_from_range(const CapFrame *buf,
             s.b[b].std_aoa = sqrtf(fmaxf(0.0f, -2.0f * logf(fmaxf(1e-4f, R_aoa))));
         }
     }
+
+    // ── LANDMINE B (commit side) ──────────────────────────────────
+    // A sample every one of whose beacons has sample_count == 0 carries
+    // no information whatsoever, but it still occupied a kernel slot and
+    // still counted toward "85 samples".  Downstream, cross-validation,
+    // loop closure and ambiguity all divide by counts that are zero, so
+    // every headline metric printed 0.000 and the cal was graded on
+    // nothing.  Refuse the commit instead.
+    int usable = 0;
+    for (int b = 0; b < MAX_BEACONS; b++)
+        if (s.b[b].sample_count > 0) usable++;
+    if (usable == 0) {
+        MSLOG("[scene] kernel sample lm=%u had NO usable beacon - dropped\n",
+              (unsigned)lm_id);
+        return false;
+    }
+
     s_kernel_count++;
     return true;
 }
@@ -1138,17 +1169,28 @@ void scene_observe(const FrameObservation &obs) {
         f.t_ms = obs.frame_ms;
         memset(f.beacon_valid, 0, sizeof(f.beacon_valid));
         memset(f.aoa_valid,    0, sizeof(f.aoa_valid));
+        int n_fresh = 0;
         for (int b = 0; b < MAX_BEACONS; b++) {
             if (!obs.beacon[b].fresh) continue;
             f.amp[b]   = obs.beacon[b].amp_perturbation;
             f.phase[b] = obs.beacon[b].phase_perturbation;
             f.beacon_valid[b] = 1;
+            n_fresh++;
             if (obs.beacon[b].have_aoa) {
                 f.aoa[b] = obs.beacon[b].aoa_rad;
                 f.aoa_valid[b] = 1;
             }
         }
-        s_cap_anchor_len++;
+        // ── LANDMINE B ────────────────────────────────────────────
+        // s_cap_anchor_len++ used to run unconditionally.  A frame in
+        // which NO beacon was fresh still consumed a capture slot with
+        // every beacon_valid clear, and the kernel then committed it as
+        // a sample whose sample_count is 0 on every channel.  That is
+        // the wall of zeros: 85 kernel samples, lm/tr 0/0, every metric
+        // 0.000, on a run where the beacons were perfectly healthy.
+        //
+        // An observation with nothing in it is not an observation.
+        if (n_fresh > 0) s_cap_anchor_len++;
     }
 
     // 2) If we're PROBE in stereo cal, transmit this frame to ANCHOR —
@@ -1171,6 +1213,12 @@ void scene_observe(const FrameObservation &obs) {
 // per-beacon SNR (variance-across-landmarks / variance-within-landmark),
 // cross-validation error (leave-one-landmark-out), and loop closure.
 void scene_finalize_cal(CalReport &report) {
+    // ── LANDMINE E ────────────────────────────────────────────────
+    // scene_reset() zeroes s_lm_pos[].  Nothing re-derived it, so every
+    // landmark and beacon icon collapsed to the origin for the rest of
+    // the session -- the walk map showed all beacons stacked at the
+    // centre and the operator had nothing to navigate by.
+    scene_derive_landmarks_from_geometry();
     memset(&report, 0, sizeof(report));
     report.mode = s_cal_mode;
     report.total_kernel_samples = (uint16_t)s_kernel_count;
@@ -2671,6 +2719,13 @@ bool scene_finalize_probe_kernel() {
         return false;
     }
     s_probe_kernel_ready = true;
+    // ── LANDMINE C ────────────────────────────────────────────────
+    // scene_update() is gated on scene_cal_complete(), and only the
+    // ANCHOR's scene_finalize_cal() ever set it.  The PROBE built a
+    // perfectly good kernel, set s_probe_kernel_ready, and then never
+    // ran tracking at all -- it showed AoA and turbulence and nothing
+    // else, which is exactly the "glorified tripwire" symptom.
+    s_cal_complete = true;
     MSLOG("[scene] probe kernel ready: %d samples, %d beacons\n",
                   s_kernel_count, usable_beacons);
     return true;
