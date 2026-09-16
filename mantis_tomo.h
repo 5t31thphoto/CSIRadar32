@@ -243,18 +243,9 @@ static inline int mantis_tomo_build(const float *bx, const float *by,
             const float qs = q1 + q2;
             if (qs <= 0.0f) continue;
             const float a  = (a1 * q1 + a2 * q2) / qs;
-            // Reciprocity check -- but ONLY when both directions were
-            // actually measured.
-            //
-            // With one direction unmeasured its attenuation reads as
-            // zero, so |a1 - a2| equals a1 and a perfectly good one-way
-            // measurement gets penalised in proportion to how much
-            // signal it found.  The stronger the evidence, the harder it
-            // was punished, which is exactly backwards.
-            const bool both = (q1 > 0.0f) && (q2 > 0.0f);
-            const float trust = both
-                ? (1.0f / (1.0f + 4.0f * fabsf(a1 - a2)))
-                : 0.75f;   // one-way: usable, but no cross-check to earn full trust
+            // Disagreement between directions discounts confidence.
+            const float disagree = fabsf(a1 - a2);
+            const float trust    = 1.0f / (1.0f + 4.0f * disagree);
             out[m].ax = bx[i]; out[m].ay = by[i];
             out[m].bx = bx[j]; out[m].by = by[j];
             out[m].atten  = a;

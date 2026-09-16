@@ -74,27 +74,7 @@ typedef struct {
     uint8_t  last_quality;
     uint32_t last_seq;
     bool     ready;
-
-    // Local noise estimate: how much this link wanders when nothing is
-    // happening.  A link that is intrinsically restless needs a bigger
-    // excursion to count as blocked than one that sits still, and only
-    // the beacon knows which kind this is.
-    float    quiet_dev;      // running mean |deviation| during baseline
-    bool     blocked;        // THIS beacon's verdict on THIS link
 } MantisBeaconLink;
-
-// How many multiples of a link's own quiet deviation count as blocked.
-// Per-link rather than global: a 0.15 excursion is decisive on a stable
-// link and meaningless on a restless one, and a single global threshold
-// has to be set for the worst link in the room.
-#ifndef MANTIS_BLOCK_SIGMA
-  #define MANTIS_BLOCK_SIGMA 3.5f
-#endif
-// Floor, so an unnaturally quiet link cannot make trivial noise look
-// like a body.
-#ifndef MANTIS_BLOCK_FLOOR
-  #define MANTIS_BLOCK_FLOOR 0.08f
-#endif
 
 // Reduce one raw CSI buffer to amplitude, fit-intercept phase and a
 // quality figure.
@@ -196,41 +176,6 @@ static inline void mantis_beacon_link_update(MantisBeaconLink *L,
         L->phi_base = (k == 0) ? L->phi_ema
                                : (L->phi_base + db / (float)(k + 1));
         if (L->base_n < 65535) L->base_n++;
-    }
-
-    // ── THE BEACON'S OWN VERDICT ──────────────────────────────
-    // Made here because only here is the link's own quiet behaviour
-    // known.  The receiver sees the number; the beacon knows what is
-    // normal for it.
-    float da_now = 0.0f;
-    if (L->base_n > 0 && L->amp_base > 1e-3f)
-        da_now = (L->amp_ema - L->amp_base) / L->amp_base;
-    if (learning) {
-        // Measure the link's restlessness only once its BASELINE has
-        // settled.
-        //
-        // da_now is a deviation from amp_base, and amp_base is still
-        // converging during the first samples -- so those deviations are
-        // huge and have nothing to do with how restless the link
-        // actually is.  Folding them in inflated quiet_dev, which raised
-        // the blocked threshold, which made the beacons miss real
-        // blockages on exactly the links carrying the most signal.  The
-        // witness count then came out BACKWARDS: the true target scored
-        // 2 of 6 while an artefact scored 3.
-        if (L->base_n > 12) {
-            const float dev = fabsf(da_now);
-            const uint16_t k = (uint16_t)(L->base_n - 12);
-            L->quiet_dev = (k <= 1) ? dev
-                                    : (L->quiet_dev + (dev - L->quiet_dev) / (float)k);
-        }
-        L->blocked = false;
-    } else {
-        float thresh = MANTIS_BLOCK_SIGMA * L->quiet_dev;
-        if (thresh < MANTIS_BLOCK_FLOOR) thresh = MANTIS_BLOCK_FLOOR;
-        // Blocked means LOST amplitude.  A gain is constructive
-        // multipath, not a body, and counting it would let a reflection
-        // vote as a witness.
-        L->blocked = (da_now < -thresh) && (quality > 60);
     }
 
     if (!out) return;

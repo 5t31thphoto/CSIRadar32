@@ -89,46 +89,13 @@
 // (L-LTF / HT-LTF), not from the payload, so payload bytes buy nothing
 // and cost airtime.  These fields exist only to identify the sounding.
 #define MANTIS_AIR_MAGIC        0x4D41ul     // 'MA'
-// TWO DIFFERENT KINDS OF NAME, and keeping them separate matters.
-//
-//   beacon_id  a SCHEDULING RESOURCE.  It picks the transmit slot
-//              (slot = id-1) and it is assignable, so it can change when
-//              hardware is swapped or a collision resolves.
-//
-//   uid        the PHYSICAL BOX.  Derived from the MAC, so it is unique
-//              by construction, permanent, and needs no protocol, no
-//              storage and no claim exchange to establish.
-//
-// Everything learned about a location -- surveyed geometry, per-link
-// quiet-room baselines, the static room map -- is keyed to UID, never to
-// beacon_id.  That was the trap in keying it to the assignable name: an
-// id reshuffle would leave every one of those silently describing the
-// wrong physical box, and the system would look completely healthy while
-// being wrong.
-//
-// The operator never sees either of these.  The UI names beacons by the
-// SLOT BINDING established during the walk -- B1 is whichever box you
-// walked to first -- so the assignable name and the permanent name are
-// both implementation details.
 typedef struct __attribute__((packed)) {
     uint16_t magic;        // MANTIS_AIR_MAGIC
-    uint8_t  slot;         // which slot this was sent in
-    uint8_t  beacon_id;    // 1..6, the scheduling resource
-    uint16_t uid;          // MAC-derived, permanent, identifies the BOX
+    uint8_t  slot;         // which slot this was sent in (0..MANTIS_SLOTS-1)
+    uint8_t  beacon_id;    // 1..6
     uint32_t seq;          // superframe counter, the RF event identity
     uint32_t epoch_us;     // sender's frame-start time, for drift tracking
 } MantisAirFrame;
-
-// 16 bits of MAC.  Collision probability across six beacons is about
-// 1 in 13,000 -- and a collision is DETECTABLE (two boxes reporting the
-// same uid from different ids), where a silent re-key is not.
-static inline uint16_t mantis_uid_from_mac(const uint8_t *mac) {
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < 6; i++) { h ^= mac[i]; h *= 16777619u; }
-    h ^= h >> 16;
-    const uint16_t u = (uint16_t)(h & 0xFFFF);
-    return u ? u : 1;      // 0 means "unknown", so never hand it out
-}
 
 // ── Beacon-to-beacon report ───────────────────────────────────
 // A beacon that heard another beacon reports a COMPACT summary, never
@@ -183,7 +150,7 @@ typedef struct __attribute__((packed)) {
 // without the other, these fire at build time rather than producing
 // silently misaligned reads on the air.
 #ifdef __cplusplus
-static_assert(sizeof(MantisAirFrame)        == 14, "MantisAirFrame layout changed");
+static_assert(sizeof(MantisAirFrame)        == 12, "MantisAirFrame layout changed");
 static_assert(sizeof(MantisBistaticReport)  == 14, "MantisBistaticReport layout changed");
 static_assert(sizeof(MantisSilenceReport)   ==  8, "MantisSilenceReport layout changed");
 static_assert(sizeof(MantisRange)           ==  8, "MantisRange layout changed");
