@@ -454,7 +454,23 @@ void peer_handle_command(const PeerCommand &cmd) {
             g_app.peer.primary_state_hint = ST_SLEEP_ARM;
             break;
         case PEER_OP_STATE_HINT:
-            g_app.peer.primary_state_hint = cmd.arg_u8;
+            // VALIDATE.  This byte comes off the air and used to be cast
+            // straight to AppState.  A peer on older or newer firmware --
+            // or one corrupted packet -- could name a state this build
+            // has no handler for, and the dispatch's `default: break;`
+            // means the unit then renders nothing and accepts no input.
+            // A frozen screen with live buttons that do nothing is the
+            // worst possible failure for a device you are carrying around
+            // a room.
+            //
+            // Out-of-range hints are dropped, not clamped: clamping would
+            // invent a state the peer never asked for.
+            if (cmd.arg_u8 > 0 && cmd.arg_u8 < (uint8_t)ST_COUNT) {
+                g_app.peer.primary_state_hint = cmd.arg_u8;
+            } else {
+                MSLOG("[peer] rejected out-of-range state hint %u\n",
+                      (unsigned)cmd.arg_u8);
+            }
             break;
         case PEER_OP_CAL_STEP_HINT: {
             // PROBE→ANCHOR: PROBE has advanced its wizard to step
@@ -465,6 +481,13 @@ void peer_handle_command(const PeerCommand &cmd) {
             wizard_jump_to_step((int)cmd.arg_u16);
             break;
         }
+        case PEER_OP_TAC_STEP:
+            // arg_u16 packs the deploy index in the low byte and the
+            // capturing flag in bit 8.  The anchor renders from this, so
+            // its screen tracks the operator instead of freezing on B1.
+            g_app.tac_peer_step      = (uint8_t)(cmd.arg_u16 & 0xFF);
+            g_app.tac_peer_capturing = (cmd.arg_u16 & 0x100) != 0;
+            break;
         case PEER_OP_CAL_ROLE_ANCHOR:
             // The other unit was pressed, so it carries the probe and
             // this one stays put as the anchor.

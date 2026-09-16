@@ -2,6 +2,7 @@
 //  CSI-Radar-S3 — csi.cpp
 // ═══════════════════════════════════════════════════════════════
 #include "csi.h"
+#include "tactical.h"   // RF chart shares this observation
 #include <stdarg.h>
 #include "peer.h"
 #include "stereo.h"
@@ -107,8 +108,13 @@ static int IRAM_ATTR slot_for_mac(const uint8_t *mac) {
             g_app.beacon[i].last_counter = 0;
             g_app.beacon[i].stereo_ring_head = 0;
             g_app.beacon[i].phase_baseline_valid = false;
-            g_app.beacon[i].slope_baseline = 0;
-            g_app.beacon[i].intercept_baseline = 0;
+            // Both the LOCAL reference and the derived disparity: a
+            // re-discovered beacon that kept a stale local baseline would
+            // have its disparity derived from the previous session.
+            g_app.beacon[i].slope_baseline_local     = 0;
+            g_app.beacon[i].intercept_baseline_local = 0;
+            g_app.beacon[i].slope_baseline           = 0;
+            g_app.beacon[i].intercept_baseline       = 0;
             g_app.beacon[i].aoa_rad = 0;
             g_app.beacon[i].aoa_conf = 0;
             // Seqlock must start EVEN (= no write in flight), or the
@@ -150,6 +156,19 @@ static void IRAM_ATTR csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
     const int8_t *buf = (const int8_t*)info->buf;
 
     BeaconState &b = g_app.beacon[slot];
+
+    // ── PHY metadata: capture RAW, smooth on core 1 ───────────────
+    // Byte stores only.  These come straight off rx_ctrl alongside the
+    // CSI buffer and cost nothing here; the EMAs are folded in
+    // csi_process_frames() so this callback keeps its "no float math"
+    // property.
+    b.rx_rssi_raw   = (int8_t)info->rx_ctrl.rssi;
+    b.rx_noise_raw  = (int8_t)info->rx_ctrl.noise_floor;
+    b.rx_sig_mode   = (uint8_t)info->rx_ctrl.sig_mode;
+    b.rx_rate       = (uint8_t)info->rx_ctrl.rate;
+    b.rx_mcs        = (uint8_t)info->rx_ctrl.mcs;
+    b.rx_cwb        = (uint8_t)info->rx_ctrl.cwb;
+    b.rx_meta_fresh = true;
 
     // ── v0.9: publish raw I/Q under a seqlock; do NO float math here ──
     //
@@ -306,7 +325,17 @@ static inline float beacon_rate_hz(const BeaconState &b) {
         if (hz > 200.0f) hz = 200.0f;
         return hz;
     }
-    return SAMPLE_RATE_HZ;   // not enough frames yet: assume stock rate
+    // NEVER assume the stock rate.  100 Hz is a buffer-sizing ceiling and
+    // a beacon's boot default -- it is not a rate this project ever
+    // operates at, and assuming it here designed the lowpass at 11 Hz and
+    // sized the moving-variance window at 50 samples for a beacon that
+    // was about to run at 30.  Every filter downstream inherited that.
+    //
+    // Before an estimate exists, assume the rate we COMMAND.  If the
+    // beacon never obeys, the enforcer notices and re-commands; until
+    // then the filter chain is at least designed for the rate we are
+    // trying to be at rather than one we refuse to use.
+    return (float)BEACON_REQUEST_RATE_HZ;
 }
 
 static float lowpass(BeaconState &b, float x) {
@@ -619,6 +648,116 @@ void csi_beacon_enable_sleep_after_cal() {
 #endif
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  BEACON SLOTS  —  display identity, decoupled from hardware id
+// ═══════════════════════════════════════════════════════════════
+// The map used to label beacons by their HARDWARE id, which meant the
+// drawn ring was only correct if the operator had also physically placed
+// the boxes in id order.  Nothing enforced that, so "walk to B2" pointed
+// at a position the real B2 might be nowhere near.
+//
+// Inverted: B1..Bn on screen are SLOTS -- positions in the nominal ring.
+// The walk sends the operator to a slot, and whichever physical beacon
+// turns out to be standing there gets BOUND to it.  The operator only
+// ever deals with the on-screen number; the hardware id lives behind the
+// binding and nothing above this layer needs to know it.
+//
+// The binding is also a measurement, not a label: once slot k is bound,
+// that beacon's assumed position is corrected to slot k's ring position,
+// so the geometry stops being a guess about placement order.
+static uint8_t s_slot_bind[MAX_BEACONS] = {0};   // slot -> hardware id, 0 = unbound
+
+void beacon_slots_reset() {
+    for (int i = 0; i < MAX_BEACONS; i++) s_slot_bind[i] = 0;
+}
+
+uint8_t beacon_slot_id(int slot) {
+    if (slot < 0 || slot >= MAX_BEACONS) return 0;
+    return s_slot_bind[slot];
+}
+
+int beacon_slot_of_id(uint8_t id) {
+    if (id == 0) return -1;
+    for (int i = 0; i < MAX_BEACONS; i++) if (s_slot_bind[i] == id) return i;
+    return -1;
+}
+
+int beacon_slots_bound() {
+    int n = 0;
+    for (int i = 0; i < MAX_BEACONS; i++) if (s_slot_bind[i]) n++;
+    return n;
+}
+
+bool beacon_slot_bind(int slot, uint8_t id) {
+    if (slot < 0 || slot >= MAX_BEACONS || id == 0) return false;
+    // A beacon can only occupy one slot.  Re-visiting a beacon that was
+    // already bound elsewhere means the operator walked to the wrong box
+    // -- release the old slot rather than listing it twice.
+    const int prev = beacon_slot_of_id(id);
+    if (prev >= 0 && prev != slot) {
+        s_slot_bind[prev] = 0;
+        MSLOG("[slot] B%d released (its beacon turned up at B%d)\n",
+              prev + 1, slot + 1);
+    }
+    s_slot_bind[slot] = id;
+
+    // Correct the geometry: this beacon really is at slot's ring position.
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        if (!g_app.beacon[i].active || g_app.beacon[i].id != id) continue;
+        float sx, sy;
+        csi_slot_nominal_pos(slot, &sx, &sy);
+        g_app.beacon[i].pos_x = sx;
+        g_app.beacon[i].pos_y = sy;
+        break;
+    }
+    MSLOG("[slot] B%d <- beacon id %u\n", slot + 1, (unsigned)id);
+    return true;
+}
+
+// Nominal ring position for a slot, in the same cm-scale units
+// csi_assign_default_geometry uses.  This is the ONE definition of where
+// slot k sits; the map, the geometry correction and the landmark derive
+// all read it so they cannot drift apart.
+void csi_slot_nominal_pos(int slot, float *out_x, float *out_y) {
+    const int n = g_app.beacon_count < 1 ? 1 : g_app.beacon_count;
+    const float side = (n <= 3) ? 300.0f : (n == 4 ? 350.0f : 400.0f);
+    const float R = side / (2.0f * sinf((float)M_PI / (float)n));
+    const float t = (float)M_PI / 2.0f + 2.0f * (float)M_PI * (float)slot / (float)n;
+    if (out_x) *out_x = R * cosf(t);
+    if (out_y) *out_y = R * sinf(t);
+}
+
+// ── WHICH PHYSICAL BOX IS THIS? ───────────────────────────────
+// The map draws a NOMINAL ring by beacon id, so it can say "walk to B2"
+// while the operator has three identical boxes on the floor and no way
+// to tell which is which.  Labelling them by hand only works if they are
+// also PLACED in id order, which nothing enforces.
+//
+// The radio already knows.  Standing next to a beacon perturbs its link
+// far harder than any other, because the body is in the near field of
+// that path.  Return the id of the beacon whose perturbation dominates,
+// and how dominant it is, so the UI can say "you are standing at B2"
+// and refuse to guess when nothing stands out.
+//
+// margin = (top - second) / top, 0..1.  Below ~0.25 the answer is not
+// trustworthy and the caller should show nothing.
+uint8_t csi_nearest_beacon(float *out_margin) {
+    float best = -1.0f, second = -1.0f;
+    uint8_t best_id = 0;
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        const BeaconState &b = g_app.beacon[i];
+        if (!b.active) continue;
+        if ((millis() - b.last_frame_ms) > 400) continue;   // stale
+        const float m = b.link_metric_ema;
+        if (m > best) { second = best; best = m; best_id = b.id; }
+        else if (m > second) { second = m; }
+    }
+    if (best <= 0.0f) { if (out_margin) *out_margin = 0.0f; return 0; }
+    if (second < 0.0f) second = 0.0f;      // only one beacon alive
+    if (out_margin) *out_margin = (best - second) / best;
+    return best_id;
+}
+
 void csi_beacon_keepalive() {
 #if MS_BEACON_CONTROL
     const uint32_t now = millis();
@@ -666,7 +805,14 @@ void csi_beacon_enforce_rate() {
         // delivery loss, and no amount of re-commanding cures that.
         if (b.inter_arrival_ms_ema <= 0.5f) continue;   // no estimate yet
         const int observed = (int)(1000.0f / b.inter_arrival_ms_ema + 0.5f);
-        const int stock    = (int)SAMPLE_RATE_HZ;
+        // The beacon now BOOTS at the operating rate, so "reverted to
+        // stock" no longer means 100 Hz -- it means a beacon that never
+        // heard us and is free-running at its own default, which is the
+        // same rate we want.  There is nothing to correct in that case.
+        //
+        // What still needs correcting is a beacon running WILDLY off,
+        // which now means the legacy firmware or a corrupted period.
+        const int stock    = (int)SAMPLE_RATE_HZ;   // legacy 100 Hz, if ever seen
         const int midpoint = (want + stock) / 2;
         if (observed < midpoint) continue;              // obeying; leave it alone
 
@@ -776,6 +922,7 @@ void csi_assign_default_geometry(float side_cm) {
 }
 
 void csi_reset_filters(bool hard) {
+    bool s_drop_peer_stash = false;
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active) continue;
@@ -817,6 +964,14 @@ void csi_reset_filters(bool hard) {
             b.phase_baseline_valid = false;
             b.aoa_conf = 0;
             b.aoa_rad  = 0;
+            // The stereo phase reference, both halves.  Leaving the LOCAL
+            // value behind would let the next calibration derive its
+            // disparity from the previous room.
+            b.slope_baseline_local     = 0;
+            b.intercept_baseline_local = 0;
+            b.slope_baseline           = 0;
+            b.intercept_baseline       = 0;
+            s_drop_peer_stash = true;
             // Clear stereo ring
             for (int r = 0; r < STEREO_MAG_PACK_MAX; r++) {
                 b.stereo_ring[r].counter = 0;
@@ -825,6 +980,9 @@ void csi_reset_filters(bool hard) {
             b.stereo_ring_head = 0;
         }
     }
+    // The peer's stashed baselines belong to the calibration we just
+    // discarded.
+    if (s_drop_peer_stash) stereo_reset_peer_baselines();
 }
 
 // v0.9: seqlock reader.  Takes a consistent snapshot of the raw I/Q the
@@ -859,11 +1017,41 @@ static bool decode_iq_snapshot(BeaconState &b) {
 }
 #endif
 
+// Fold the raw PHY metadata the callback captured into smooth features.
+// Runs on core 1.  Alpha 0.15 matches the inter-arrival EMA so all three
+// RF-metadata channels share one response time (~7 frames).
+static void fold_phy_metadata(BeaconState &b) {
+    if (!b.rx_meta_fresh) return;
+    b.rx_meta_fresh = false;
+
+    const float rssi = (float)b.rx_rssi_raw;
+    b.rssi_ema = (b.rssi_ema == 0.0f) ? rssi : (b.rssi_ema + 0.15f * (rssi - b.rssi_ema));
+
+    const float nf = (float)b.rx_noise_raw;
+    b.noise_floor_ema = (b.noise_floor_ema == 0.0f) ? nf
+                      : (b.noise_floor_ema + 0.15f * (nf - b.noise_floor_ema));
+
+    // ONE bounded profile from the PHY mode/rate metadata.  The legacy
+    // `rate` field is only meaningful for non-HT packets; HT packets
+    // report MCS instead, so reading `rate` unconditionally would be
+    // reading a field the PHY never filled.  Neither path claims Mbps.
+    float profile;
+    if (b.rx_sig_mode == 0) profile = (float)b.rx_rate / 15.0f;
+    else profile = 0.25f + 0.65f * ((float)b.rx_mcs / 76.0f)
+                         + 0.10f * (float)b.rx_cwb;
+    if (profile < 0.0f) profile = 0.0f;
+    if (profile > 1.0f) profile = 1.0f;
+    b.phy_rate_ema = (b.phy_rate_ema == 0.0f) ? profile
+                   : (b.phy_rate_ema + 0.15f * (profile - b.phy_rate_ema));
+}
+
 int csi_process_frames() {
     int processed = 0;
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
-        if (!b.active || !b.dirty) continue;
+        if (!b.active) continue;
+        fold_phy_metadata(b);        // cheap, and independent of `dirty`
+        if (!b.dirty) continue;
 #if MS_CSI_SEQLOCK
         // Convert the raw I/Q the callback published.  Clear `dirty` only
         // after a successful decode so a contended frame is retried
@@ -987,7 +1175,11 @@ static int baseline_target_frames(const BeaconState &b) {
 // How long the baseline will actually take at the rate beacons are
 // currently transmitting.  100 Hz stock -> 5 s; 20 Hz -> 25 s.
 int csi_baseline_expected_seconds() {
-    float slowest = SAMPLE_RATE_HZ;
+    // Seed from the COMMANDED rate, not the stock ceiling: with no active
+    // beacons this reported a baseline duration computed for 100 Hz, a
+    // rate we never run at, so the figure shown to the user was wrong
+    // by more than 3x.
+    float slowest = (float)BEACON_REQUEST_RATE_HZ;
     bool any = false;
     for (int i = 0; i < MAX_BEACONS; i++) {
         if (!g_app.beacon[i].active) continue;
@@ -1155,6 +1347,22 @@ void csi_update_spatial() {
         while (dphase >  (float)M_PI) dphase -= 2.0f * (float)M_PI;
         while (dphase < -(float)M_PI) dphase += 2.0f * (float)M_PI;
         obs.beacon[i].phase_perturbation = dphase;
+
+        // ── v1.0 widening ─────────────────────────────────────────
+        obs.beacon[i].temporal_delta  = b.feat_temporal_delta;
+        // Scaled against this beacon's OWN learned threshold, so an
+        // intrinsically quiet link is not punished for being quiet;
+        // floored at 0.25 so no beacon drops out of the solve for being
+        // calm, neutral 0.5 before a threshold exists.
+        obs.beacon[i].quality =
+            (b.threshold > 1e-6f)
+              ? fminf(1.0f, b.moving_variance / (b.threshold * 4.0f) + 0.25f)
+              : 0.5f;
+        obs.beacon[i].rssi            = b.rssi_ema;
+        obs.beacon[i].noise_floor     = b.noise_floor_ema;
+        obs.beacon[i].phy_rate        = b.phy_rate_ema;
+        obs.beacon[i].interarrival_ms = b.inter_arrival_ms_ema;
+
         // AoA (stereo only, and only if fresh within 500ms)
         if (g_app.peer.role == ROLE_PRIMARY
             && g_app.peer.peer_present
@@ -1182,6 +1390,19 @@ void csi_update_spatial() {
         g_app.alert_latched = true;
         g_app.last_alert_ms = millis();
     }
+
+    // ── TACTICAL RF CHART ─────────────────────────────────────────
+    // The single inference boundary into the Rust core.
+    //
+    // Both calls take the SAME FrameObservation the Full Mode solver
+    // just consumed -- there is deliberately no second sensor path.
+    // tactical_observe() feeds whatever ceremony is open (a deployment
+    // leg, a circuit, a baseline, an active check); tactical_runtime_
+    // observe() runs the live solve and returns early unless a baseline
+    // and a finalized model both exist.  Before either is true this
+    // costs one call and a flag test.
+    tactical_observe(obs);
+    tactical_runtime_observe(obs);
 }
 
 uint32_t csi_frames_seen() { return g_app.total_csi_frames; }

@@ -33,7 +33,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
 #include <esp_sleep.h>
@@ -56,7 +55,7 @@ enum : uint8_t {
     BEACON_OP_PING              = 1,   // reply with PONG
     BEACON_OP_SET_RATE          = 2,   // arg_u16 = Hz (1..200)
     BEACON_OP_SET_SLEEP         = 3,   // arg_u16 = 0/1 (light sleep between bursts)
-    BEACON_OP_RESTORE_DEFAULTS  = 4,   // back to 100 Hz, no sleep
+    BEACON_OP_RESTORE_DEFAULTS  = 4,   // back to 30 Hz, no sleep
 };
 
 // Wire packet formats.  Kept POD; ESP-NOW passes raw bytes.
@@ -83,7 +82,19 @@ struct BeaconPong {
 };
 
 // ── Runtime state (only NEW stuff — original state below) ─────
-static uint32_t s_tx_period_ms   = 10;    // 100 Hz default (10 ms period)
+// BOOT RATE IS THE OPERATING RATE.
+//
+// This was 10 ms (100 Hz) purely for compatibility with a stock receiver
+// that no longer exists in this project.  Nothing wants 100 Hz: the
+// scene solver consumes at 25 Hz, capture decimates to 20, and human
+// gross motion tops out near 5 -- so the legacy default was three times
+// the airtime, three times the power, and a rate the filter chain then
+// had to be talked down from on every boot.
+//
+// Booting at the operating rate also means a beacon is USEFUL before it
+// is ever commanded, and light sleep is legal from the first frame
+// because the period already exceeds the beacon's own >30 ms guard.
+static uint32_t s_tx_period_ms   = 33;    // 30 Hz operating rate
 // v0.9 COMMANDED MODE ONLY.  Exact period in microseconds, and an
 // absolute next-transmit deadline.
 //
@@ -102,7 +113,7 @@ static uint32_t s_tx_period_ms   = 10;    // 100 Hz default (10 ms period)
 // Number of interleave slots the transmit period is divided into.  Must
 // match the receiver's MAX_BEACONS so every possible id gets its own.
 #define BEACON_MAX_SLOTS 6
-static uint32_t s_tx_period_us   = 10000;
+static uint32_t s_tx_period_us   = 33333;
 static int64_t  s_next_tx_us     = 0;
 static bool     s_precise_timing = false;
 static uint8_t  s_sleep_fail_count = 0;
@@ -113,7 +124,6 @@ static uint32_t s_cmd_ignored    = 0;     // packets without our magic
 // ── Original beacon state (verbatim) ──────────────────────────
 static uint8_t  beacon_id          = 1;
 static uint32_t beacon_pkt_count   = 0;
-static char     beacon_ssid[32]    = "CSI-Beacon-1";
 static uint8_t  fixed_mac[6]       = {0x1A, 0x00, 0x00, 0x00, 0x00, 0x01};
 
 #if defined(LED_BUILTIN)
@@ -124,7 +134,6 @@ static uint8_t  fixed_mac[6]       = {0x1A, 0x00, 0x00, 0x00, 0x00, 0x01};
   #define BEACON_LED -1
 #endif
 
-static WiFiUDP udp;
 static String  serialBuf;
 static const uint8_t broadcast_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -251,15 +260,15 @@ static void apply_command(const BeaconCommand &c, const uint8_t src[6]) {
         } break;
 
         case BEACON_OP_RESTORE_DEFAULTS: {
-            s_tx_period_ms     = 10;
-            s_tx_period_us     = 10000;
+            s_tx_period_ms     = 33;      // our rate, not the legacy one
+            s_tx_period_us     = 33333;
             s_precise_timing   = false;    // back to stock timing exactly
             s_next_tx_us       = 0;
             s_sleep_between    = false;
             s_sleep_fail_count = 0;
             esp_wifi_set_ps(WIFI_PS_NONE);
             esp_wifi_set_channel(11, WIFI_SECOND_CHAN_BELOW);
-            Serial.println("[BEACON] RESTORE_DEFAULTS (100 Hz, no sleep)");
+            Serial.println("[BEACON] RESTORE_DEFAULTS (30 Hz, no sleep)");
         } break;
 
         default:
@@ -297,7 +306,15 @@ void startBeacon() {
     WiFi.mode(WIFI_OFF);
     delay(100);
 
-    WiFi.mode(WIFI_AP_STA);
+    // Beacon is a pure RF/ESP-NOW instrument.  No SoftAP.
+    //
+    // An AP emits unsolicited 802.11 beacon frames roughly every 100 ms on
+    // the same channel we are measuring on.  That is airtime spent on
+    // nothing, power spent on nothing, and -- worse -- a SECOND
+    // uncontrolled CSI source injected into the environment the receiver
+    // is trying to characterise.  ESP-NOW needs no association, so the AP
+    // was never doing any work.
+    WiFi.mode(WIFI_STA);
 
     fixed_mac[5] = beacon_id;
     esp_err_t mac_err = esp_wifi_set_mac(WIFI_IF_STA, fixed_mac);
@@ -306,9 +323,6 @@ void startBeacon() {
     esp_wifi_get_mac(WIFI_IF_STA, check_mac);
     Serial.printf("[BEACON] STA MAC set: %02X:%02X:%02X:%02X:%02X:%02X\n",
         check_mac[0], check_mac[1], check_mac[2], check_mac[3], check_mac[4], check_mac[5]);
-
-    snprintf(beacon_ssid, sizeof(beacon_ssid), "CSI-Beacon-%d", beacon_id);
-    WiFi.softAP(beacon_ssid, NULL, 11);
 
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
@@ -335,8 +349,6 @@ void startBeacon() {
     esp_err_t rc = esp_now_set_peer_rate_config(broadcast_addr, &rate_cfg);
     if (rc != ESP_OK) Serial.printf("[BEACON] Rate config not supported (%d), using default\n", rc);
 
-    udp.begin(55555);
-
     beacon_pkt_count = 0;
 }
 
@@ -360,8 +372,8 @@ void setup() {
     Serial.printf("[BEACON] ID=%d MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
         beacon_id, fixed_mac[0], fixed_mac[1], fixed_mac[2],
         fixed_mac[3], fixed_mac[4], fixed_mac[5]);
-    Serial.printf("[BEACON] SSID=%s CH=11 HT40 MCS0 (rate=%luHz)\n",
-        beacon_ssid, (unsigned long)(1000 / s_tx_period_ms));
+    Serial.printf("[BEACON] STA-only CH=11 HT40 MCS0 (rate=%luHz)\n",
+        (unsigned long)(1000 / s_tx_period_ms));
     Serial.println(F("[BEACON] Type 'beacon help' for commands"));
 }
 
@@ -397,16 +409,8 @@ void loop() {
         uint32_t count = beacon_pkt_count;
         esp_now_send(broadcast_addr, (const uint8_t*)&count, sizeof(count));
 
-        // UDP ping reply path (single-beacon fallback mode)
-        int pktSize = udp.parsePacket();
-        if (pktSize > 0) {
-            uint8_t buf[32];
-            udp.read(buf, sizeof(buf));
-            uint8_t reply[8] = {0xC5, 0x1B, beacon_id, (uint8_t)(count & 0xFF)};
-            udp.beginPacket(udp.remoteIP(), udp.remotePort());
-            udp.write(reply, 4);
-            udp.endPacket();
-        }
+        // UDP ping reply path removed with the SoftAP: it existed only so a
+        // phone could reach the beacon over its own AP, and there is no AP.
 
         beacon_pkt_count++;
 
@@ -508,8 +512,8 @@ void handleCommand(const String& cmd) {
         if (id >= 1 && id <= 8) {
             beacon_id = (uint8_t)id;
             startBeacon();
-            Serial.printf("[BEACON] ID=%d MAC=1A:00:00:00:00:%02X SSID=%s\n",
-                beacon_id, beacon_id, beacon_ssid);
+            Serial.printf("[BEACON] ID=%d MAC=1A:00:00:00:00:%02X\n",
+                          beacon_id, beacon_id);
         } else Serial.println(F("ERR: id 1-8"));
     } else if (sub.startsWith("rate ")) {
         int hz = sub.substring(5).toInt();
@@ -522,9 +526,9 @@ void handleCommand(const String& cmd) {
         s_sleep_between = (v != 0);
         Serial.printf("[BEACON] sleep=%d\n", (int)s_sleep_between);
     } else if (sub == "reset") {
-        s_tx_period_ms  = 10;
+        s_tx_period_ms  = 33;
         s_sleep_between = false;
-        Serial.println(F("[BEACON] defaults restored"));
+        Serial.println(F("[BEACON] defaults restored (30 Hz)"));
     } else if (sub == "status") {
         Serial.println(F("── CSI-Beacon-Extended Status ──"));
         Serial.printf("FW:      %s v%s\n", BEACON_FW_NAME, BEACON_FW_VERSION);
@@ -532,13 +536,11 @@ void handleCommand(const String& cmd) {
         Serial.printf("MAC:     %02X:%02X:%02X:%02X:%02X:%02X\n",
             fixed_mac[0], fixed_mac[1], fixed_mac[2],
             fixed_mac[3], fixed_mac[4], fixed_mac[5]);
-        Serial.printf("SSID:    %s\n", beacon_ssid);
         Serial.printf("CH:      11 (HT40)\n");
         Serial.printf("TX:      %lu (%luHz)\n",
             beacon_pkt_count, (unsigned long)(1000 / s_tx_period_ms));
         Serial.printf("Sleep:   %s\n", s_sleep_between ? "on" : "off");
         Serial.printf("Cmd RX:  %lu handled, %lu ignored\n", s_cmd_rx_count, s_cmd_ignored);
-        Serial.printf("AP:      %d client(s)\n", WiFi.softAPgetStationNum());
     } else if (sub == "restart") {
         ESP.restart();
     } else Serial.println(F("Unknown. Type 'beacon help'"));

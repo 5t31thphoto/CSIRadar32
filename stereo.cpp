@@ -70,12 +70,18 @@ void stereo_snapshot_baseline(BeaconState &b) {
     float slope, intercept;
     int n = stereo_fit_line(b.phase_baseline, slope, intercept);
     if (n >= 3) {
-        b.slope_baseline     = slope;
-        b.intercept_baseline = intercept;
+        // Keep the LOCAL value untouched; slope_baseline is a derived
+        // quantity from here on.
+        b.slope_baseline_local     = slope;
+        b.intercept_baseline_local = intercept;
+        b.slope_baseline           = slope;
+        b.intercept_baseline       = intercept;
         b.phase_baseline_valid = true;
     } else {
-        b.slope_baseline = 0;
-        b.intercept_baseline = 0;
+        b.slope_baseline_local     = 0;
+        b.intercept_baseline_local = 0;
+        b.slope_baseline           = 0;
+        b.intercept_baseline       = 0;
         b.phase_baseline_valid = false;
     }
 }
@@ -94,19 +100,35 @@ static StashedPeerBase s_peer_base_stash[16] = {};
 // b.slope_baseline / b.intercept_baseline.  Only run this ONCE per beacon
 // per calibration cycle.  We detect that by re-checking: if the beacon's
 // baseline slot is still "local only" we fold; otherwise skip.
+// Drop every stashed peer baseline.
+//
+// Folding is now non-destructive (derived from the untouched local
+// value), which fixed the triple-subtraction bug but removed the
+// "consumed" flag that used to expire a stash.  Without this, a
+// RE-calibration would derive its disparity from the PREVIOUS session's
+// peer baseline until a fresh packet happened to arrive -- trading one
+// silent phase error for another.
+//
+// Called from csi_reset_filters(hard), so the stash has exactly the
+// lifetime of the calibration it belongs to.
+void stereo_reset_peer_baselines() {
+    for (int i = 0; i < 16; i++) s_peer_base_stash[i].present = false;
+    MSLOGLN("[stereo] peer baseline stash cleared");
+}
+
 static void fold_disparity_baseline_locked(BeaconState &b) {
     if (!b.phase_baseline_valid) return;
     if (g_app.peer.role != ROLE_PRIMARY) return;
     if (b.id >= 16) return;
     if (!s_peer_base_stash[b.id].present) return;
-    // Local baseline currently holds LOCAL slope/intercept.  Replace with
-    // disparity baseline = local - peer.
-    b.slope_baseline     = b.slope_baseline     - s_peer_base_stash[b.id].slope;
-    b.intercept_baseline = b.intercept_baseline - s_peer_base_stash[b.id].intercept;
-    // Wrap intercept to [-π, π] for numerical hygiene.
-    b.intercept_baseline = wrap_pi(b.intercept_baseline);
-    // Mark stash consumed so we don't fold twice on re-cal without a fresh peer packet.
-    s_peer_base_stash[b.id].present = false;
+    // DERIVE from the untouched local value rather than mutating in
+    // place.  This is what makes a repeated packet harmless: the answer
+    // is recomputed, not compounded.  The stash is deliberately NOT
+    // cleared -- a duplicate simply produces the same result again.
+    b.slope_baseline     = b.slope_baseline_local
+                         - s_peer_base_stash[b.id].slope;
+    b.intercept_baseline = wrap_pi(b.intercept_baseline_local
+                         - s_peer_base_stash[b.id].intercept);
     MSLOG("[stereo] disparity baseline set B%u slope=%.4f int=%.3f\n",
                   (unsigned)b.id, b.slope_baseline, b.intercept_baseline);
 }

@@ -7,6 +7,10 @@
 //    field from current observation, temporal-linking into tracks.
 // ═══════════════════════════════════════════════════════════════
 #include "scene.h"
+#if defined(ARDUINO) || defined(ESP32)
+  #include <esp_heap_caps.h>
+#endif
+#include "csi.h"   // beacon slot bindings
 #include "peer.h"
 #include <math.h>
 #include <string.h>
@@ -98,9 +102,31 @@ struct CapFrame {
     uint8_t aoa_valid[MAX_BEACONS];
     uint8_t beacon_valid[MAX_BEACONS];
 };
-static CapFrame  s_cap_anchor[CAP_MAX_FRAMES];  // this-unit observations
+// ── CAPTURE RINGS LIVE IN PSRAM ───────────────────────────────
+// 2 x 256 CapFrames is ~44 KB of internal DRAM held for something that
+// is only touched while a capture window is OPEN.  Outside a ceremony
+// s_cap_kind is CAP_NONE, scene_observe() never enters the append
+// branch, and these bytes sit idle for the entire operating life of the
+// device.
+//
+// Access pattern makes them the safest possible PSRAM candidate:
+//   write  ~100 B at CAP_HZ (20 Hz) = 2 KB/s, during cal only
+//   read   once per capture window, when it closes, while the operator
+//          is standing still between landmarks
+// PSRAM sustains 40-80 MB/s.  2 KB/s is four orders of magnitude under
+// that, and NOTHING here runs at loop rate.
+//
+// The kernel table stays in DRAM by contrast: meas_model() scans all
+// 139 samples per candidate per solve at 25 Hz, random-access -- the
+// worst possible pattern for a cached bus.
+//
+// Allocation is late-bound and OPTIONAL.  If PSRAM is absent the
+// pointers fall back to static DRAM arrays and behaviour is identical,
+// because a device that cannot calibrate is worse than one that uses
+// more RAM.
+static CapFrame *s_cap_anchor = nullptr;
 static int       s_cap_anchor_len = 0;
-static CapFrame  s_cap_probe[CAP_MAX_FRAMES];   // peer PROBE-stream observations (ANCHOR-side only)
+static CapFrame *s_cap_probe  = nullptr;
 static int       s_cap_probe_len = 0;
 
 // Feature normalization ranges (per beacon), computed at finalize.
@@ -240,7 +266,37 @@ static bool cholesky_solve(float *A, float *b, float *x, int N) {
 // ═══════════════════════════════════════════════════════════════
 //  LIFECYCLE
 // ═══════════════════════════════════════════════════════════════
+// Bring the capture rings up.  Called from scene_begin(), which runs
+// once at boot before any ceremony can start.
+//
+// Deliberately not fatal: a DRAM fallback keeps calibration working on a
+// board whose PSRAM never initialised.  The log says which one you got,
+// because "cal behaves differently on this unit" is not something anyone
+// should have to guess at.
+static void cap_rings_begin() {
+    if (s_cap_anchor && s_cap_probe) return;
+    const size_t bytes = sizeof(CapFrame) * CAP_MAX_FRAMES;
+#if defined(ARDUINO) || defined(ESP32)
+    if (!s_cap_anchor)
+        s_cap_anchor = (CapFrame *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!s_cap_probe)
+        s_cap_probe  = (CapFrame *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+#endif
+    if (s_cap_anchor && s_cap_probe) {
+        MSLOG("[scene] capture rings in PSRAM: 2 x %u B = %u KB freed from DRAM\n",
+              (unsigned)bytes, (unsigned)(2 * bytes / 1024));
+        return;
+    }
+    // Fallback: static DRAM, exactly as before.
+    static CapFrame dram_anchor[CAP_MAX_FRAMES];
+    static CapFrame dram_probe[CAP_MAX_FRAMES];
+    if (!s_cap_anchor) s_cap_anchor = dram_anchor;
+    if (!s_cap_probe)  s_cap_probe  = dram_probe;
+    MSLOGLN("[scene] PSRAM unavailable - capture rings in DRAM (as before)");
+}
+
 void scene_begin() {
+    cap_rings_begin();
     scene_reset();
 }
 
@@ -410,13 +466,18 @@ void scene_landmark_pos(LandmarkId id, float *out_x, float *out_y) {
 //  CAL LIFECYCLE
 // ═══════════════════════════════════════════════════════════════
 void scene_cal_begin(CalMode mode) {
-    // ── LANDMINE E ────────────────────────────────────────────────
-    // scene_reset() zeroes s_lm_pos[].  Nothing re-derived it, so every
-    // landmark and beacon icon collapsed to the origin for the rest of
-    // the session -- the walk map showed all beacons stacked at the
-    // centre and the operator had nothing to navigate by.
-    scene_derive_landmarks_from_geometry();
     scene_reset();
+    // A new calibration re-learns which physical beacon sits at which
+    // on-screen slot; stale bindings from a previous room would place
+    // beacons where they are not.
+    beacon_slots_reset();
+    // ── LANDMINE E ────────────────────────────────────────────────
+    // scene_reset() zeroes s_lm_pos[], so the derive MUST come after it.
+    // I first put this call above the reset, which meant the reset wiped
+    // the landmarks four lines later and the map stayed piled on the
+    // origin exactly as before -- the same derive-then-reset ordering
+    // this fix exists to correct.
+    scene_derive_landmarks_from_geometry();
     s_cal_mode = mode;
     s_cal_active = true;
     s_empty_room_ready = false;

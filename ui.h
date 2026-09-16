@@ -30,7 +30,21 @@ void ui_cal_intro();
 // v0.9: "press the unit you will carry" — shown on BOTH units.
 void ui_pick_carry();
 // Anchor-side view of the same step: informational, no input.
-void ui_pick_carry_anchor();               // explain the walk
+void ui_pick_carry_anchor();
+
+// ── v1.0 MANTIS TACTICAL DEPLOYMENT ───────────────────────────
+// Explicit arguments rather than reading a scene struct: these screens
+// render state they are GIVEN, so they cannot drift out of step with
+// whatever the model happens to hold.
+// Shown on the splash while RIGHT is held: confirms the shortcut is armed.
+void ui_splash_tactical_hint();
+void ui_tactical_intro(bool can_adopt);
+void ui_tactical_deploy(uint8_t index, uint8_t total, bool capturing);
+void ui_tactical_return(bool capturing);
+void ui_tactical_circuit(bool capturing);
+void ui_tactical_baseline(float quality, bool contaminated);
+void ui_tactical_critique();
+void ui_tactical_check(const char *cue, float x, float y, bool capturing);               // explain the walk
 void ui_cal_anchor_place();        // stereo: place ANCHOR at origin
 void ui_cal_empty_room(uint32_t elapsed_ms);
 // Countdown shown before empty-room sampling begins.
@@ -55,10 +69,12 @@ void ui_csi_next_beacon();
 // v0.8: the row count is dynamic — the probe gains an undock row once
 // it has a usable kernel.  The state machine must use these rather than
 // a hardcoded 6 when wrapping the selection.
-#define UI_SETTINGS_MAX_ROWS      9
-#define UI_SETTINGS_ROW_TRIPWIRE  6   // stereo tripwire wiring
-#define UI_SETTINGS_ROW_DEBUG     7   // always present
-#define UI_SETTINGS_ROW_UNDOCK    8   // probe only, once a kernel exists
+#define UI_SETTINGS_MAX_ROWS      11
+#define UI_SETTINGS_ROW_TACTICAL  6   // start a tactical deployment
+#define UI_SETTINGS_ROW_REFIT     7   // re-fit the chart from the PSRAM archive
+#define UI_SETTINGS_ROW_TRIPWIRE  8   // stereo tripwire wiring
+#define UI_SETTINGS_ROW_DEBUG     9   // always present
+#define UI_SETTINGS_ROW_UNDOCK    10  // probe only, once a kernel exists
 bool ui_settings_undock_row_visible();
 int  ui_settings_row_count();
 void ui_settings(int selected_row);
@@ -88,3 +104,6 @@ void ui_sleep_arm(float progress);
 
 // Final "going to sleep" screen shown for a moment before deep sleep.
 void ui_going_to_sleep();
+// Put the LCD controller itself to sleep before its rail is cut.  Yanking
+// power from a panel mid-frame can latch its charge pumps.
+void ui_panel_sleep();

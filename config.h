@@ -171,7 +171,12 @@ static const int CSI_SEL_SC[CSI_SEL_COUNT] =
 // The live filter coefficients are computed per beacon from that
 // beacon's OWN measured inter-arrival time, so mixed-rate deployments
 // (a stock beacon alongside commanded ones) work correctly.
-#define SAMPLE_RATE_HZ          100.0f   // max / buffer sizing only
+// BUFFER-SIZING CEILING ONLY.  Nothing operates at this rate and nothing
+// may assume it: beacons boot at BEACON_REQUEST_RATE_HZ, the filter
+// chain derives from each beacon's measured cadence, and the only
+// remaining use of this constant is sizing MOVVAR_WIN and recognising a
+// legacy beacon that is running far too fast.
+#define SAMPLE_RATE_HZ          100.0f   // ceiling for buffer sizes, NOT a rate
 
 // The rate THIS project runs at.  Commanded to every beacon after
 // discovery, and re-commanded whenever a beacon is seen off-rate.
@@ -210,6 +215,23 @@ static const int CSI_SEL_SC[CSI_SEL_COUNT] =
 // the channel is re-asserted after every wake, and a 2 s TX-stall
 // watchdog restores the radio if a wake still goes wrong.
 #define BEACON_REQUEST_SLEEP    1
+
+// ── Beacon duty policy ────────────────────────────────────────
+// Light sleep is armed AFTER calibration and never during it.  The two
+// phases have genuinely different priorities:
+//
+//   CAL      every frame is a measurement being recorded into a model
+//            that cannot be re-derived later.  A dropped transmit is a
+//            hole in the training data, so the beacon runs flat out and
+//            we accept the power.
+//   RUNTIME  the model exists; a dropped frame costs one observation out
+//            of thirty per second, and the tracker already tolerates far
+//            worse.  Here power matters and accuracy barely moves.
+//
+// At 30 Hz the period is 33 ms and a transmission plus turnaround is
+// ~2 ms, so the radio is idle ~94% of the time.  Sleeping that idle
+// window is most of the available saving and costs nothing measurable.
+#define BEACON_IDLE_SLEEP_FRAC  0.85f   // of each period, post-cal
 
 // Re-command a beacon whose reported/observed rate has drifted from
 // what we asked for (it rebooted, or missed the original broadcast).
@@ -322,6 +344,10 @@ static const int CSI_SEL_SC[CSI_SEL_COUNT] =
 #define PIN_BTN_LEFT            0
 #define PIN_BTN_RIGHT           14
 #define PIN_LCD_POWER_ON        15
+// Backlight enable.  The sleep path never touched this, so the panel LED
+// driver stayed powered through deep sleep -- by far the largest drain
+// on the board and the reason the units were flattening overnight.
+#define PIN_LCD_BACKLIGHT       38
 #define BTN_DEBOUNCE_MS         20
 #define BTN_LONG_PRESS_MS       650
 #define BTN_COMBO_MIN_MS        30
@@ -597,6 +623,26 @@ enum AppState : uint8_t {
     ST_MOBILE_PROBE,          // probe undocked: self-locates, shows anchor tracks
     ST_DEBUG_LOG,             // v0.9: in-RAM log viewer (Settings -> Debug log)
     ST_PICK_CARRY,            // v0.9: user presses the unit they will carry
+
+    // ── v1.0 MANTIS TACTICAL DEPLOYMENT ───────────────────────────
+    // Appended at the END so the peer state-hint byte stays compatible
+    // with a unit running older firmware.
+    //
+    // A deliberately different ceremony from Full Mode: no landmark
+    // script, no rotations, no fixed empty-room wait.  The operator
+    // carries beacons out one at a time, returns, walks the perimeter
+    // once, and the model is built out of that walk.
+    ST_TACTICAL_INTRO,        // explain the deployment, confirm beacons
+    ST_TACTICAL_DEPLOY,       // carry beacon N out and place it
+    ST_TACTICAL_RETURN,       // walk back to the anchor with the probe
+    ST_TACTICAL_CIRCUIT,      // one lap of the perimeter -> cyclic s
+    ST_TACTICAL_BASELINE,     // adaptive quiet-room baseline
+    ST_TACTICAL_CRITIQUE,     // finalize, then ask what it still needs
+    ST_TACTICAL_CHECK,        // information-directed field check
+
+    // Sentinel.  Keep LAST.  Peer state hints arrive as a raw byte off
+    // the air and are range-checked against this before being acted on.
+    ST_COUNT
 };
 
 // Dashboard sub-views.  RADAR is the star; the others are diagnostic.
@@ -608,6 +654,10 @@ enum DashView : uint8_t {
     DV_LINKS,        // per-beacon amplitude/phase perturbation bars
     DV_CSI,          // per-beacon subcarrier plot (raw)
     DV_PEER,         // peer link diagnostics
+    // v1.0: the tactical RF chart's own view -- the learned field, its
+    // tracks, the perimeter contact.  Sits at the END so existing view
+    // indices are unchanged.
+    DV_TACTICAL,
     DV_COUNT
 };
 
@@ -757,6 +807,19 @@ struct BeaconState {
     // passed by name to stereo_fit_line() in stereo_snapshot_baseline(),
     // which is why a grep for indexed access misses it.
     float phase_baseline[CSI_NUM_SUBCARRIERS];
+    // ── Non-destructive disparity baseline (report bug 2) ─────────
+    // These used to be MUTATED in place by subtracting the peer's
+    // values.  The secondary sends each baseline three times because
+    // ESP-NOW is unacknowledged at that layer, and the receive path
+    // re-armed the stash on every copy -- so the peer baseline was
+    // subtracted two or three times and the stereo phase reference was
+    // silently wrong by a multiple of itself.
+    //
+    // The LOCAL value is kept separately and never modified; the
+    // disparity is DERIVED from it, so folding is idempotent by
+    // construction and a duplicate packet recomputes the same answer
+    // instead of compounding.
+    float slope_baseline_local, intercept_baseline_local;
     float slope_baseline, intercept_baseline;
     bool  phase_baseline_valid;
 
@@ -816,6 +879,30 @@ struct BeaconState {
     // on each frame ingest.  UI translates the number into a mode label
     // (e.g. <30ms → "50Hz normal"; >100ms → "5Hz+sleep extended").
     float    inter_arrival_ms_ema;
+
+    // ── PHY-layer metadata (v1.0) ─────────────────────────────────
+    // Not derived from CSI.  The PHY reports an RF noise floor and the
+    // received PHY-rate/MCS alongside every CSI buffer, and both move
+    // when interference, fading or blockage change -- often while a
+    // single CSI frame still looks perfectly benign.  Packet cadence is
+    // a third such observable: blockage disturbs the arrival process.
+    //
+    // CAPTURED RAW, SMOOTHED LATER.  The callback runs in the Wi-Fi task
+    // on core 0, where the seqlock rework deliberately removed all float
+    // work.  These are byte stores there; csi_process_frames() folds the
+    // EMAs on core 1.  Doing the EMA in the callback would undo that
+    // decision for no benefit.
+    volatile int8_t  rx_rssi_raw;
+    volatile int8_t  rx_noise_raw;
+    volatile uint8_t rx_sig_mode;    // 0 = non-HT (legacy `rate` valid)
+    volatile uint8_t rx_rate;        // legacy rate index, non-HT only
+    volatile uint8_t rx_mcs;         // HT only
+    volatile uint8_t rx_cwb;         // channel bandwidth flag
+    volatile bool    rx_meta_fresh;  // a frame arrived since the last fold
+
+    float    rssi_ema;
+    float    noise_floor_ema;
+    float    phy_rate_ema;
 
     // v0.9: what we actually COMMANDED, and what the beacon reported
     // back.  Previously the UI only had inter_arrival_ms_ema and
@@ -938,6 +1025,10 @@ enum : uint8_t {
     // v0.9: the unit the user pressed tells the other one it is the
     // anchor.  Roles are a user decision, not a MAC-order guess.
     PEER_OP_CAL_ROLE_ANCHOR = 11,
+    // v1.0: which beacon the tactical deployment is on, so the ANCHOR
+    // renders the same step the operator is actually performing instead
+    // of being stuck on the first one.
+    PEER_OP_TAC_STEP        = 12,
 };
 
 struct PeerBaselinePacket {
@@ -1134,6 +1225,24 @@ struct FrameObservation {
         float   phase_perturbation;    // wrap-π delta from phase baseline
         float   aoa_rad;
         float   aoa_conf;
+
+        // ── v1.0 observation widening ─────────────────────────────
+        // Additive.  The Full Mode solver reads none of these, so its
+        // behaviour is bit-identical; they exist for the tactical RF
+        // chart, whose feature vector is 13 wide per beacon.
+        //
+        // The last three are PHY metadata rather than channel state:
+        // noise floor, PHY-rate profile and packet cadence all move when
+        // interference or blockage changes, often while a single CSI
+        // frame still looks benign.  They are bounded encodings, NOT
+        // calibrated dBm/Mbps, and nothing downstream treats them as a
+        // distance.
+        float   temporal_delta;
+        float   quality;           // 0..1 confidence in this beacon now
+        float   rssi;              // smoothed, raw dBm scale
+        float   noise_floor;       // smoothed, raw scale
+        float   phy_rate;          // 0..1 normalised PHY profile
+        float   interarrival_ms;   // smoothed packet cadence
     } beacon[MAX_BEACONS];
     uint8_t n_beacons;
 };
@@ -1176,6 +1285,15 @@ struct AppContext {
     // the anchor tracks the probe's undock state separately (it
     // learns of it via PEER_OP_UNDOCK_PROBE).
     bool        probe_undocked;
+    // v1.0: the operator asked for a tactical deployment (splash hold, or
+    // the discovery shortcut).  Discovery still runs -- tactical needs to
+    // know which beacons exist -- but it hands over instead of going to
+    // the Full Mode geometry guide.
+    bool        tactical_requested;
+    // Mirrored tactical progress, so the ANCHOR renders the step the
+    // operator is on rather than the one it started at.
+    uint8_t     tac_peer_step;
+    bool        tac_peer_capturing;
 
     // v0.9 — tripwire topology + anchor→probe mirror state.
     // TW_REMOTE: the anchor owns the tripwire and mirrors it to the

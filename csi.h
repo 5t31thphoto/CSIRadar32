@@ -50,6 +50,22 @@ void csi_beacon_apply_run_config();         // ping + set rate + set sleep
 void csi_beacon_enforce_rate();
 // PING-only upkeep, safe to run DURING calibration: carries no config so
 // it cannot change a beacon's rate mid-capture.
+// Which beacon is the operator standing at?  Returns its id, or 0 when
+// nothing dominates.  out_margin (0..1) is the confidence; below ~0.25
+// the caller should show nothing rather than guess.
+// ── Beacon slots ──────────────────────────────────────────────
+// On-screen B1..Bn are SLOTS in the nominal ring, not hardware ids.  The
+// walk binds whichever physical beacon is found standing at each slot,
+// so the operator only ever deals with the number on the map.
+void    beacon_slots_reset();
+bool    beacon_slot_bind(int slot, uint8_t id);
+uint8_t beacon_slot_id(int slot);        // 0 = slot not yet bound
+int     beacon_slot_of_id(uint8_t id);   // -1 = this beacon has no slot
+int     beacon_slots_bound();
+void    csi_slot_nominal_pos(int slot, float *out_x, float *out_y);
+
+uint8_t csi_nearest_beacon(float *out_margin);
+
 void csi_beacon_keepalive();
 // One-shot: arm beacon light-sleep AFTER cal is accepted.  Never during.
 void csi_beacon_enable_sleep_after_cal();

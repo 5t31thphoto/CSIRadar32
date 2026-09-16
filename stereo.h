@@ -48,6 +48,9 @@ void stereo_ingest_peer_summary(const PeerCsiSummary &pkt);
 // local baseline is already valid for this beacon, fold immediately into
 // the disparity baseline.  Called from peer_handle_baseline.
 void stereo_ingest_peer_baseline(const PeerBaselinePacket &pkt);
+// Drop stashed peer baselines.  Their lifetime is one calibration; see
+// the note in stereo.cpp for why folding alone no longer expires them.
+void stereo_reset_peer_baselines();
 
 // Called at the end of csi_baseline_finalize on both units.  On SECONDARY,
 // transmits our per-beacon baseline to primary.  On PRIMARY, folds any

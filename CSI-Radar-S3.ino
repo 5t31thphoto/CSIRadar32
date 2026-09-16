@@ -36,6 +36,9 @@
 #include "stereo.h"
 #include "scene.h"
 #include "wizard.h"
+#include "rfcore.h"      // -I rust/rfcore supplied by the build flags
+#include "rfarchive.h"   // PSRAM cold tier for the response archive
+#include "tactical.h"    // MANTIS tactical deployment ceremony
 
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
@@ -43,8 +46,71 @@
 
 AppContext g_app = {};
 
+// ── Rust FFI ABI guard ────────────────────────────────────────
+// MantisRfNode/Snapshot/Check are declared TWICE -- once in rfcore.h for
+// C++ and once in rust/rfcore/src/lib.rs for Rust.  Nothing links the
+// two, so a field added on one side and not the other silently reshapes
+// every struct crossing the boundary and the inference reads garbage
+// with no compiler anywhere to catch it.  The Rust side exports its own
+// sizeof() precisely for this, and nothing was calling them.
+//
+// A mismatch disables the model rather than feeding it misaligned data.
+static bool s_rf_abi_ok = false;
+static bool rf_abi_check() {
+    const bool ok =
+        mantis_rf_sizeof_node()     == sizeof(MantisRfNode) &&
+        mantis_rf_sizeof_snapshot() == sizeof(MantisRfSnapshot) &&
+        mantis_rf_sizeof_check()    == sizeof(MantisRfCheck);
+    if (!ok) {
+        MSLOG("[rf] ABI MISMATCH node %u/%u snap %u/%u check %u/%u\n",
+              (unsigned)mantis_rf_sizeof_node(),     (unsigned)sizeof(MantisRfNode),
+              (unsigned)mantis_rf_sizeof_snapshot(), (unsigned)sizeof(MantisRfSnapshot),
+              (unsigned)mantis_rf_sizeof_check(),    (unsigned)sizeof(MantisRfCheck));
+    }
+    return ok;
+}
+
 // Forward decls needed by enter_state's arming logic.
 static bool is_cal_state(AppState s);
+static bool is_tactical_state(AppState s);
+
+// ── GEOMETRY MUST EXIST WHEREVER IT IS USED ───────────────────
+// csi_assign_default_geometry() was only ever called at the discovery
+// EXIT and in the settings mode-cycle.  The ANCHOR reaches calibration
+// by following a peer state hint and runs neither, so its beacon
+// pos_x/pos_y stayed at (0,0) for the whole session.
+//
+// scene_derive_landmarks_from_geometry() then faithfully derived
+// landmarks from all-zero positions, so every beacon, every midpoint and
+// the centroid landed on the origin -- the walk map showed the whole
+// room piled in the middle and the operator had nothing to navigate by.
+// Re-deriving does not help when the SOURCE is zero.
+//
+// Idempotent and cheap: if any active beacon already has a position,
+// this does nothing.
+static void ensure_geometry() {
+    if (g_app.beacon_count < 1) return;
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        const BeaconState &b = g_app.beacon[i];
+        if (!b.active) continue;
+        if (b.pos_x != 0.0f || b.pos_y != 0.0f) return;   // already placed
+    }
+    csi_assign_default_geometry(300.0f);
+    scene_derive_landmarks_from_geometry();
+    MSLOG("[geom] assigned default geometry for %d beacons on entry\n",
+          (int)g_app.beacon_count);
+}
+
+// Empty-room latch: has the operator pressed START from outside the
+// room?  Declared here because enter_state() clears it, and enter_state
+// is the only point every path into ST_CAL_EMPTY_ROOM shares.
+static bool     s_empty_started  = false;
+static uint32_t s_empty_start_ms = 0;
+
+// One-shot latch for the tactical critique's model fit.  Declared here
+// because enter_state() clears it, which is the only point every path
+// into ST_TACTICAL_CRITIQUE shares.
+static bool     s_tac_finalized  = false;
 
 static void enter_state(AppState s) {
     const AppState prev = g_app.state;
@@ -61,6 +127,43 @@ static void enter_state(AppState s) {
     //
     // Arming belongs on ENTRY, because entry is the one thing both paths
     // share, whether you got here by pressing a button or by being told.
+    if (is_cal_state(s) || s == ST_DASHBOARD || s == ST_MOBILE_PROBE)
+        ensure_geometry();
+
+    // The empty-room step has a latch: whether the operator has pressed
+    // START from outside the room.  Four different paths re-enter this
+    // state (geometry guide, back-out, redo-from-results, baseline-only
+    // redo) and only one of them cleared the latch -- so a redo skipped
+    // the "walk out first" prompt and sampled the baseline with the
+    // operator standing in the room.  That reading is the reference
+    // every later measurement is compared against.
+    //
+    // Cleared on ENTRY, because entry is what every path shares.
+    // A tactical deployment must reset the model on BOTH units.
+    // tactical_begin() was called only after the carries() gate, so the
+    // anchor followed into the ceremony with whatever model the previous
+    // session left in the core and observed straight into it.
+    // Any entry into the tactical chain FROM OUTSIDE it starts the model.
+    //
+    // Keying only on ST_TACTICAL_INTRO left a race: discovery enters the
+    // intro with enter_state(), so the anchor only follows via the loop's
+    // periodic broadcast.  Arrive one broadcast late and it lands on
+    // DEPLOY having never passed through INTRO -- model_started stays
+    // false, tactical_observe() returns immediately, and the anchor
+    // silently collects nothing for the whole deployment.
+    if (is_tactical_state(s) && !is_tactical_state(prev)) {
+        tactical_begin();
+    }
+    // The critique is re-entered after every field check, and each
+    // re-entry must re-fit with the new sample folded in.
+    if (s == ST_TACTICAL_CRITIQUE && prev != ST_TACTICAL_CRITIQUE)
+        s_tac_finalized = false;
+
+    if (s == ST_CAL_EMPTY_ROOM && prev != ST_CAL_EMPTY_ROOM) {
+        s_empty_started  = false;
+        s_empty_start_ms = 0;
+    }
+
     if (s == ST_CAL_LANDMARK_WALK && prev != ST_CAL_LANDMARK_WALK) {
         // Seal a still-running empty-room baseline first.  If the probe
         // advanced while this unit was mid-accumulation, the samples are
@@ -103,7 +206,15 @@ static CalReport s_report = {};
 // (it owns the beacon-side rate switching etc.).  Both units always
 // FOLLOW peer state hints — the sender decides authority.
 static AppState s_last_broadcast_state = ST_SPLASH;
+// Tactical deployment is a ceremony too: it needs beacon keepalive and
+// spatial observation for exactly the same reasons cal does, and it must
+// NOT get a mid-capture SET_RATE.
+static bool is_tactical_state(AppState s) {
+    return s >= ST_TACTICAL_INTRO && s <= ST_TACTICAL_CHECK;
+}
+
 static bool is_cal_state(AppState s) {
+    if (is_tactical_state(s)) return true;
     return s == ST_CAL_INTRO || s == ST_CAL_ANCHOR_PLACE
         || s == ST_CAL_EMPTY_ROOM || s == ST_CAL_LANDMARK_WALK
         || s == ST_CAL_FINALIZE  || s == ST_CAL_RESULTS
@@ -220,8 +331,22 @@ static void assign_cal_roles() {
 
 // Are we the unit driving the wizard UI (has user's buttons)?  YES for
 // PROBE in stereo, YES for the sole unit in solo.
+// "Does the unit in my hand drive this?"  There were three predicates
+// for one question and they disagreed in one case: with no peer present
+// but cal_role somehow unset, this returned false while the tactical
+// equivalent returned true -- so the walk would render with nobody able
+// to advance it, on a single device with nobody else to do it.
+//
+// Solo sets cal_role = CAL_ROLE_PROBE today, so that case is not
+// currently reachable; it is one refactor away from being reachable, and
+// a stuck walk is silent when it happens.
+// Same rule, same reason: losing the radio link must not promote the
+// anchor to driving the walk.  See this_unit_carries().
 static bool this_unit_drives_wizard() {
-    return g_app.peer.cal_role == CAL_ROLE_PROBE;
+    if (g_app.cal_mode == CAL_MODE_SOLO) return true;
+    if (g_app.peer.cal_role != CAL_ROLE_NONE)
+        return g_app.peer.cal_role == CAL_ROLE_PROBE;
+    return !g_app.peer.peer_present;
 }
 
 // ── Deep sleep ────────────────────────────────────────────────
@@ -233,9 +358,46 @@ static void enter_deep_sleep() {
     }
     ui_going_to_sleep();
     delay(500);
+
+    // ── 1. THE BACKLIGHT ──────────────────────────────────────────
+    // This was never touched.  GPIO38 drives the panel's LED backlight
+    // and it stayed asserted straight through deep sleep -- tens of
+    // milliamps against a sleep budget of tens of MICROamps, which is
+    // three orders of magnitude and entirely explains a battery that
+    // goes flat overnight in a device that is supposed to be off.
+    pinMode(PIN_LCD_BACKLIGHT, OUTPUT);
+    digitalWrite(PIN_LCD_BACKLIGHT, LOW);
+
+    // ── 2. PANEL, THEN PANEL POWER ────────────────────────────────
+    // Tell the ST7789 to sleep before cutting its rail.  Yanking power
+    // from a panel mid-frame can leave its charge pumps latched, which
+    // both draws current and occasionally comes back up scrambled.
+    ui_panel_sleep();
+    delay(20);
+    pinMode(PIN_LCD_POWER_ON, OUTPUT);
     digitalWrite(PIN_LCD_POWER_ON, LOW);
+
+    // ── 3. RADIOS ─────────────────────────────────────────────────
     esp_wifi_stop();
     esp_wifi_deinit();
+
+    // ── 4. HOLD THE PINS ──────────────────────────────────────────
+    // THE CRITICAL PIECE.  A normal GPIO loses its drive state the
+    // instant the digital core powers down, so backlight and panel rails
+    // would float back up during sleep -- exactly the pins just turned
+    // off.  gpio_hold_en latches each pad, and gpio_deep_sleep_hold_en
+    // keeps those latches alive across the sleep itself.  Without the
+    // second call the first one does nothing once the core is gone.
+    gpio_hold_en((gpio_num_t)PIN_LCD_BACKLIGHT);
+    gpio_hold_en((gpio_num_t)PIN_LCD_POWER_ON);
+    gpio_deep_sleep_hold_en();
+
+    // ── 5. WAKE SOURCES ───────────────────────────────────────────
+    // Clear everything first: a stale timer wake-up left armed from an
+    // earlier feature would wake the device for no reason and the drain
+    // would look like sleep current.
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
     rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_LEFT);
     rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_RIGHT);
     rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_LEFT);
@@ -246,12 +408,32 @@ static void enter_deep_sleep() {
 #else
     esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ALL_LOW);
 #endif
+
+    // RTC peripherals stay POWERED ON deliberately.  They supply the
+    // internal pull-ups holding the button pins high; powering that
+    // domain down saves a few microamps and lets both pins float, which
+    // either wakes the device at random or never wakes it at all.  A
+    // device that will not wake is not a power saving.
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
     esp_deep_sleep_start();
 }
 
 // ═══════════════════════════════════════════════════════════════
 //  STATE HANDLERS
 // ═══════════════════════════════════════════════════════════════
+// Armed by holding RIGHT through the splash; consumed at the hand-off to
+// discovery, which happens in state_role_confirm (splash -> peer
+// discovery -> role confirm -> discovery).  File scope because the two
+// halves live in different handlers.
+static bool s_tac_shortcut = false;
+// The operator may still be holding RIGHT when the splash ends.  That
+// release lands in ST_PEER_DISCOVERY, whose exit is wasShortPressed
+// (BTN_RIGHT) -- so asking for tactical would skip peer discovery before
+// a peer was found and force a SOLO session nobody asked for.  Swallow
+// exactly one release.
+static bool s_swallow_right = false;
+
 static void state_splash() {
     ui_splash();
     // The splash is NOT skippable.  It runs to its timeout every boot.
@@ -268,8 +450,31 @@ static void state_splash() {
     // shortcut.  The splash is where the version and identity live; a
     // wake is exactly when you want to see them.
     const uint32_t splash_timeout = 4000;
+
+    // ── FAST PATH TO TACTICAL ─────────────────────────────────────
+    // Hold RIGHT through the splash to go straight to a tactical
+    // deployment instead of discovery.
+    //
+    // Deliberately a LEVEL (isHeld), not an edge.  An edge on this screen
+    // is what the phantom boot-press used to produce, and the splash is
+    // still not skippable -- holding the button does not shorten it by a
+    // millisecond, it only changes where it goes.  The operator gets
+    // feedback while holding, so the shortcut is discoverable rather
+    // than a secret.
+    if (state_age_ms() > 600 && isHeld(BTN_RIGHT)) {
+        s_tac_shortcut  = true;
+        s_swallow_right = true;   // their release must not skip peer discovery
+    }
+    if (s_tac_shortcut) ui_splash_tactical_hint();
+
     if (state_age_ms() > splash_timeout) {
         g_app.woke_from_deep_sleep = false;
+        s_rf_abi_ok = rf_abi_check();
+        MSLOG("[rf] ABI %s\n", s_rf_abi_ok ? "ok" : "MISMATCH - model disabled");
+        // PSRAM cold tier.  Optional by construction: if this fails the
+        // model still works from its in-DRAM coreset, it just re-fits
+        // from fewer samples.
+        rf_archive_begin();
         csi_engine_begin();
         peer_begin();
         // v0.9: bring up the wired peer link.  Harmless with no cable
@@ -285,6 +490,15 @@ static void state_splash() {
 
 static void state_peer_discovery() {
     ui_peer_discovery(state_age_ms(), PEER_DISCOVERY_MS);
+
+    // Eat the splash-hold release before it can be read as a press here.
+    if (s_swallow_right) {
+        if (isHeld(BTN_RIGHT)) return;       // still holding: nothing to do
+        s_swallow_right = false;
+        inputClearEdges();                   // drop the release edge
+        return;
+    }
+
     if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)
         || peer_discovery_done()) {
         peer_resolve_role();
@@ -302,11 +516,24 @@ static void state_role_confirm() {
     ui_role_confirm();
     if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)
         || state_age_ms() > 3500) {
+        if (s_tac_shortcut) {
+            s_tac_shortcut = false;            // one-shot: consume it
+            MSLOGLN("[tac] splash shortcut -> tactical deployment");
+            g_app.tactical_requested = true;   // discovery hands straight over
+        }
         enter_state(ST_DISCOVERY);
     }
     if (wasShortPressed(BTN_LEFT)) {
         g_app.peer.role = ROLE_SOLO;
         g_app.peer.peer_present = false;
+        // Forcing solo must NOT discard a tactical request.  The operator
+        // held the button through the whole splash; choosing to run solo
+        // says nothing about which ceremony they wanted.
+        if (s_tac_shortcut) {
+            s_tac_shortcut = false;
+            g_app.tactical_requested = true;
+            MSLOGLN("[tac] splash shortcut kept through solo fallback");
+        }
         enter_state(ST_DISCOVERY);
     }
 }
@@ -347,6 +574,7 @@ static void state_discovery() {
     const int n_found   = (int)g_app.beacon_count;
     const bool full_set = (n_found >= 3);
     if ((wasShortPressed(BTN_RIGHT) && n_found > 0)
+        || (g_app.tactical_requested && n_found > 0)
         || (state_age_ms() >= deadline && full_set && settled)) {
         int n = g_app.beacon_count;
         if (n >= 3)      g_app.mode = RM_TRIANGLE_3;
@@ -363,14 +591,35 @@ static void state_discovery() {
         // receiver never sent any, so every beacon stayed at its
         // compiled 100 Hz default while the capture path used 20.
         csi_beacon_apply_run_config();
+        // ── TACTICAL HAND-OVER ────────────────────────────────────
+        // Tactical needs discovery (it must know which beacons exist)
+        // but nothing after it: no geometry guide, no role ceremony,
+        // no landmark script.  That is the point -- fast to standing up.
+        if (g_app.tactical_requested) {
+            // Tactical skips the geometry guide -- which is the ONLY place
+            // assign_cal_roles() ran.  Without it cal_role stays
+            // CAL_ROLE_NONE and cal_mode stays CAL_MODE_UNKNOWN, so
+            // this_unit_carries() is FALSE on BOTH units and every
+            // tactical handler returns early: the whole ceremony frozen,
+            // with no indication why.
+            assign_cal_roles();
+            if (g_app.peer.peer_present && g_app.cal_mode != CAL_MODE_SOLO
+                && g_app.peer.cal_role == CAL_ROLE_NONE) {
+                // Roles are still the user's choice.  Keep the request set
+                // so ST_PICK_CARRY hands back to tactical, not Full Mode.
+                enter_state(ST_PICK_CARRY);
+                return;
+            }
+            g_app.tactical_requested = false;
+            enter_state(ST_TACTICAL_INTRO);
+            return;
+        }
         enter_state(ST_GEOMETRY_GUIDE);
     }
 }
 
-// Empty-room step state: whether the user has pressed START from
-// outside the room (stereo) or the countdown has expired (solo).
-static bool     s_empty_started  = false;
-static uint32_t s_empty_start_ms = 0;
+// (s_empty_started / s_empty_start_ms are declared above enter_state,
+// which clears them on entry to ST_CAL_EMPTY_ROOM.)
 
 static void state_geometry_guide() {
     ui_geometry_guide();
@@ -394,6 +643,14 @@ static void state_geometry_guide() {
 // v0.9 — the user picks which box they carry, by pressing it.
 // Both units show the same prompt; whichever is pressed becomes the
 // PROBE and tells the other it is the ANCHOR.  No MAC order, no guess.
+// Did a tactical deployment ask for this role choice?  Consumed here so
+// the next Full Mode cal is not hijacked by a stale request.
+static bool tac_pending() {
+    if (!g_app.tactical_requested) return false;
+    g_app.tactical_requested = false;
+    return true;
+}
+
 static void state_pick_carry() {
     // The anchor never NEEDS a press -- it follows the unit in your hand
     // automatically.  But its buttons still work.  Locking them out
@@ -410,10 +667,14 @@ static void state_pick_carry() {
             g_app.peer.role_override = RO_FORCE_PROBE;
             peer_send_command(PEER_OP_CAL_ROLE_ANCHOR, 0);   // other one takes it
             MSLOGLN("[cal] role swapped by press on the anchor");
-            enter_state(ST_CAL_INTRO);
+            enter_state(tac_pending() ? ST_TACTICAL_INTRO : ST_CAL_INTRO);
             return;
         }
-        if (wasShortPressed(BTN_LEFT)) enter_state(ST_RX_ASSEMBLY);
+        // BACK goes BACK.  This used to jump to ST_RX_ASSEMBLY -- a
+        // POST-calibration screen -- so pressing back on the anchor
+        // skipped the entire cal and landed the operator on the stereo
+        // assembly page with no model behind it.
+        if (wasShortPressed(BTN_LEFT)) enter_state(ST_GEOMETRY_GUIDE);
         return;
     }
     ui_pick_carry();
@@ -423,12 +684,16 @@ static void state_pick_carry() {
         g_app.peer.role_override = RO_FORCE_PROBE;
         g_app.cal_mode           = CAL_MODE_STEREO;
         // Tell the other unit it is the anchor.
-        peer_send_command(PEER_OP_STATE_HINT, (uint8_t)ST_CAL_INTRO);
+        // Hand back to whichever ceremony asked for the role choice.
+        const AppState nxt = tac_pending() ? ST_TACTICAL_INTRO : ST_CAL_INTRO;
+        peer_send_command(PEER_OP_STATE_HINT, (uint8_t)nxt);
         peer_send_command(PEER_OP_CAL_ROLE_ANCHOR, 0);
-        enter_state(ST_CAL_INTRO);
+        enter_state(nxt);
         return;
     }
-    if (wasShortPressed(BTN_LEFT)) enter_state(ST_RX_ASSEMBLY);
+    // Same on the probe side: back is the geometry guide, not the
+    // post-cal assembly screen.
+    if (wasShortPressed(BTN_LEFT)) enter_state(ST_GEOMETRY_GUIDE);
 }
 
 static void state_cal_intro() {
@@ -649,9 +914,297 @@ static void state_rx_assembly() {
         enter_state(ST_CAL_RESULTS);
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  v1.0 — MANTIS TACTICAL DEPLOYMENT
+// ═══════════════════════════════════════════════════════════════
+// A different ceremony, not a different sensor.  Full Mode walks a
+// scripted set of landmarks to build a dense kernel; this walks the
+// beacons OUT to where they will live and builds the model from that
+// journey.  Both feed the same FrameObservation.
+//
+// Only the unit in the operator's hand drives, exactly as the cal walk
+// does; the anchor follows the state hints and renders.
+static uint8_t     s_tac_deploy_idx = 0;
+static bool        s_tac_capturing  = false;
+static float       s_tac_check_x = 0, s_tac_check_y = 0;
+static const char *s_tac_check_cue = "";
+
+// "Is this the unit in the operator's hand?"
+//
+// A ROLE, ONCE ASSIGNED, IS AUTHORITATIVE.  The `!peer_present` clause
+// exists for the genuinely solo case -- one device, no peer, ever -- but
+// peer_present also goes FALSE on link timeout, and the probe walking
+// out of ESP-NOW range is normal: that is what walking to the far corner
+// of a room does.
+//
+// Read naively, the anchor would then decide it was the carrying unit
+// and start driving the ceremony on its own: committing deployment legs
+// while sitting motionless on the floor, corrupting the model, and
+// fighting the probe the moment it came back in range.  Split-brain
+// caused by the thing the ceremony is FOR.
+//
+// So the link state only decides anything before a role exists.
+static bool this_unit_carries() {
+    if (g_app.cal_mode == CAL_MODE_SOLO) return true;
+    if (g_app.peer.cal_role != CAL_ROLE_NONE)
+        return g_app.peer.cal_role == CAL_ROLE_PROBE;
+    return !g_app.peer.peer_present;   // no role yet: solo only if truly alone
+}
+
+// Advance deploy_idx to the next ACTIVE beacon, or past the end.
+static void tac_next_deploy_slot() {
+    do { s_tac_deploy_idx++; }
+    while (s_tac_deploy_idx < g_app.beacon_count
+           && !g_app.beacon[s_tac_deploy_idx].active);
+}
+
+static void state_tactical_intro() {
+    // If a Full Mode calibration already exists, offer to ADOPT it.
+    // The walk already visited known positions and recorded the response
+    // at each one -- that is the same information a deployment collects,
+    // so making the operator fetch the beacons and place them again
+    // would be pure busywork.
+    const bool can_adopt = tactical_can_adopt();
+    ui_tactical_intro(can_adopt);
+    if (!this_unit_carries()) return;
+
+    // The footer hides START with no beacons -- but hiding a LABEL does
+    // not disable a BUTTON.  Pressing RIGHT here used to walk the entire
+    // deployment ceremony with zero beacons and finalize a model built
+    // from nothing.
+    if ((wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT))
+        && g_app.beacon_count > 0) {
+        if (can_adopt) {
+            const int n = tactical_adopt_full_cal();
+            if (n > 0) {
+                // Straight to the critique: the model exists, so the only
+                // question left is whether it wants anything checked.
+                g_app.dash_view = DV_TACTICAL;
+                user_advance(ST_TACTICAL_CRITIQUE);
+                return;
+            }
+            // Adoption failed (too few usable samples) -- fall through and
+            // deploy rather than leaving the operator on a dead screen.
+            MSLOGLN("[tac] adoption rejected, running a deployment instead");
+        }
+        tactical_begin();          // resets the model AND the archive
+        s_tac_deploy_idx = 0;
+        s_tac_capturing  = false;
+        while (s_tac_deploy_idx < g_app.beacon_count
+               && !g_app.beacon[s_tac_deploy_idx].active) s_tac_deploy_idx++;
+        user_advance(ST_TACTICAL_DEPLOY);
+        return;
+    }
+    // LONG LEFT forces a fresh deployment even when a cal exists -- the
+    // room may have changed since.
+    if (wasLongPressed(BTN_LEFT) && can_adopt) {
+        tactical_begin();
+        s_tac_deploy_idx = 0;
+        s_tac_capturing  = false;
+        while (s_tac_deploy_idx < g_app.beacon_count
+               && !g_app.beacon[s_tac_deploy_idx].active) s_tac_deploy_idx++;
+        user_advance(ST_TACTICAL_DEPLOY);
+        return;
+    }
+    if (wasShortPressed(BTN_LEFT)) user_advance(ST_DISCOVERY);
+}
+
+static void state_tactical_deploy() {
+    if (!this_unit_carries()) {
+        // ANCHOR: render what the operator is ACTUALLY doing.  Its own
+        // s_tac_deploy_idx never advances (it returns before the advance
+        // logic), so this used to sit on "B1, pick up this beacon" while
+        // the operator was three beacons along.
+        ui_tactical_deploy(g_app.tac_peer_step, g_app.beacon_count,
+                           g_app.tac_peer_capturing);
+        return;
+    }
+    ui_tactical_deploy(s_tac_deploy_idx, g_app.beacon_count, s_tac_capturing);
+
+    // Mirror progress to the anchor whenever it changes.  Sent on change
+    // only -- this is a ceremony step, not telemetry, and the RF is busy
+    // being measured.
+    {
+        static uint16_t last_sent = 0xFFFF;
+        const uint16_t now_step = (uint16_t)(s_tac_deploy_idx & 0xFF)
+                                | (s_tac_capturing ? 0x100 : 0);
+        if (now_step != last_sent) {
+            last_sent = now_step;
+            peer_send_command(PEER_OP_TAC_STEP, 0, now_step);
+        }
+    }
+
+    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+        if (!s_tac_capturing) {
+            // Outbound leg begins: operator picks up this beacon and walks.
+            tactical_begin_deploy(s_tac_deploy_idx);
+            s_tac_capturing = true;
+        } else {
+            // PLACE: the beacon stays here, the leg closes.
+            tactical_end_capture();
+            s_tac_capturing = false;
+            tac_next_deploy_slot();
+            if (s_tac_deploy_idx >= g_app.beacon_count)
+                user_advance(ST_TACTICAL_RETURN);
+        }
+        return;
+    }
+    if (wasShortPressed(BTN_LEFT) && !s_tac_capturing)
+        user_advance(ST_TACTICAL_INTRO);
+}
+
+static void state_tactical_return() {
+    ui_tactical_return(s_tac_capturing);
+    if (!this_unit_carries()) return;
+    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+        if (!s_tac_capturing) {
+            tactical_begin_return();
+            s_tac_capturing = true;
+        } else {
+            // The final sample of the return leg is tagged as the chart
+            // origin, so the map is anchored where the operator ended up
+            // rather than at an assumed (0,0).
+            tactical_end_capture();
+            s_tac_capturing = false;
+            user_advance(ST_TACTICAL_CIRCUIT);
+        }
+        return;
+    }
+    if (wasShortPressed(BTN_LEFT) && !s_tac_capturing)
+        user_advance(ST_TACTICAL_DEPLOY);
+}
+
+static void state_tactical_circuit() {
+    ui_tactical_circuit(s_tac_capturing);
+    if (!this_unit_carries()) return;
+    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+        if (!s_tac_capturing) {
+            tactical_begin_capture(TCAP_CIRCUIT, LM_RX, LM_RX);
+            s_tac_capturing = true;
+        } else {
+            // Samples are tagged kind=5 with their traversal fraction,
+            // which is what gives the perimeter a cyclic 1-D coordinate.
+            tactical_end_capture();
+            s_tac_capturing = false;
+            user_advance(ST_TACTICAL_BASELINE);
+        }
+        return;
+    }
+    if (wasShortPressed(BTN_LEFT) && !s_tac_capturing)
+        user_advance(ST_TACTICAL_RETURN);
+}
+
+static void state_tactical_baseline() {
+    ui_tactical_baseline(tactical_baseline_quality(),
+                         tactical_baseline_contaminated());
+    if (state_age_ms() < 80 && !tactical_baseline_ready())
+        tactical_begin_baseline();
+
+    // Both units build their OWN baseline -- each has its own radio and
+    // its own empty-room reference.  But only the unit in the operator's
+    // hand narrates the transition, or both broadcast competing hints and
+    // pull each other back and forth.
+    if (tactical_baseline_ready()) {
+        if (this_unit_carries()) user_advance(ST_TACTICAL_CRITIQUE);
+        return;
+    }
+
+    // No fixed wait.  Accept as soon as the room has been demonstrably
+    // quiet for long enough -- and never while contaminated, because a
+    // baseline taken with someone in the room is the one error the whole
+    // model cannot recover from.
+    if (!tactical_baseline_contaminated()
+        && tactical_baseline_quality() > 0.72f
+        && state_age_ms() > 500) {
+        tactical_accept_baseline();
+        if (this_unit_carries()) user_advance(ST_TACTICAL_CRITIQUE);
+        return;
+    }
+    if (wasShortPressed(BTN_RIGHT) && !tactical_baseline_contaminated())
+        tactical_accept_baseline();
+    if (wasShortPressed(BTN_LEFT)) user_advance(ST_TACTICAL_CIRCUIT);
+}
+
+static void state_tactical_critique() {
+    ui_tactical_critique();
+    if (state_age_ms() <= 250) return;
+
+    // ONE-SHOT.  tactical_finalize_model() re-embeds the chart, relaxes
+    // it and re-learns the feature weights -- by far the most expensive
+    // call in the system.  Without this latch it ran on EVERY frame for
+    // as long as the screen was up.
+    //
+    // Both units finalize: each holds its own model and each needs it
+    // fitted.  Only the unit in the operator's hand decides what happens
+    // next.
+    if (!s_tac_finalized) {
+        s_tac_finalized = true;
+        tactical_finalize_model();
+    }
+
+    // The ANCHOR cannot walk to a check point.  It follows the decision
+    // instead of making its own -- this used to enter ST_TACTICAL_CHECK
+    // locally via enter_state(), which does not broadcast, so the two
+    // units silently ended up in different states.
+    if (!this_unit_carries()) return;
+
+    // The model says where it is weakest.  If it has nothing to ask for,
+    // go live -- this is not a fixed quota of extra stands.
+    float x, y; const char *cue; LandmarkId lm;
+    if (tactical_next_check(&x, &y, &cue, &lm)) {
+        s_tac_check_x = x; s_tac_check_y = y; s_tac_check_cue = cue;
+        user_advance(ST_TACTICAL_CHECK);
+    } else {
+        // Calibration is complete, so light-sleep gets armed.  This is the
+        // rule, and tactical was silently exempt from it: a deployment
+        // finished and left every beacon awake at full rate forever.
+        // Safe here for the same reason it is safe after a Full Mode cal
+        // -- no capture window can be open once the model is final.
+        csi_beacon_enable_sleep_after_cal();
+        // Go live, and land ON the tactical view rather than making the
+        // operator hunt for it.
+        g_app.dash_view = DV_TACTICAL;
+        user_advance(ST_DASHBOARD);
+    }
+}
+
+static void state_tactical_check() {
+    ui_tactical_check(s_tac_check_cue, s_tac_check_x, s_tac_check_y,
+                      s_tac_capturing);
+    if (!this_unit_carries()) return;
+
+    if (wasShortPressed(BTN_RIGHT) || wasLongPressed(BTN_RIGHT)) {
+        if (!s_tac_capturing) {
+            tactical_begin_check(s_tac_check_x, s_tac_check_y);
+            s_tac_capturing = true;
+        } else {
+            tactical_end_capture();
+            tactical_complete_check();
+            s_tac_capturing = false;
+            user_advance(ST_TACTICAL_CRITIQUE);  // ask again, and tell the anchor
+        }
+        return;
+    }
+    // SKIP: the operator may not be able to reach the requested spot.
+    // Still a completed model, so sleep is still armed -- every exit that
+    // goes live has to honour the rule, not just the tidy one.
+    if (wasShortPressed(BTN_LEFT)) {
+        tactical_cancel_check();
+        s_tac_capturing = false;
+        csi_beacon_enable_sleep_after_cal();
+        g_app.dash_view = DV_TACTICAL;
+        user_advance(ST_DASHBOARD);
+    }
+}
+
 static void state_dashboard() {
     if (wasShortPressed(BTN_LEFT)) {
         g_app.dash_view = (DashView)((g_app.dash_view + 1) % DV_COUNT);
+        // Skip the tactical view unless a tactical model actually exists.
+        // An empty view the operator has to cycle past is worse than no
+        // view at all, and on a Full Mode session there is nothing in it.
+        if (g_app.dash_view == DV_TACTICAL && !tactical_ready())
+            g_app.dash_view = (DashView)((g_app.dash_view + 1) % DV_COUNT);
     }
     if (wasShortPressed(BTN_RIGHT)) {
         switch (g_app.dash_view) {
@@ -877,6 +1430,39 @@ static void state_settings() {
             case 5:
                 enter_state(ST_DASHBOARD);
                 return;
+            case UI_SETTINGS_ROW_TACTICAL:
+                // Tactical deployment is a whole ceremony, not a toggle.
+                //
+                // Roles are already set by the time the dashboard is
+                // reachable, but do not DEPEND on that: without a role,
+                // this_unit_carries() is false on both units and the
+                // ceremony freezes with no indication why.
+                if (g_app.peer.peer_present
+                    && g_app.peer.cal_role == CAL_ROLE_NONE) {
+                    g_app.tactical_requested = true;   // route back here
+                    enter_state(ST_PICK_CARRY);
+                    return;
+                }
+                enter_state(ST_TACTICAL_INTRO);
+                return;
+            case UI_SETTINGS_ROW_REFIT: {
+                // Re-fit the chart over EVERY archived observation rather
+                // than the bounded coreset the scorer kept.  The core
+                // evicts by novelty to stay fast, which is correct and
+                // does discard real measurements; this is the one place
+                // that gets them back.
+                //
+                // Costs hundreds of milliseconds at full capacity, so it
+                // only runs from a menu, never on the live path.
+                const int n = rf_archive_refit();
+                if (n > 0) {
+                    tactical_finalize_model();
+                    MSLOG("[ui] chart re-fit from %d archived samples\n", n);
+                } else {
+                    MSLOGLN("[ui] nothing archived to re-fit from");
+                }
+                break;
+            }
             case UI_SETTINGS_ROW_TRIPWIRE:
                 g_app.tripwire_mode =
                     (g_app.tripwire_mode == TW_REMOTE) ? TW_DUAL : TW_REMOTE;
@@ -931,6 +1517,17 @@ static void state_sleep_arm() {
 //  setup()
 // ═══════════════════════════════════════════════════════════════
 void setup() {
+    // ── RELEASE THE DEEP-SLEEP PIN HOLDS, FIRST THING ─────────────
+    // enter_deep_sleep() latches the backlight and panel-power pads low
+    // so they cannot float back up while the core is off.  Those latches
+    // SURVIVE the wake and must be released BEFORE ui_begin() brings the
+    // panel up -- otherwise the display initialises into clamped pins,
+    // never lights, and the device looks bricked.  That would be trading
+    // a battery bug for a far worse one.
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)PIN_LCD_BACKLIGHT);
+    gpio_hold_dis((gpio_num_t)PIN_LCD_POWER_ON);
+
     MSLOG_BEGIN();
     delay(100);
 
@@ -1117,8 +1714,29 @@ void loop() {
         case ST_MOBILE_PROBE:       state_mobile_probe();       break;
         case ST_DEBUG_LOG:          state_debug_log();          break;
         case ST_PICK_CARRY:         state_pick_carry();         break;
+        case ST_TACTICAL_INTRO:     state_tactical_intro();     break;
+        case ST_TACTICAL_DEPLOY:    state_tactical_deploy();    break;
+        case ST_TACTICAL_RETURN:    state_tactical_return();    break;
+        case ST_TACTICAL_CIRCUIT:   state_tactical_circuit();   break;
+        case ST_TACTICAL_BASELINE:  state_tactical_baseline();  break;
+        case ST_TACTICAL_CRITIQUE:  state_tactical_critique();  break;
+        case ST_TACTICAL_CHECK:     state_tactical_check();     break;
         case ST_SLEEP_ARM:          state_sleep_arm();          break;
-        default:                    break;
+        default:
+            // RECOVER, do not sit there.  ST_SECONDARY_ACTIVE is a legacy
+            // enum slot kept only so the peer state-hint byte stays
+            // compatible with older firmware, and any future state added
+            // without a handler lands here too.
+            //
+            // `break` meant the unit rendered nothing and accepted no
+            // input -- a frozen screen with live buttons that do nothing,
+            // which is indistinguishable from a crash to whoever is
+            // holding it.  Falling back to the dashboard is always safe:
+            // it renders, it takes input, and it can reach settings.
+            MSLOG("[state] no handler for state %u - recovering to dashboard\n",
+                  (unsigned)g_app.state);
+            enter_state(ST_DASHBOARD);
+            break;
     }
 
     static uint32_t last_slow = 0;

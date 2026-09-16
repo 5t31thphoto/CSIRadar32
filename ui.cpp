@@ -2,6 +2,8 @@
 //  CSI-Radar-S3 — ui.cpp
 // ═══════════════════════════════════════════════════════════════
 #include "ui.h"
+#include "tactical.h"
+#include "rfarchive.h"
 #include "lgfx_tdisplay_s3.h"
 #include "wizard.h"
 #include "scene.h"
@@ -37,6 +39,12 @@ static LovyanGFX &gfx() {
 
 // Public accessor for render.cpp — draws into the same sprite/lcd.
 LovyanGFX &gfx_sprite() { return gfx(); }
+
+// The PANEL, not the sprite: this must reach the physical ST7789 so it
+// can shut down cleanly before PIN_LCD_POWER_ON is pulled low.
+void ui_panel_sleep() {
+    g_lcd.sleep();
+}
 
 static void flush() {
     if (g_canvas_ok) g_canvas.pushSprite(0, 0);
@@ -1490,8 +1498,15 @@ void ui_dashboard() {
     draw_header(h);
 
     switch (g_app.dash_view) {
-        case DV_RADAR:    render_radar_view();  break;   // v0.3 primary view
+        case DV_RADAR:
+            // A tactical model supersedes the Full Mode radar: it is the
+            // same scene rendered from a chart that was actually learned,
+            // rather than from a kernel this session may not even have.
+            if (tactical_ready()) tactical_render_radar();
+            else                  render_radar_view();
+            break;
         case DV_FIELD:    render_field_view();  break;   // v0.3 debug view
+        case DV_TACTICAL: tactical_render_field(); break; // v1.0 RF chart
         case DV_AOA:      draw_view_aoa();      break;
         case DV_TRIPWIRE: draw_view_tripwire(); break;
         case DV_LINKS:    draw_view_links();    break;
@@ -1507,6 +1522,7 @@ void ui_dashboard() {
     if (g_app.dash_view == DV_AOA)  rlabel = "-";
     if (g_app.dash_view == DV_PEER) rlabel = "-";
     if (g_app.dash_view == DV_FIELD) rlabel = "-";
+    if (g_app.dash_view == DV_TACTICAL) rlabel = "-";
     draw_footer("view", rlabel);
     flush();
 }
@@ -1559,10 +1575,27 @@ void ui_settings(int selected_row) {
     if (g_app.mode == RM_TRIANGLE_3)
         snprintf(values[3], 24, "%d beacons", g_app.beacon_count);
     else
-        snprintf(values[3], 24, "%s", mode_names[g_app.mode]);
+        snprintf(values[3], 24, "%s",
+                 mode_names[(unsigned)g_app.mode < 4 ? (unsigned)g_app.mode : 0]);
     const char *ro_names[] = {"AUTO", "PROBE", "ANCHOR"};
-    snprintf(values[4], 24, "%s", ro_names[g_app.peer.role_override]);
+    // Clamped for the same reason the other name tables are: an enum
+    // read out of range is an out-of-bounds pointer load, and "settings
+    // crashes the device" is not a failure anyone can diagnose in a room.
+    snprintf(values[4], 24, "%s",
+             ro_names[(unsigned)g_app.peer.role_override < 3
+                      ? (unsigned)g_app.peer.role_override : 0]);
     strcpy(values[5], "");
+    labels[UI_SETTINGS_ROW_TACTICAL] = "Deploy (tactical)";
+    snprintf(values[UI_SETTINGS_ROW_TACTICAL], 24, "%s",
+             tactical_ready() ? "active" : "start");
+    // The cold tier only earns its 648 KB if it can actually be used.
+    // Shows how much is banked, so the operator can see the difference
+    // between "re-fit from 40 samples" and "re-fit from 900".
+    labels[UI_SETTINGS_ROW_REFIT] = "Re-fit chart";
+    if (rf_archive_available())
+        snprintf(values[UI_SETTINGS_ROW_REFIT], 24, "%d pts", rf_archive_count());
+    else
+        snprintf(values[UI_SETTINGS_ROW_REFIT], 24, "no PSRAM");
     labels[UI_SETTINGS_ROW_TRIPWIRE] = "Tripwire";
     snprintf(values[UI_SETTINGS_ROW_TRIPWIRE], 24, "%s",
              g_app.tripwire_mode == TW_REMOTE ? "anchor link" : "both units");
@@ -2352,6 +2385,9 @@ static void draw_mini_landmark_map(int box_x, int box_y, int box_w, int box_h,
     }
 
     // Beacons, numbered and colour-coded.
+    float near_margin = 0.0f;
+    uint8_t near_id = csi_nearest_beacon(&near_margin);
+    if (near_margin < 0.25f) near_id = 0;     // not confident -> claim nothing
     g.setFont(&fonts::Font0);
     for (int i = 0; i < n_b; i++) {
         float bx, by;
@@ -2360,6 +2396,17 @@ static void draw_mini_landmark_map(int box_x, int box_y, int box_w, int box_h,
         int py = cy - (int)(by * pix_per_unit);
 
         const bool is_target = have_h && (highlight == (LandmarkId)(LM_BEACON_1 + i));
+        // "YOU ARE HERE": the beacon whose link the operator's own body
+        // is dominating.  This is what turns a nominal ring into a
+        // usable map -- the drawn B2 and the physical box in front of
+        // you are finally connected by something measured.
+        // i is the SLOT, not a hardware index.  "You are here" is true
+        // when the beacon the radio detects is the one bound to this
+        // slot -- or, before binding, when this is the slot being
+        // visited right now.
+        const uint8_t slot_id = beacon_slot_id(i);
+        const bool bound   = (slot_id != 0);
+        const bool is_here = bound && near_id != 0 && slot_id == near_id;
         uint16_t c = beacon_color(i);         // same hue as links / compass
 
         if (is_target) {
@@ -2370,12 +2417,25 @@ static void draw_mini_landmark_map(int box_x, int box_y, int box_w, int box_h,
             } else {
                 g.fillCircle(px, py, 6, COL_MS_WARN);
             }
-        } else {
+        } else if (bound) {
             g.fillCircle(px, py, 4, c);
             g.drawCircle(px, py, 4, COL_MS_INK);
+        } else {
+            // Hollow = slot exists on the map but no physical beacon has
+            // been matched to it yet.
+            g.drawCircle(px, py, 4, COL_MS_DIM);
+        }
+        if (is_here) {
+            // Double ring = you are standing at this one, right now.
+            g.drawCircle(px, py, 10, COL_MS_TEAL);
+            g.drawCircle(px, py, 12, COL_MS_TEAL);
         }
 
-        char lbl[4]; snprintf(lbl, sizeof(lbl), "B%d", i + 1);
+        // Label by SLOT.  Unbound slots get a "?" so the operator can see
+        // at a glance which ones the walk has not reached yet -- and so a
+        // number never implies a binding that does not exist.
+        char lbl[6];
+        snprintf(lbl, sizeof(lbl), bound ? "B%d" : "B%d?", i + 1);
         // Push the label radially outward so it never sits on the dot.
         int lx = px + (bx >= 0 ? 7 : -14);
         int ly = py + (by >= 0 ? -12 : 5);
@@ -2701,6 +2761,28 @@ void ui_cal_landmark_walk() {
         // v0.9: labels need vertical room; the map was sized for bare dots.
         draw_mini_landmark_map(4, map_y, SCREEN_W - 8,
                                map_h < 110 ? 110 : map_h, highlight, next);
+    }
+
+    // ── WHICH BOX AM I AT? ────────────────────────────────────────
+    // Three identical beacons on the floor and an instruction that says
+    // "walk to B2" is not an instruction.  Name the one the radio says
+    // you are standing at, so the label on the map and the object in
+    // front of you are connected.
+    {
+        float nm = 0.0f;
+        const uint8_t nid = csi_nearest_beacon(&nm);
+        if (nid != 0 && nm >= 0.25f) {
+            char lb[24];
+            // Speak in SLOTS.  A hardware id means nothing to the
+            // operator; the number on the map is the only name they have.
+            const int sl = beacon_slot_of_id(nid);
+            if (sl >= 0) snprintf(lb, sizeof(lb), "at B%d", sl + 1);
+            else         snprintf(lb, sizeof(lb), "at an unassigned beacon");
+            g.setFont(&fonts::Font2);
+            g.setTextColor(COL_MS_TEAL, COL_BG);
+            g.setCursor(6, SCREEN_H - FOOTER_H - 36);
+            g.print(lb);
+        }
     }
 
     // ── HONEST CAPTURE FEEDBACK ───────────────────────────────────
@@ -3389,5 +3471,306 @@ void ui_cal_empty_prompt() {
     g.print("Don't touch it.");
 
     draw_footer("back", "START");
+    flush();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  v1.0 — MANTIS TACTICAL DEPLOYMENT SCREENS
+// ═══════════════════════════════════════════════════════════════
+// Ops-console chrome: a double border in teal/violet so tactical is
+// unmistakable at a glance from the Full Mode ceremony.  Every screen
+// takes its state as arguments, so none of them can show something the
+// state machine is not actually doing.
+
+static void tac_frame() {
+    auto &g = gfx();
+    clear();
+    g.drawRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, COL_MS_TEAL);
+    g.drawRect(2, 2, SCREEN_W - 4, SCREEN_H - 4, COL_MS_VIOLET);
+}
+
+// Blinking REC while a leg is being recorded.  The operator is walking
+// away from the screen, so this has to read at arm's length.
+static void tac_rec(bool capturing) {
+    if (!capturing) return;
+    auto &g = gfx();
+    if (((millis() / 400) % 2) == 0) return;
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MS_ALERT, COL_BG);
+    g.setCursor(SCREEN_W - 46, CONTENT_Y + 2);
+    g.print("REC");
+}
+
+// Drawn over the splash while RIGHT is held.  Without this the shortcut
+// would be a secret, and a held button with no feedback feels broken.
+void ui_splash_tactical_hint() {
+    auto &g = gfx();
+    g.setFont(&fonts::Font2);
+    const bool blink = ((millis() / 300) % 2) != 0;
+    g.setTextColor(blink ? COL_MS_WARN : COL_MS_TEAL, COL_BG);
+    const char *t = "TACTICAL";
+    const int tw = g.textWidth(t);
+    g.setCursor((SCREEN_W - tw) / 2, SCREEN_H - FOOTER_H - 34);
+    g.print(t);
+    g.setTextColor(COL_MUTED, COL_BG);
+    const char *h = "keep holding";
+    const int hw = g.textWidth(h);
+    g.setCursor((SCREEN_W - hw) / 2, SCREEN_H - FOOTER_H - 18);
+    g.print(h);
+    // ui_splash() has already flushed by the time this is called, so the
+    // hint has to push its own frame or it never reaches the panel.
+    flush();
+}
+
+void ui_tactical_intro(bool can_adopt) {
+    tac_frame();
+    auto &g = gfx();
+    draw_header("TACTICAL");
+
+    if (can_adopt) {
+        // The room is already calibrated.  Say so, and say plainly that
+        // the beacons stay exactly where they are.
+        draw_multiline(8, CONTENT_Y + 10, 16, COL_MS_INK,
+            "A calibration\n"
+            "already exists.\n"
+            "\n"
+            "Tactical can use\n"
+            "it directly.\n"
+            "\n"
+            "Leave the beacons\n"
+            "where they are -\n"
+            "you will just walk\n"
+            "a few spot checks.");
+        g.setFont(&fonts::Font2);
+        g.setTextColor(COL_MUTED, COL_BG);
+        g.setCursor(8, SCREEN_H - FOOTER_H - 36);
+        g.print("hold BACK to redeploy");
+        g.setTextColor(COL_MS_LIME, COL_BG);
+        g.setCursor(8, SCREEN_H - FOOTER_H - 20);
+        g.print("if the room changed");
+        draw_footer("back", "USE IT");
+        flush();
+        return;
+    }
+
+    draw_multiline(8, CONTENT_Y + 10, 16, COL_MS_INK,
+        "Deployment walk.\n"
+        "\n"
+        "Carry each beacon\n"
+        "out, place it, come\n"
+        "back, then walk the\n"
+        "perimeter once.\n"
+        "\n"
+        "The map is built\n"
+        "from that walk.");
+    char l[32];
+    snprintf(l, sizeof(l), "%d beacon%s ready",
+             (int)g_app.beacon_count, g_app.beacon_count == 1 ? "" : "s");
+    g.setFont(&fonts::Font2);
+    g.setTextColor(g_app.beacon_count > 0 ? COL_MS_LIME : COL_MS_ALERT, COL_BG);
+    g.setCursor(8, SCREEN_H - FOOTER_H - 22);
+    g.print(l);
+    draw_footer("back", g_app.beacon_count > 0 ? "start" : "");
+    flush();
+}
+
+void ui_tactical_deploy(uint8_t index, uint8_t total, bool capturing) {
+    tac_frame();
+    auto &g = gfx();
+    draw_header("DEPLOY");
+
+    // One pip per beacon: filled = placed, ringed = the one in your hand,
+    // hollow = still waiting at the anchor.
+    const int pip_y = CONTENT_Y + 16;
+    for (int i = 0; i < total && i < MAX_BEACONS; i++) {
+        const int x = 14 + i * 26;
+        if (i < index) {
+            g.fillCircle(x, pip_y, 6, COL_MS_LIME);
+        } else if (i == index) {
+            g.fillCircle(x, pip_y, 6, capturing ? COL_MS_WARN : COL_MS_TEAL);
+            g.drawCircle(x, pip_y, 9, COL_MS_TEAL);
+        } else {
+            g.drawCircle(x, pip_y, 6, COL_MS_DIM);
+        }
+        char n[4]; snprintf(n, sizeof(n), "%d", i + 1);
+        g.setFont(&fonts::Font0);
+        g.setTextColor(COL_MS_INK, COL_BG);
+        g.setCursor(x - 3, pip_y + 11);
+        g.print(n);
+    }
+
+    g.setFont(&fonts::Font4);
+    g.setTextColor(COL_MS_LIME, COL_BG);
+    char big[16]; snprintf(big, sizeof(big), "B%d", (int)index + 1);
+    g.setCursor(8, CONTENT_Y + 46);
+    g.print(big);
+
+    draw_multiline(8, CONTENT_Y + 78, 16, COL_MS_INK,
+        capturing ? "Walking out.\n"
+                    "\n"
+                    "Put the beacon\n"
+                    "down where it\n"
+                    "will live, then\n"
+                    "press PLACE."
+                  : "Pick up this\n"
+                    "beacon at the\n"
+                    "anchor.\n"
+                    "\n"
+                    "Press START,\n"
+                    "then walk out.");
+    tac_rec(capturing);
+    draw_footer(capturing ? "" : "back", capturing ? "PLACE" : "START");
+    flush();
+}
+
+void ui_tactical_return(bool capturing) {
+    tac_frame();
+    auto &g = gfx();
+    draw_header("RETURN");
+    draw_multiline(8, CONTENT_Y + 16, 16, COL_MS_INK,
+        capturing ? "Walking back.\n"
+                    "\n"
+                    "Return to the\n"
+                    "anchor and press\n"
+                    "ARRIVED.\n"
+                    "\n"
+                    "Where you stop\n"
+                    "becomes the\n"
+                    "map origin."
+                  : "All beacons are\n"
+                    "placed.\n"
+                    "\n"
+                    "Press START and\n"
+                    "walk back to the\n"
+                    "anchor carrying\n"
+                    "only the probe.");
+    tac_rec(capturing);
+    draw_footer(capturing ? "" : "back", capturing ? "ARRIVED" : "START");
+    flush();
+}
+
+void ui_tactical_circuit(bool capturing) {
+    tac_frame();
+    auto &g = gfx();
+    draw_header("CIRCUIT");
+
+    // A ring of the deployed beacons, to show what "the perimeter" means.
+    const int cx = SCREEN_W / 2, cy = CONTENT_Y + 74, R = 40;
+    g.drawCircle(cx, cy, R, capturing ? COL_MS_WARN : COL_MS_DIM);
+    const int n = g_app.beacon_count < 1 ? 1 : g_app.beacon_count;
+    for (int i = 0; i < n && i < MAX_BEACONS; i++) {
+        const float t = (float)M_PI / 2.0f + 2.0f * (float)M_PI * i / n;
+        const int x = cx + (int)(R * cosf(t)), y = cy - (int)(R * sinf(t));
+        g.fillCircle(x, y, 5, COL_MS_LIME);
+        char l[4]; snprintf(l, sizeof(l), "%d", i + 1);
+        g.setFont(&fonts::Font0);
+        g.setTextColor(COL_MS_INK, COL_BG);
+        g.setCursor(x - 2, y - 3);
+        g.print(l);
+    }
+    g.fillRect(cx - 4, cy - 2, 8, 4, COL_MS_TEAL);
+
+    draw_multiline(8, CONTENT_Y + 130, 15, COL_MS_INK,
+        capturing ? "Walking the\n"
+                    "perimeter. Press\n"
+                    "DONE back at the\n"
+                    "start."
+                  : "Walk one lap\n"
+                    "past every beacon\n"
+                    "in order, then\n"
+                    "return here.");
+    tac_rec(capturing);
+    draw_footer(capturing ? "" : "back", capturing ? "DONE" : "START");
+    flush();
+}
+
+void ui_tactical_baseline(float quality, bool contaminated) {
+    tac_frame();
+    auto &g = gfx();
+    draw_header("BASELINE");
+    draw_multiline(8, CONTENT_Y + 10, 16, COL_MS_INK,
+        "Hold still.\n"
+        "\n"
+        "Learning what the\n"
+        "room looks like\n"
+        "with nothing\n"
+        "happening.");
+
+    // Quality bar: this fills when the room is quiet and stalls when it
+    // is not, which is the whole story the operator needs.
+    const int bx = 10, by = CONTENT_Y + 118, bw = SCREEN_W - 20, bh = 14;
+    g.drawRect(bx, by, bw, bh, COL_MS_DIM);
+    const int fillw = (int)((bw - 2) * (quality < 0 ? 0 : (quality > 1 ? 1 : quality)));
+    g.fillRect(bx + 1, by + 1, fillw, bh - 2,
+               contaminated ? COL_MS_ALERT
+                            : (quality > 0.72f ? COL_MS_LIME : COL_MS_TEAL));
+
+    g.setFont(&fonts::Font2);
+    if (contaminated) {
+        g.setTextColor(COL_MS_ALERT, COL_BG);
+        g.setCursor(8, by + 22);
+        g.print("MOVEMENT - paused");
+        g.setTextColor(COL_MUTED, COL_BG);
+        g.setCursor(8, by + 38);
+        g.print("Contaminated samples");
+        g.setCursor(8, by + 52);
+        g.print("are never kept.");
+    } else {
+        char q[24]; snprintf(q, sizeof(q), "quality %.2f", (double)quality);
+        g.setTextColor(COL_MUTED, COL_BG);
+        g.setCursor(8, by + 22);
+        g.print(q);
+    }
+    draw_footer("back", contaminated ? "" : "accept");
+    flush();
+}
+
+void ui_tactical_critique() {
+    tac_frame();
+    auto &g = gfx();
+    draw_header("MODEL");
+    g.setFont(&fonts::Font4);
+    g.setTextColor(COL_MS_TEAL, COL_BG);
+    g.setCursor(8, CONTENT_Y + 40);
+    g.print("CHECKING");
+    draw_multiline(8, CONTENT_Y + 78, 16, COL_MUTED,
+        "Fitting the map\n"
+        "and looking for\n"
+        "the weakest part\n"
+        "of it.");
+    draw_footer("", "");
+    flush();
+}
+
+void ui_tactical_check(const char *cue, float x, float y, bool capturing) {
+    tac_frame();
+    auto &g = gfx();
+    draw_header("FIELD CHECK");
+
+    g.setFont(&fonts::Font2);
+    g.setTextColor(COL_MS_WARN, COL_BG);
+    g.setCursor(8, CONTENT_Y + 8);
+    g.print(cue ? cue : "CHECK RF FIELD");
+
+    // Where to stand, in the learned chart's own frame.
+    const int cx = SCREEN_W / 2, cy = CONTENT_Y + 90, R = 52;
+    g.drawCircle(cx, cy, R, COL_MS_DIM);
+    g.drawLine(cx - R, cy, cx + R, cy, COL_MS_DIM);
+    g.drawLine(cx, cy - R, cx, cy + R, COL_MS_DIM);
+    g.fillRect(cx - 4, cy - 2, 8, 4, COL_MS_TEAL);
+    const int px = cx + (int)(x * R), py = cy - (int)(y * R);
+    const uint16_t c = ((millis() / 350) % 2) ? COL_MS_WARN : COL_MS_ALERT;
+    g.drawCircle(px, py, 7, c);
+    g.drawLine(px - 5, py, px + 5, py, c);
+    g.drawLine(px, py - 5, px, py + 5, c);
+
+    draw_multiline(8, CONTENT_Y + 150, 15, COL_MS_INK,
+        capturing ? "Hold still here."
+                  : "Stand on the mark\n"
+                    "and press START.\n"
+                    "SKIP if you cannot\n"
+                    "reach it.");
+    tac_rec(capturing);
+    draw_footer(capturing ? "" : "skip", capturing ? "DONE" : "START");
     flush();
 }

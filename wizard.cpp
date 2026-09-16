@@ -9,6 +9,7 @@
 //  whether it's required.
 // ═══════════════════════════════════════════════════════════════
 #include "wizard.h"
+#include "csi.h"   // csi_nearest_beacon / beacon_slot_bind
 #include "scene.h"
 #include "input.h"
 #include "peer.h"
@@ -680,6 +681,31 @@ static bool         s_capture_open = false;
 // ── Capture-window helpers ────────────────────────────────────
 static void open_capture(const WizardStep &s) {
     if (s_capture_open) return;
+
+    // ── SLOT BINDING ──────────────────────────────────────────────
+    // The operator has just arrived at the slot this step names.  Ask
+    // the radio which physical beacon is standing here and bind it.
+    //
+    // Bound at capture OPEN rather than close: the operator is standing
+    // at the beacon right now, which is exactly when the near-field
+    // dominance that identifies it is strongest.  By the time the hold
+    // ends they may already be turning away.
+    if (s.kind == STEP_STAND &&
+        s.landmark_a >= LM_BEACON_1 &&
+        s.landmark_a <  (LandmarkId)(LM_BEACON_1 + MAX_BEACONS)) {
+        const int slot = (int)s.landmark_a - (int)LM_BEACON_1;
+        float margin = 0.0f;
+        const uint8_t id = csi_nearest_beacon(&margin);
+        if (id != 0 && margin >= 0.25f) {
+            beacon_slot_bind(slot, id);
+        } else {
+            // Not confident.  Leave the slot unbound rather than guess --
+            // a wrong binding corrupts the geometry it is meant to fix.
+            MSLOG("[slot] B%d: no dominant beacon (margin %.2f) - unbound\n",
+                  slot + 1, (double)margin);
+        }
+    }
+
     switch (s.kind) {
         case STEP_STAND:  scene_begin_landmark_capture(s.landmark_a); break;
         case STEP_WALK:   scene_begin_transit_capture(s.landmark_a, s.landmark_b); break;
