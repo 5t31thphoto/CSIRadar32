@@ -52,6 +52,8 @@
 //                                 should say so rather than guess
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_mesh.h"
+#include <stdint.h>
+#include <math.h>
 
 // 2.4 GHz.  Wavelength sets how much phase a given motion produces, and
 // it is the only physical constant this file needs.

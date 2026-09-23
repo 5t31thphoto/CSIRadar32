@@ -35,6 +35,12 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_timer.h>
+// esp_read_mac() and ESP_MAC_WIFI_STA are in esp_mac.h, NOT esp_wifi.h.
+// Without this the build fails with "ESP_MAC_WIFI_STA was not declared;
+// did you mean ESP_IF_WIFI_STA" -- a different enum entirely, which
+// would have compiled to the wrong thing had it been accepted.
+#include <esp_mac.h>
+#include <esp_sleep.h>
 
 #include "mantis_air.h"
 #include "mantis_sched.h"
@@ -44,6 +50,7 @@
 #include "mantis_beacon_csi.h"
 #include "mantis_dense.h"
 #include "mantis_identity.h"
+#include "mantis_geometry.h"
 #include <Preferences.h>
 
 // ── Identity ──────────────────────────────────────────────────
@@ -76,6 +83,23 @@ static MantisBeaconLink  g_link[MANTIS_SLOTS];      // one per peer id
 // speeds, while machinery concentrates in one.  It has to be built up
 // over time on the BEACON -- the receiver only ever sees the histogram,
 // never the per-frame rates it came from.
+// ── MESH SELF-SURVEY ──────────────────────────────────────────
+// Every beacon hears every other beacon, so every beacon holds a
+// complete pairwise RSSI matrix -- and therefore a distance matrix the
+// receiver has no way to obtain.  Solving it here and broadcasting the
+// answer is what replaces the assumed ring with a measured layout.
+//
+// The TIMEKEEPER publishes.  Not an election: it is already the lowest
+// live id and every node computes that independently, so making it the
+// publisher costs nothing and guarantees exactly one publisher.
+static int8_t   g_peer_rssi[MANTIS_SLOTS][MANTIS_SLOTS];   // [hearer][heard]
+static uint8_t  g_rssi_n[MANTIS_SLOTS][MANTIS_SLOTS];
+static float    g_geo_x[MANTIS_SLOTS], g_geo_y[MANTIS_SLOTS];
+static uint8_t  g_geo_stress = 255;
+static uint16_t g_geo_cm     = 0;
+static bool     g_geo_ready  = false;
+static uint32_t g_geo_last_ms = 0;
+
 static uint8_t  g_dop[MANTIS_SLOTS][MANTIS_DENSE_DOP_BINS];
 static float    g_prev_phi[MANTIS_SLOTS];
 static bool     g_prev_ok[MANTIS_SLOTS];
@@ -85,6 +109,11 @@ static uint32_t g_dop_since_ms = 0;
 // limb swings, short enough that the histogram still describes NOW
 // rather than the last minute.
 #define MANTIS_DOP_WINDOW_MS 3000
+
+// How often the timekeeper re-solves the layout.  Beacons do not move,
+// so this is about catching the case where one WAS moved -- often
+// enough to notice within a few seconds, rare enough to cost nothing.
+#define MANTIS_SURVEY_INTERVAL_MS 5000
 static uint32_t          g_counter = 0;             // the legacy field
 static bool              g_learning = true;         // baseline accumulation
 static uint32_t          g_boot_ms = 0;
@@ -128,6 +157,15 @@ static void csi_cb(void *, wifi_csi_info_t *info) {
     r.len     = n;
     r.from_id = from;
     r.rssi    = info->rx_ctrl.rssi;
+    // The genuine per-link RSSI, from the PHY.  now_recv() only ever
+    // sees the ESP-NOW callback, which does not carry it.
+    if (beacon_id && beacon_id < MANTIS_SLOTS) {
+        int8_t &pr = g_peer_rssi[beacon_id][from];
+        uint8_t &pn = g_rssi_n[beacon_id][from];
+        pr = (pn == 0) ? (int8_t)info->rx_ctrl.rssi
+                       : (int8_t)((pr * 7 + info->rx_ctrl.rssi) / 8);
+        if (pn < 255) pn++;
+    }
     r.noise   = info->rx_ctrl.noise_floor;
     r.t_us    = (uint32_t)esp_timer_get_time();
     r.seq++;                       // even: done
@@ -225,6 +263,54 @@ static void process_csi() {
                                   nullptr, i);
         r.len = 0;
     }
+}
+
+// ── SOLVE THE MESH'S OWN LAYOUT ───────────────────────────────
+//
+// Only the timekeeper does this, and only occasionally: the geometry of
+// a deployment does not change between frames, and a solve every few
+// seconds is far more often than furniture moves.
+//
+// The result REPLACES the assumed ring.  Until it runs, every position
+// downstream is relative to a fiction -- a perfect hexagon that the
+// beacons were never actually placed in.
+static void survey_geometry(uint32_t now_ms) {
+    if (!g_mesh.is_timekeeper) return;
+    if (now_ms - g_geo_last_ms < MANTIS_SURVEY_INTERVAL_MS) return;
+    g_geo_last_ms = now_ms;
+
+    const uint8_t n = MANTIS_MAX_BEACON_ID;
+    static float dist[MANTIS_MAX_BEACON_ID * MANTIS_MAX_BEACON_ID];
+    uint8_t live = 0;
+    for (uint8_t i = 0; i < n; i++)
+        if (g_rssi_n[beacon_id][i + 1] > 0 || (i + 1) == beacon_id) live++;
+
+    // We only hold OUR OWN row of the matrix directly.  The other rows
+    // arrive as peers' reports, and a beacon that cannot hear a pair has
+    // no opinion about that pair -- so unmeasured entries are marked
+    // negative and the solver skips them.  That is exactly why stress
+    // majorisation was chosen over classical MDS.
+    for (uint8_t i = 0; i < n; i++)
+        for (uint8_t j = 0; j < n; j++) {
+            if (i == j) { dist[i * n + j] = 0.0f; continue; }
+            const uint8_t a = (uint8_t)(i + 1), b = (uint8_t)(j + 1);
+            int8_t r = 0; uint8_t cnt = 0;
+            if (g_rssi_n[a][b]) { r = g_peer_rssi[a][b]; cnt++; }
+            if (g_rssi_n[b][a]) { r = (int8_t)((r + g_peer_rssi[b][a]) / (cnt ? 2 : 1)); cnt++; }
+            dist[i * n + j] = cnt ? mantis_rssi_to_m(r) : -1.0f;
+        }
+
+    float x[MANTIS_SLOTS], y[MANTIS_SLOTS];
+    const float stress = mantis_geom_solve(dist, n, x, y, 120);
+    mantis_geom_canonical(x, y, n);
+    g_geo_cm = mantis_geom_normalise(x, y, n);
+    for (uint8_t i = 0; i < n; i++) { g_geo_x[i] = x[i]; g_geo_y[i] = y[i]; }
+    g_geo_stress = (uint8_t)(stress * 255.0f > 255.0f ? 255 : stress * 255.0f);
+    // Publish even a poor solve -- the CONFIDENCE travels with it, and a
+    // receiver that knows the layout is 40% trusted can draw it faintly.
+    // Suppressing it entirely would leave the receiver on the assumed
+    // ring with no idea a better answer existed.
+    g_geo_ready = (live >= 3);
 }
 
 // ── Build and send this slot's payload ────────────────────────
@@ -363,6 +449,7 @@ void loop() {
 
     mantis_mesh_tick(&g_mesh, now);
     process_csi();
+    survey_geometry(now_ms);
 
     // Age the Doppler window.  Halving rather than clearing keeps a
     // little history across the boundary, so a target that was moving a
@@ -410,7 +497,12 @@ void loop() {
         && (duty.seq != last_tx_seq || duty.slot != last_tx_slot)) {
         last_tx_seq  = duty.seq;
         last_tx_slot = duty.slot;
-        transmit(duty.payload);
+        // Only the timekeeper holds a solved layout.  Anyone else handed
+        // the geometry slot sends its perspective instead, so the slot
+        // is never wasted on a packet that would have been empty.
+        MantisPayloadKind k = duty.payload;
+        if (k == MPL_ECHO && !(g_mesh.is_timekeeper && g_geo_ready)) k = MPL_REPORT;
+        transmit(k);
     }
 
     // ── SLEEP ─────────────────────────────────────────────────

@@ -28,23 +28,21 @@
     // the flash button on both dropdowns being set.
     const MANIFESTS = {
         'receiver|t-display-s3':   'manifests/receiver.json',
-        // The Cardputer-Adv is a receiver too -- a probe-role one.  It
-        // gets the MERGED image here; the launcher-compatible bare app
-        // image is a separate download, not something to flash at 0x0.
-        'receiver|cardputer-adv':  'manifests/cardputer-adv.json',
+        // ONE beacon firmware.  It claims its mesh id at runtime and
+        // persists it, so there is no longer a bin per beacon -- and no
+        // longer a way to flash the wrong one to the wrong box.
+        'beacon|xiao-c3':          'manifests/beacon-c3.json',
+        'beacon|xiao-s3':          'manifests/beacon-s3.json',
+        // The hand-held devices are full receivers in the PROBE role.
+        // They are listed under 'probe' only: a stale 'receiver|...' key
+        // was reachable from no dropdown combination and just invited
+        // someone to wire it up by mistake.
+        //
+        // Each gets the MERGED image here.  The launcher-compatible bare
+        // app image is a separate download from docs/bins, NOT something
+        // to flash at offset 0.
+        'probe|core2':             'manifests/core2.json',
         'probe|cardputer-adv':     'manifests/cardputer-adv.json',
-        'beacon-1|xiao-c3':         'manifests/beacon-1.json',
-        'beacon-1|xiao-s3':         'manifests/beacon-1.json',
-        'beacon-2|xiao-c3':         'manifests/beacon-2.json',
-        'beacon-2|xiao-s3':         'manifests/beacon-2.json',
-        'beacon-3|xiao-c3':         'manifests/beacon-3.json',
-        'beacon-3|xiao-s3':         'manifests/beacon-3.json',
-        'beacon-4|xiao-c3':         'manifests/beacon-4.json',
-        'beacon-4|xiao-s3':         'manifests/beacon-4.json',
-        'beacon-5|xiao-c3':         'manifests/beacon-5.json',
-        'beacon-5|xiao-s3':         'manifests/beacon-5.json',
-        'beacon-6|xiao-c3':         'manifests/beacon-6.json',
-        'beacon-6|xiao-s3':         'manifests/beacon-6.json',
     };
 
     // Which boards go with which role
@@ -53,29 +51,10 @@
             { value: 't-display-s3', label: 'LilyGo T-Display S3' }
         ],
         'probe': [
+            { value: 'core2',         label: 'M5Stack Core2' },
             { value: 'cardputer-adv', label: 'M5Stack Cardputer-Adv' }
         ],
-        'beacon-1': [
-            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
-            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
-        ],
-        'beacon-2': [
-            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
-            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
-        ],
-        'beacon-3': [
-            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
-            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
-        ],
-        'beacon-4': [
-            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
-            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
-        ],
-        'beacon-5': [
-            { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
-            { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
-        ],
-        'beacon-6': [
+        'beacon': [
             { value: 'xiao-c3', label: 'Seeed XIAO ESP32-C3' },
             { value: 'xiao-s3', label: 'Seeed XIAO ESP32-S3' }
         ],

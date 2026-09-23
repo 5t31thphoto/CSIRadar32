@@ -41,6 +41,7 @@
 //  silently and permanently, and it looks exactly like poor tracking.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_mesh.h"
+#include <stdint.h>
 #include "mantis_geometry.h"
 
 // Free-space loss is proportional to distance^2; in the normalised

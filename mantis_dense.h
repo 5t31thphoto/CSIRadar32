@@ -61,6 +61,7 @@
 //     tracker has run.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_report.h"
+#include <stdint.h>
 #include <math.h>   // sqrtf/fabsf, used by the profile and Doppler helpers
 
 #define MANTIS_DENSE_VERSION   1

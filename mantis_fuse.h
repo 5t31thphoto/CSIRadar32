@@ -49,6 +49,7 @@
 //  is why stability alone was never going to be enough.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_targets.h"
+#include <stdint.h>
 #include "mantis_doppler.h"
 #include "mantis_report.h"
 #include "mantis_trilat.h"
@@ -63,21 +64,34 @@
 // no field, no back-projection, just counting who independently agrees.
 // It works because each beacon judged its own links against its own
 // baseline -- six separate opinions, not one opinion six times.
-#ifndef MANTIS_MIN_WITNESSES
-  #define MANTIS_MIN_WITNESSES 3
-#endif
+// ── WITNESS THRESHOLDS SCALE WITH THE MESH ───────────────────
+//
+// Absolute thresholds were wrong and the failure was silent: with three
+// beacons the maximum possible witness count is three, so an absolute
+// "strong" floor of four could NEVER be met.  A three-beacon deployment
+// found its target on every frame and believed it on none.
+//
+// UNANIMOUS AGREEMENT AMONG THREE IS STRONGER EVIDENCE THAN FOUR OF SIX.
+// What matters is the fraction that agree, with absolute floors so a
+// two-beacon mesh cannot declare a quorum of one.
+static inline uint8_t mantis_min_witnesses(uint8_t n_beacons) {
+    if (n_beacons < 3) return 2;               // the whole mesh
+    const uint8_t half = (uint8_t)((n_beacons + 1) / 2);
+    return half < 2 ? 2 : half;
+}
+static inline uint8_t mantis_strong_witnesses(uint8_t n_beacons) {
+    if (n_beacons < 3) return 2;
+    // Two thirds, floored at 2 and never more than the mesh can supply.
+    uint8_t s = (uint8_t)((n_beacons * 2 + 2) / 3);
+    if (s < 2) s = 2;
+    if (s > n_beacons) s = n_beacons;
+    return s;
+}
 
 // How far a back-projection peak can sit from the truth it represents.
 // One grid cell (0.10) plus the reconstruction bias measured against
 // known targets (~0.05).  Widening the witness test by this much is not
 // slack -- it is the measured uncertainty of the thing being tested.
-// Witnesses sufficient to carry a contact WITHOUT Doppler corroboration.
-// Set above the measured artefact count (2 of 6) with a clear margin,
-// and below what a real target reliably achieves (4-5 of 6).
-#ifndef MANTIS_STRONG_WITNESSES
-  #define MANTIS_STRONG_WITNESSES 4
-#endif
-
 #ifndef MANTIS_WITNESS_SLACK
   #define MANTIS_WITNESS_SLACK 0.15f
 #endif
@@ -258,7 +272,7 @@ static inline void mantis_fuse_update(MantisFusion *F,
                                               MANTIS_WITNESS_SLACK * 2.0f);
 
         MantisFuseClass cls;
-        if (wit < MANTIS_MIN_WITNESSES) {
+        if (wit < mantis_min_witnesses(m->n_beacons)) {
             // Too few beacons independently saw a blockage on any path
             // through here.  The back-projection may show a strong peak,
             // and it is still a crossing of streaks rather than a body:
@@ -284,12 +298,12 @@ static inline void mantis_fuse_update(MantisFusion *F,
             cls = discredited ? MFC_SHADOW_ONLY : MFC_STATIC;
         } else if (expl >= MANTIS_FUSE_CORROBORATE) {
             cls = MFC_CONFIRMED;
-        } else if (tri_ok && wit >= MANTIS_MIN_WITNESSES) {
+        } else if (tri_ok && wit >= mantis_min_witnesses(m->n_beacons)) {
             // Two independent position methods agree and enough beacons
             // witnessed a blockage.  That is corroboration from a
             // different direction than Doppler, and it is worth the same.
             cls = MFC_CONFIRMED;
-        } else if (wit >= MANTIS_STRONG_WITNESSES) {
+        } else if (wit >= mantis_strong_witnesses(m->n_beacons)) {
             // STRONG INDEPENDENT AGREEMENT OUTWEIGHS ONE CHANNEL'S DOUBT.
             //
             // Five of six beacons each measured a blockage on a path

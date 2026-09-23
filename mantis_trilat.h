@@ -45,6 +45,8 @@
 //  is worth the little it costs.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_mesh.h"
+#include <stdint.h>
+#include <math.h>
 #include "mantis_report.h"
 
 #define MANTIS_TRI_MAX_SEG 16

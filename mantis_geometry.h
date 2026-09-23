@@ -50,6 +50,7 @@
 //  measured.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_report.h"
+#include <stdint.h>
 #include <math.h>
 
 #define MANTIS_GEOM_VERSION 1

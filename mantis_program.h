@@ -208,8 +208,20 @@ static inline MantisDuty mantis_duty(const MantisSched *s, int64_t now_us,
         default:   // MFR_SOLO
             d.transmit = (d.slot == (uint8_t)(my_id - 1));
             // The payload rides the transmission we were making anyway.
-            d.payload  = (my_id == mantis_report_turn(seq, n_beacons))
-                       ? MPL_REPORT : MPL_SOUND;
+            //
+            // Once per macroframe the slot that would carry a REPORT
+            // carries the SURVEYED GEOMETRY instead.  Only the
+            // timekeeper fills it (mantis_program cannot know who that
+            // is, so the beacon checks and falls back to SOUND), and it
+            // costs one report out of sixteen -- the layout changes far
+            // more slowly than the links do.
+            if ((seq % MANTIS_MACRO_FRAMES) == 13
+                && my_id == mantis_report_turn(seq, n_beacons)) {
+                d.payload = MPL_ECHO;      // geometry, if this node has it
+            } else {
+                d.payload = (my_id == mantis_report_turn(seq, n_beacons))
+                          ? MPL_REPORT : MPL_SOUND;
+            }
             d.listen   = !d.transmit;
             break;
     }

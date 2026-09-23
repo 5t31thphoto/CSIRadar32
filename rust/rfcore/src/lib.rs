@@ -583,31 +583,31 @@ impl Engine {
 }
 
 static mut E:Engine=Engine::new();
-#[no_mangle]pub extern "C"fn mantis_rf_sizeof_node()->usize{core::mem::size_of::<RfNode>()}
-#[no_mangle]pub extern "C"fn mantis_rf_sizeof_snapshot()->usize{core::mem::size_of::<RfSnapshot>()}
-#[no_mangle]pub extern "C"fn mantis_rf_sizeof_check()->usize{core::mem::size_of::<RfCheck>()}
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_reset(){E.reset()}
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_begin(){E.active=true;E.ready=false}
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_add_node(n:*const RfNode){if !n.is_null(){E.add_node(&*n)}}
+#[no_mangle]pub extern "C" fn mantis_rf_sizeof_node()->usize{core::mem::size_of::<RfNode>()}
+#[no_mangle]pub extern "C" fn mantis_rf_sizeof_snapshot()->usize{core::mem::size_of::<RfSnapshot>()}
+#[no_mangle]pub extern "C" fn mantis_rf_sizeof_check()->usize{core::mem::size_of::<RfCheck>()}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_reset(){E.reset()}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_begin(){E.active=true;E.ready=false}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_add_node(n:*const RfNode){if !n.is_null(){E.add_node(&*n)}}
 // Add a post-calibration observation in the same baseline-relative space as
 // runtime frames. This is deliberately separate from mantis_rf_add_node():
 // deployment samples arrive before the baseline exists and are converted once
 // by mantis_rf_set_baseline(), while active-check samples arrive afterwards.
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_add_live_node(n:*const RfNode){
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_add_live_node(n:*const RfNode){
     if n.is_null(){return}
     let mut live=*n;
     live.feat=E.delta_features(&live.feat,MAX_B);
     E.add_node(&live);
 }
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_add_edge(a:u8,b:u8){E.add_edge(a,b)}
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_finalize()->u8{E.learn_feature_weights();E.embed_chart();E.build_local_edges();E.ready=E.node_n>=2;E.ready as u8}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_add_edge(a:u8,b:u8){E.add_edge(a,b)}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_finalize()->u8{E.learn_feature_weights();E.embed_chart();E.build_local_edges();E.ready=E.node_n>=2;E.ready as u8}
 // Refresh statistics/graph after an active check without re-embedding the
 // chart.  Check coordinates are operator-measured coordinates in the already
 // established chart; re-embedding here would silently move that measurement
 // and corrupt the very calibration point we just paid to collect.
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_refresh_live_model(){if E.node_n>=2{E.learn_feature_weights();E.build_local_edges();E.ready=true;}}
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_set_sensitivity(v:f32){E.sensitivity=v.clamp(0.25,4.0);}
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_set_baseline(f:*const f32,n:usize){
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_refresh_live_model(){if E.node_n>=2{E.learn_feature_weights();E.build_local_edges();E.ready=true;}}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_set_sensitivity(v:f32){E.sensitivity=v.clamp(0.25,4.0);}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_set_baseline(f:*const f32,n:usize){
     if f.is_null(){return}
     let m=n.min(FEATS);
     let src=core::slice::from_raw_parts(f,m);
@@ -623,5 +623,5 @@ static mut E:Engine=Engine::new();
     }
     E.base_valid=true;
 }
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_next_check(out:*mut RfCheck)->u8{if out.is_null(){return 0}*out=E.next_check();(*out).valid}
-#[no_mangle]pub unsafe extern "C"fn mantis_rf_observe(frame:u32,features:*const f32,nb:u8,plen:f32,out:*mut RfSnapshot)->u8{if features.is_null()||out.is_null(){return 0}let mut f=[0.0;FEATS];let n=(nb as usize).min(MAX_B)*FEAT_PER_B;let src=core::slice::from_raw_parts(features,n);f[..n].copy_from_slice(src);*out=E.observe(frame,&f,nb as usize,plen);1}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_next_check(out:*mut RfCheck)->u8{if out.is_null(){return 0}*out=E.next_check();(*out).valid}
+#[no_mangle]pub unsafe extern "C" fn mantis_rf_observe(frame:u32,features:*const f32,nb:u8,plen:f32,out:*mut RfSnapshot)->u8{if features.is_null()||out.is_null(){return 0}let mut f=[0.0;FEATS];let n=(nb as usize).min(MAX_B)*FEAT_PER_B;let src=core::slice::from_raw_parts(features,n);f[..n].copy_from_slice(src);*out=E.observe(frame,&f,nb as usize,plen);1}

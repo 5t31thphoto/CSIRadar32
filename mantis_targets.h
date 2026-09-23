@@ -42,6 +42,8 @@
 //  Slotted gives +- 0.2 ms, 0.6%.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_mesh.h"
+#include <stdint.h>
+#include <math.h>
 
 #define MANTIS_MAX_TARGETS 4
 
@@ -240,9 +242,30 @@ static inline uint8_t mantis_targets_extract(MantisTargetSet *ts,
         // fraction of the primary's strength separates a person from a
         // reconstruction artefact -- and does it with a number that has a
         // physical meaning rather than a tuned threshold.
+        // SCALE THE SECOND-TARGET BAR BY HOW MANY LINES WE ACTUALLY HAVE.
+        //
+        // 0.70 was measured on a COMPLETE 15-chord set, where the
+        // strongest streak artefact reached 61% of a real peak.  With
+        // fewer chords the reconstruction has fewer constraints and the
+        // streaks get relatively stronger: at 20 of 30 directed links,
+        // artefacts reached 77-79% and one person was reported as three.
+        //
+        // Fewer independent lines means less ability to separate
+        // targets, so the evidence bar rises accordingly.  That is the
+        // geometry talking, not a tuned constant -- and it degrades in
+        // the safe direction, because reporting phantom people is worse
+        // than missing a second real one.
+        const float full = (float)(MANTIS_MAX_TARGETS > 0 ? 15 : 15);
+        const float have = (float)m->n_chords;
+        float frac = MANTIS_SECOND_TARGET_FRAC;
+        if (have < full) {
+            const float sparsity = 1.0f - (have / full);      // 0 = complete
+            frac += (0.95f - MANTIS_SECOND_TARGET_FRAC) * sparsity;
+            if (frac > 0.95f) frac = 0.95f;
+        }
         const bool strong_enough =
             (k == 0) ? (margin > MANTIS_MESH_MIN_MARGIN)
-                     : (bv >= MANTIS_SECOND_TARGET_FRAC * ts->t[0].llr
+                     : (bv >= frac * ts->t[0].llr
                         && margin > MANTIS_MESH_MIN_MARGIN);
         const bool ok = (cov >= 2) && strong_enough;
 

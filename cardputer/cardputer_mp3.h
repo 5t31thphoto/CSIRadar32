@@ -44,6 +44,7 @@
 //  than in silence.
 // ═══════════════════════════════════════════════════════════════
 #include "cardputer_platform.h"
+#include <stdio.h>
 #include "cardputer_audio.h"
 
 // Virtual speaker channel.  m5::Speaker_Class mixes 0-7 internally, so

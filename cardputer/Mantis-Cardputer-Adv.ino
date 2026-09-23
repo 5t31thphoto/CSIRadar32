@@ -60,6 +60,11 @@
 #include "mantis_probe.h"
 #include "mantis_geometry.h"
 #include "mantis_static.h"
+#include "mantis_receiver.h"
+#include "mantis_caps.h"
+#include "mantis_fuse.h"
+#include "mantis_control.h"
+#include "mantis_probe_radio.h"
 
 // ── State ─────────────────────────────────────────────────────
 static M5Canvas          g_cv(&M5Cardputer.Display);
@@ -71,16 +76,25 @@ static CardputerSession  g_sess;
 static CardputerScreen   g_screen = CPS_SPLASH;
 static CardputerMode     g_mode   = CPM_SEARCHING;
 
-static MantisMesh            g_mesh;
-static MantisPerspectiveStore g_store;
-static MantisTargetSet       g_targets;
-static MantisProbe           g_probe;
-static MantisStaticScene     g_static;
-static MantisIntegrity       g_integ;
+// ONE receiver object, exactly as the Core2 uses.
+//
+// This file previously drove MantisMesh, MantisTargetSet and friends
+// directly, which meant it silently missed everything mantis_receiver.h
+// added later: surveyed-geometry adoption, cross-channel fusion, the
+// phase-rate Doppler input, and capability gating.  Two devices with the
+// same role were running different inference.
+//
+// Anything a device needs from the mesh now goes through here.
+static MantisReceiver g_rx;
+#define g_mesh    (g_rx.mesh)
+#define g_targets (g_rx.targets)
+#define g_integ   (g_rx.integrity)
+#define g_probe   (g_rx.probe)
 
 static uint32_t g_screen_entered_ms = 0;
 static uint8_t  g_dash_view = 0;
 static bool     g_canvas_ok = false;
+static MantisProbeLink g_link;
 
 static uint32_t screen_age() { return millis() - g_screen_entered_ms; }
 static void go(CardputerScreen s) {
@@ -346,10 +360,21 @@ static void screen_discovery() {
     g_cv.setCursor(6, cp_row_y(1));
     g_cv.printf("anchor: %s", (millis() - g_last_tdisplay_ms) < 2000 ? "yes" : "none");
 
-    const CardputerCaps c = cp_caps(g_mode, g_mesh.n_beacons);
-    g_cv.setTextColor(CPC_WARN, CPC_BG);
-    g_cv.setCursor(6, cp_row_y(3));
-    g_cv.print(c.why_limited);
+    // What this deployment can do, and the single most useful thing to
+    // add next.  Both from the shared capability layer, so the menu can
+    // never offer something the solver cannot do.
+    const MantisDeployment &dep = g_rx.deploy;
+    const MantisCaps &caps = g_rx.caps;
+
+    g_cv.setTextColor(caps.localize ? CPC_LIME : CPC_WARN, CPC_BG);
+    g_cv.setCursor(6, cp_row_y(2));
+    g_cv.printf("%s  %d chords", caps.localize ? "LOCATING" : "presence only",
+                caps.chords);
+    if (caps.blocker[0]) {
+        g_cv.setTextColor(CPC_MID, CPC_BG);
+        g_cv.setCursor(6, cp_row_y(4));
+        g_cv.print(caps.blocker);
+    }
 
     draw_footer("", g_mesh.n_beacons ? "go" : "");
     flush();
@@ -436,19 +461,32 @@ static void screen_settings() {
     draw_chrome("SETTINGS");
     g_cv.setFont(&fonts::Font0);
     static int sel = 0;
+    const MantisDeployment &dep = g_rx.deploy;
+    const MantisCaps &caps = g_rx.caps;
     const char *items[] = { "Alarms", "Sessions", "Mesh health", "Radar", "Calibrate" };
+    // Calibrate needs a fixed anchor, which a hand-held device is not.
+    // Shown either way, with the reason -- a greyed row that explains
+    // itself is help; one that does not is a support question.
+    const bool avail[] = { true, true, caps.localize, true, caps.tactical };
     const int n = 5;
     if (g_in.down) sel = (sel + 1) % n;
     if (g_in.up)   sel = (sel + n - 1) % n;
     for (int i = 0; i < n; i++) {
-        g_cv.setTextColor(i == sel ? CPC_LIME : CPC_INK, CPC_BG);
+        const bool ok = avail[i];
+        g_cv.setTextColor(!ok ? CPC_DIM : (i == sel ? CPC_LIME : CPC_INK), CPC_BG);
         g_cv.setCursor(6, cp_row_y(i));
         g_cv.printf("%c %s", i == sel ? '>' : ' ', items[i]);
+        if (!ok && i == sel) {
+            g_cv.setTextColor(CPC_WARN, CPC_BG);
+            g_cv.setCursor(cp_status_x(), cp_row_y(i));
+            g_cv.print(mantis_caps_why(&dep, &caps,
+                       i == 4 ? "tactical" : "localize"));
+        }
     }
     draw_footer("radar", "select");
     flush();
     if (cp_was_short(&g_in, BTN_LEFT) || g_in.esc) go(CPS_DASHBOARD);
-    if (cp_was_short(&g_in, BTN_RIGHT)) {
+    if (cp_was_short(&g_in, BTN_RIGHT) && avail[sel]) {
         switch (sel) {
             case 0: go(CPS_ALARMS);    break;
             case 1: go(CPS_SESSIONS);  break;
@@ -463,6 +501,14 @@ static void screen_settings() {
 // this hardware.  The red needle is MEASURED here, not estimated.
 static void screen_cal_walk() {
     draw_chrome("CAL WALK");
+    // Mirror the step to the anchor so it renders what the operator is
+    // actually doing rather than sitting on the first one.  A hint, so
+    // it is re-sent periodically rather than retried.
+    static uint32_t s_hint_ms = 0;
+    if (millis() - s_hint_ms > 500) {
+        s_hint_ms = millis();
+        mantis_probe_send(&g_link, MPC_CAL_STEP_HINT, 0, 0, 0, millis(), true);
+    }
     const int cx = CP_MAP_CX, cy = CP_MAP_CY, r = CP_MAP_R;
     g_cv.drawCircle(cx, cy, r, CPC_DIM);
 
@@ -482,10 +528,22 @@ static void screen_cal_walk() {
     g_cv.setCursor(x, cp_row_y(4));
     g_cv.print(g_imu.bias_ready ? "imu ready" : "imu warming");
 
+    g_cv.setTextColor(mantis_probe_anchor_live(&g_link, millis()) ? CPC_MID : CPC_WARN, CPC_BG);
+    g_cv.setCursor(x, cp_row_y(5));
+    g_cv.print(mantis_probe_link_state(&g_link, millis()));
+
     draw_footer("back", "mark");
     flush();
-    if (cp_was_short(&g_in, BTN_LEFT))  go(CPS_SETTINGS);
-    if (cp_was_short(&g_in, BTN_RIGHT)) cp_turn_begin(&g_turn, &g_imu);
+    if (cp_was_short(&g_in, BTN_LEFT)) {
+        // Closes the anchor's capture window; otherwise it keeps
+        // recording an empty room into the training set.
+        mantis_probe_send(&g_link, MPC_CAL_END, 0, 0, 0, millis(), true);
+        go(CPS_SETTINGS);
+    }
+    if (cp_was_short(&g_in, BTN_RIGHT)) {
+        cp_turn_begin(&g_turn, &g_imu);
+        mantis_probe_send(&g_link, MPC_CAL_BEGIN, 0, 0, 0, millis(), true);
+    }
 }
 
 // ── Arduino ───────────────────────────────────────────────────
@@ -501,9 +559,10 @@ void setup() {
     cp_audio_begin(&g_audio);
     cp_turn_begin(&g_turn, &g_imu);
 
-    g_mesh = MantisMesh{};
-    g_mesh.extent = 1.2f;
-    g_probe = MantisProbe{};
+    // Probe role: one receiver, no T-Display until we hear one.
+    mantis_rx_begin(&g_rx, 1.2f, /*tdisplays*/0, /*cardputers*/1, /*docked*/false);
+    mantis_probe_link_begin(&g_link);
+    mantis_probe_radio_begin();     // without this the UI renders nothing real
 
     // ── SD MOUNT, WITH THE PINS IT ACTUALLY NEEDS ─────────────
     // SD.begin() with no arguments uses the default VSPI pins, which are
@@ -548,16 +607,14 @@ void loop() {
     // Mesh solve, rate-limited well below the display rate -- the
     // tomography does not get better by running faster than the beacons
     // report.
-    static uint32_t last_solve = 0;
-    if (millis() - last_solve >= 100) {
-        last_solve = millis();
-        if (g_mesh.base_ready) {
-            mantis_mesh_solve(&g_mesh);
-            mantis_targets_extract(&g_targets, &g_mesh, &g_store,
-                                   g_mesh.last_seq, 0.1f, millis());
-            mantis_integrity_check(&g_integ, &g_mesh, 0.10f);
-        }
-    }
+    // Drain the radio EVERY loop, not on the solve interval: reports
+    // arrive faster than the solve runs and the queue is eight deep.
+    mantis_probe_pump(&g_rx, millis());
+    mantis_probe_retry_tick(&g_link, millis());
+
+    // One call. It rate-limits itself, latches the baseline on coverage,
+    // applies dense link quality, runs both channels and fuses them.
+    mantis_rx_solve(&g_rx, millis(), 0.1f);
 
     switch (g_screen) {
         case CPS_SPLASH:    screen_splash();    break;

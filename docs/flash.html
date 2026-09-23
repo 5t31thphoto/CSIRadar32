@@ -58,14 +58,9 @@
             <label for="role-select">1 · What are you flashing?</label>
             <select id="role-select">
                 <option value="">— pick a device —</option>
-                <option value="receiver">Receiver (T-Display-S3)</option>
-                <option value="probe">Probe (Cardputer-Adv)</option>
-                <option value="beacon-1">Beacon 1</option>
-                <option value="beacon-2">Beacon 2</option>
-                <option value="beacon-3">Beacon 3</option>
-                <option value="beacon-4">Beacon 4</option>
-                <option value="beacon-5">Beacon 5</option>
-                <option value="beacon-6">Beacon 6</option>
+                <option value="receiver">Anchor / Receiver (T-Display-S3)</option>
+                <option value="probe">Probe (in-hand receiver)</option>
+                <option value="beacon">Beacon (any &mdash; self-identifying)</option>
             </select>
         </div>
 
@@ -226,6 +221,46 @@
                     Buy XIAO ESP32-S3 &rarr;
                 </a>
             </div>
+        </div>
+    </section>
+
+    <!-- ═══ SD / M5Launcher downloads ═══ -->
+    <section class="panel">
+        <div class="instructions">
+            <h3>Install from an SD card</h3>
+            <p>
+                If you run <span class="accent">M5Launcher</span> on a Cardputer or
+                Core2, you can boot MantisSec from the SD card instead of flashing
+                over USB.
+            </p>
+            <p>
+                Copy the <span class="accent">merged</span> image to the card and pick
+                it in the launcher. M5Launcher reads the partition table inside a
+                merged factory image and installs just the application, so the same
+                file works for the web flasher above, for <code>esptool</code> at
+                offset&nbsp;0, and for the launcher.
+            </p>
+            <p>
+                The <span class="accent">app-only</span> image is a smaller download
+                the launcher also accepts. It cannot be flashed on its own over USB
+                &mdash; it has no bootloader and no partition table.
+            </p>
+            <h3 style="margin-top: 18px;">Downloads</h3>
+            <ul>
+                <li>M5Stack Core2 &mdash;
+                    <a href="bins/mantis-core2-merged.bin" download>merged</a> ·
+                    <a href="bins/mantis-core2-app.bin" download>app-only</a></li>
+                <li>M5Stack Cardputer-Adv &mdash;
+                    <a href="bins/mantis-cardputer-adv-merged.bin" download>merged</a> ·
+                    <a href="bins/mantis-cardputer-adv-app.bin" download>app-only</a></li>
+            </ul>
+            <h3 style="margin-top: 18px;">Alarm sounds</h3>
+            <p>
+                Optional MP3s in <code>/mantis/alarms</code> on the card. Every alarm
+                has a built-in fallback tone, so a missing file still makes a noise
+                &mdash; the alarms screen shows <code>SD</code> or <code>tone</code>
+                so you can see which one you are getting.
+            </p>
         </div>
     </section>
 

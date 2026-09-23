@@ -95,6 +95,30 @@ typedef struct __attribute__((packed)) {
     int8_t   rssi_self;    // this beacon's own reference level
     uint8_t  n_links;      // how many entries of links[] are meaningful
     uint8_t  flags;        // see MANTIS_RF_* below
+
+    // ── THIS BEACON'S OWN VERDICT ─────────────────────────────
+    //
+    // Bit k set = "link to beacon k+1 is BLOCKED", decided HERE, on the
+    // beacon, against its own baseline, its own noise floor and its own
+    // per-link history.
+    //
+    // The receiver could threshold the amplitudes itself, and that would
+    // NOT be the same thing.  This is an independent judgement made with
+    // information the receiver does not have: how quiet this particular
+    // link normally is, how much it has been wandering, what the local
+    // noise floor did in the silence slot.  Six beacons each making that
+    // call is six witnesses, not one witness with six inputs.
+    //
+    // It is what turns the mesh from a sensor array into a jury: a real
+    // body sits on links from MANY beacons, while a reconstruction
+    // artefact is a crossing of streaks that few or none of them
+    // actually saw.  Measured on a live six-beacon run:
+    //
+    //      real target   4 of 6 beacons had a blocked link through it
+    //      ghost         2 of 6
+    //      far ghost     0 of 6
+    uint8_t  blocked_mask;
+    uint8_t  _pad2;
     uint8_t  crc8;         // over everything after this field
     uint8_t  _pad;         // explicit: keeps links[] 2-byte aligned
     MantisLinkView links[MANTIS_MAX_LINKS];

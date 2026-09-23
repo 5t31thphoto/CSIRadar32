@@ -32,6 +32,7 @@
 #include "cardputer_input.h"
 #include "cardputer_imu.h"
 #include "cardputer_audio.h"
+#include "mantis_caps.h"
 
 // Palette, kept deliberately identical in MEANING to the T-Display so an
 // operator moving between the two devices does not have to relearn it.
@@ -100,45 +101,29 @@ static inline const char *cp_mode_name(CardputerMode m) {
     }
 }
 
-// What each mode can actually do.  Reported rather than assumed, because
-// "why is tactical greyed out" must have an answer on screen.
-typedef struct {
-    bool can_tactical;
-    bool can_stereo_aoa;
-    bool can_full_cal;
-    bool mesh_inference;      // are we solving from the mesh ourselves?
-    const char *why_limited;
-} CardputerCaps;
-
-static inline CardputerCaps cp_caps(CardputerMode m, uint8_t n_beacons) {
-    CardputerCaps c{};
+// Capability now comes from mantis_caps.h, which both firmwares share.
+//
+// This file previously derived its own, and two implementations of the
+// same question is how a menu ends up offering something the solver
+// cannot do -- the Cardputer's version keyed only on mode and beacon
+// count, and knew nothing about chord counts, geometry confidence or
+// whether a probe existed.
+//
+// The mode enum survives because it describes the DEPLOYMENT SHAPE,
+// which is what the header line shows and what an operator recognises.
+// What that shape can DO is a separate question with one answer.
+static inline MantisDeployment cp_deployment(CardputerMode m, uint8_t n_beacons,
+                                             bool geometry_known) {
+    MantisDeployment d{};
+    d.beacons        = n_beacons;
+    d.cardputers     = 1;                 // we are one, by definition
+    d.geometry_known = geometry_known;
     switch (m) {
-        case CPM_PROBE_STEREO:
-            c.can_tactical = c.can_stereo_aoa = c.can_full_cal = true;
-            c.why_limited = "";
-            break;
-        case CPM_PROBE_SOLO:
-            c.can_tactical = c.can_full_cal = true;
-            c.can_stereo_aoa = false;
-            c.why_limited = "no stereo pair: no AoA";
-            break;
-        case CPM_STANDALONE:
-            // No anchor means no fixed reference, so a Full Mode walk
-            // cannot be built -- but the beacon mesh is autonomous, so
-            // tomography and Doppler work perfectly well without one.
-            // That is the whole reason the mesh was made independent.
-            c.mesh_inference = true;
-            c.can_tactical   = (n_beacons >= 3);
-            c.can_full_cal   = false;
-            c.why_limited    = (n_beacons >= 3)
-                             ? "mesh only: no anchor reference"
-                             : "need 3+ beacons for mesh solve";
-            break;
-        default:
-            c.why_limited = "waiting for beacons";
-            break;
+        case CPM_PROBE_STEREO: d.tdisplays = 2; d.docked = true;  break;
+        case CPM_PROBE_SOLO:   d.tdisplays = 1; d.docked = false; break;
+        default:               d.tdisplays = 0; d.docked = false; break;
     }
-    return c;
+    return d;
 }
 
 // ── Layout helpers ────────────────────────────────────────────

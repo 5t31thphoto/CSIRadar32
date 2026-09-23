@@ -47,6 +47,8 @@
 //  The walk is not merely sampling responses.  It is forming an aperture.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_mesh.h"
+#include <stdint.h>
+#include <math.h>
 
 typedef struct {
     float   x, y;          // where the probe is, in chart units

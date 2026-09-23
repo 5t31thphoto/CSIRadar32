@@ -40,6 +40,7 @@
 #include "mantis_static.h"
 #include "mantis_probe.h"
 #include "mantis_fuse.h"
+#include "mantis_caps.h"
 
 // UID -> current beacon_id.  The receiver watches this and RE-KEYS
 // rather than silently mixing data when a box's assignable id changes.
@@ -75,6 +76,17 @@ typedef struct {
     uint8_t  link_flags[MANTIS_SLOTS * MANTIS_SLOTS];
 
     uint32_t reports_in, dense_in, rejected;
+    uint32_t geom_in, geom_rejected, geom_rebuilds;
+    uint8_t  geom_stress;
+    float    geom_shift;      // largest beacon move on the last adoption
+    uint16_t cm_per_unit;     // absolute scale, when the survey supplies it
+    bool     scale_known;
+    // What this deployment can do, recomputed as hardware appears and
+    // disappears.  Every screen asks THIS rather than testing beacon
+    // counts itself -- gating scattered across screens is how a menu
+    // ends up offering something the solver cannot do.
+    MantisDeployment deploy;
+    MantisCaps       caps;
     uint32_t last_solve_ms;
     bool     baseline_latched;
     bool     baseline_partial;   // latched on the backstop, not on coverage
@@ -107,9 +119,18 @@ typedef struct {
   #define MANTIS_RX_BASELINE_MAX_MS 45000
 #endif
 
-static inline void mantis_rx_begin(MantisReceiver *r, float extent) {
+// `tdisplays` / `cardputers` describe THIS deployment's receivers,
+// including ourselves.  The beacon count is learned from the air and
+// filled in as they are heard.
+static inline void mantis_rx_begin(MantisReceiver *r, float extent,
+                                   uint8_t tdisplays, uint8_t cardputers,
+                                   bool docked) {
     *r = MantisReceiver{};
     r->mesh.extent = extent;
+    r->deploy.tdisplays  = tdisplays;
+    r->deploy.cardputers = cardputers;
+    r->deploy.docked     = docked;
+    r->caps = mantis_caps(&r->deploy);
 }
 
 // Feed one raw ESP-NOW payload.  Returns true if anything was consumed.
@@ -117,6 +138,10 @@ static inline void mantis_rx_begin(MantisReceiver *r, float extent) {
 // `now_ms` is the local clock; the mesh's own sequencing comes from the
 // air frame, so a receiver with a wandering millis() cannot corrupt the
 // ordering of reports.
+static inline bool mantis_rx_adopt_geometry(MantisReceiver *r,
+                                            const MantisGeomPacket *g,
+                                            uint16_t len);
+
 static inline bool mantis_rx_packet(MantisReceiver *r, uint8_t from_id,
                                     const uint8_t *data, int len,
                                     uint32_t now_ms) {
@@ -170,6 +195,11 @@ static inline bool mantis_rx_packet(MantisReceiver *r, uint8_t from_id,
     // Learn how many beacons exist from who actually speaks, rather than
     // from a configured count that can be wrong in either direction.
     if (from_id > r->mesh.n_beacons) r->mesh.n_beacons = from_id;
+    // Capability follows the hardware, always.  Recomputed here because
+    // this is the one place that learns a beacon exists.
+    r->deploy.beacons        = r->mesh.n_beacons;
+    r->deploy.geometry_known = (mantis_mesh_geometry_confidence(&r->mesh) > 0.5f);
+    r->caps = mantis_caps(&r->deploy);
     if (r->first_report_ms == 0) r->first_report_ms = now_ms;
 
     const int used = (int)(sizeof(uint32_t) + sizeof(MantisAirFrame));
@@ -212,6 +242,28 @@ static inline bool mantis_rx_packet(MantisReceiver *r, uint8_t from_id,
                 }
                 mantis_mesh_ingest(&r->mesh, p, learning);
                 r->reports_in++;
+            }
+            return true;
+        }
+    }
+
+    // ── surveyed geometry ──
+    // Checked before dense: both are large, and adopting a MEASURED
+    // layout is the single most valuable thing arriving on this radio --
+    // every position downstream is relative to it.
+    if (rest >= (int)sizeof(MantisGeomPacket)) {
+        const MantisGeomPacket *g = (const MantisGeomPacket *)body;
+        if (mantis_geom_valid(g, sizeof(MantisGeomPacket))) {
+            if (mantis_rx_adopt_geometry(r, g, sizeof(MantisGeomPacket))) {
+                r->geom_in++;
+                r->geom_stress = g->stress_q8;
+            } else {
+                // Valid packet, but the mesh does not trust its own
+                // solve.  Counted separately so the UI can say "the mesh
+                // is surveying but not confident yet" rather than
+                // silently staying on the assumed ring.
+                r->geom_rejected++;
+                r->geom_stress = g->stress_q8;
             }
             return true;
         }
@@ -281,6 +333,10 @@ static inline bool mantis_rx_solve(MantisReceiver *r, uint32_t now_ms,
     }
 
     mantis_rx_apply_link_quality(r);
+    // Do not run a solve the deployment cannot support.  With fewer than
+    // three beacons the reconstruction has nothing to intersect and
+    // would report structure that is purely its own.
+    if (!r->caps.localize) return false;
     mantis_mesh_solve(&r->mesh);
     mantis_targets_extract(&r->targets, &r->mesh, &r->store,
                            r->mesh.last_seq, dt_s, now_ms);
@@ -308,25 +364,66 @@ static inline void mantis_rx_seed_geometry(MantisReceiver *r, bool measured) {
     }
 }
 
-// Adopt a geometry packet solved by the mesh itself.
+// Adopt a surveyed layout, and REBUILD WHAT RESTED ON THE OLD ONE.
+//
+// Adopting the positions alone is not enough, and the failure would be
+// silent: the static room map is back-projected THROUGH the chords, so
+// a map computed against the assumed ring describes walls that are not
+// where it thinks they are.  The probe's learned body profile has the
+// same problem -- it was measured against chord geometry.
+//
+// Invalidated IN PROPORTION to how far things moved.  A small
+// refinement should not throw away a good baseline; a beacon that turns
+// out to be somewhere else entirely should.
 static inline bool mantis_rx_adopt_geometry(MantisReceiver *r,
                                             const MantisGeomPacket *g,
                                             uint16_t len) {
     if (!mantis_geom_valid(g, len)) return false;
-    // Only adopt a solution the mesh is actually confident in.  A
-    // high-stress fit is worse than the nominal ring, because it looks
+    // A high-stress fit is worse than the nominal ring, because it LOOKS
     // like a measurement.
     if (mantis_geom_confidence(g->stress_q8) < 0.35f) return false;
-    for (uint8_t i = 0; i < g->n_nodes && i + 1 < MANTIS_SLOTS; i++)
-        mantis_mesh_set_pos(&r->mesh, (uint8_t)(i + 1),
-                            (float)g->node[i].x_q10 / 1024.0f,
-                            (float)g->node[i].y_q10 / 1024.0f, true);
+
+    float moved = 0.0f;
+    for (uint8_t i = 0; i < g->n_nodes && i + 1 < MANTIS_SLOTS; i++) {
+        const uint8_t id = (uint8_t)(i + 1);
+        const float nx = (float)g->node[i].x_q10 / 1024.0f;
+        const float ny = (float)g->node[i].y_q10 / 1024.0f;
+        if (r->mesh.have_pos[id]) {
+            const float dx = nx - r->mesh.bx[id], dy = ny - r->mesh.by[id];
+            const float d = sqrtf(dx * dx + dy * dy);
+            if (d > moved) moved = d;
+        }
+        mantis_mesh_set_pos(&r->mesh, id, nx, ny, true);
+    }
+    r->geom_shift = moved;
+
+    // ABSOLUTE SCALE, when the mesh has it.  An RSSI survey gives shape
+    // without metres; an FTM one gives both.  Carrying cm_per_unit is
+    // what lets the UI say "2.4 m" instead of "0.8 chart units".
+    if (g->scale_known && g->cm_per_unit > 0) {
+        r->cm_per_unit = g->cm_per_unit;
+        r->scale_known = true;
+    }
+
+    // A shift wider than a chord means the chord set is materially
+    // different, so anything back-projected through it describes the
+    // wrong room.
+    if (moved > MANTIS_CHORD_HALFWIDTH && r->baseline_latched) {
+        mantis_static_build(&r->statics, &r->mesh);
+        r->probe.learn_n    = 0;      // re-learn against the new geometry
+        r->probe.body_atten = 0.0f;
+        r->geom_rebuilds++;
+    }
     return true;
 }
 
 static inline const char *mantis_rx_state(const MantisReceiver *r,
                                           uint32_t now_ms) {
     if (r->mesh.n_beacons == 0)  return "no beacons";
+    // Below the localisation tier, say what the deployment IS doing
+    // rather than reporting a failure to do something it was never
+    // equipped for.  One or two beacons detect presence perfectly well.
+    if (!r->caps.localize)       return r->caps.blocker;
     if (!r->baseline_latched) return "learning room";
     if (r->baseline_partial)   return "partial baseline";
     if (r->integrity.geometry_suspect) return "BEACON MOVED";

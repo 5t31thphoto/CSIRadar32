@@ -36,9 +36,15 @@
 //  each time.  The UI overlays them instead.
 // ═══════════════════════════════════════════════════════════════
 #include "mantis_report.h"
+#include <stdint.h>
 #include "mantis_tomo.h"
 
 #define MANTIS_MESH_MAX_CHORDS 32
+
+// Frames a link needs before its quiet-room reference is trusted.
+// Declared here because mantis_mesh_ingest() uses it to EXCLUDE links
+// that have not reached it -- see the note there.
+#define MANTIS_MESH_BASE_MIN 20
 
 // Acceptance thresholds for a mesh peak.  Both must pass: a tall peak
 // with too few sight-lines through it is a streak crossing, which is the
@@ -57,7 +63,20 @@ typedef struct {
     // reconstruction while looking like extra evidence.
     float   bx[MANTIS_SLOTS];
     float   by[MANTIS_SLOTS];
+    // TWO DIFFERENT QUESTIONS, and conflating them cost a silent
+    // total failure: have_pos asks "can I place this beacon at all",
+    // pos_measured asks "did a survey establish it or did we assume it".
+    //
+    // I used one flag for both, so seeding the nominal ring as
+    // "unmeasured" left have_pos clear -- the chord builder skipped every
+    // beacon, produced zero chords, and the system reported a calm empty
+    // room with a person standing in the middle of it.  No error, no
+    // warning, just nothing.
+    //
+    // The SOLVER needs a position either way; only the UI and the
+    // confidence reporting care which kind it is.
     uint8_t have_pos[MANTIS_SLOTS];
+    uint8_t pos_measured[MANTIS_SLOTS];
     uint8_t n_beacons;
     float   extent;            // chart half-width these coords live in
 
@@ -87,11 +106,18 @@ typedef struct {
 static inline void mantis_mesh_reset(MantisMesh *m) {
     const float ex = m->extent;
     const uint8_t n = m->n_beacons;
-    float bx[MANTIS_SLOTS], by[MANTIS_SLOTS]; uint8_t hp[MANTIS_SLOTS];
-    for (int i = 0; i < MANTIS_SLOTS; i++) { bx[i]=m->bx[i]; by[i]=m->by[i]; hp[i]=m->have_pos[i]; }
+    float bx[MANTIS_SLOTS], by[MANTIS_SLOTS];
+    uint8_t hp[MANTIS_SLOTS], pm[MANTIS_SLOTS];
+    for (int i = 0; i < MANTIS_SLOTS; i++) {
+        bx[i]=m->bx[i]; by[i]=m->by[i];
+        hp[i]=m->have_pos[i]; pm[i]=m->pos_measured[i];
+    }
     *m = MantisMesh{};
     m->extent = ex; m->n_beacons = n;
-    for (int i = 0; i < MANTIS_SLOTS; i++) { m->bx[i]=bx[i]; m->by[i]=by[i]; m->have_pos[i]=hp[i]; }
+    for (int i = 0; i < MANTIS_SLOTS; i++) {
+        m->bx[i]=bx[i]; m->by[i]=by[i];
+        m->have_pos[i]=hp[i]; m->pos_measured[i]=pm[i];
+    }
 }
 
 // Publish measured beacon geometry.  Called by whichever survey produced
@@ -100,7 +126,20 @@ static inline void mantis_mesh_reset(MantisMesh *m) {
 static inline void mantis_mesh_set_pos(MantisMesh *m, uint8_t id,
                                        float x, float y, bool measured) {
     if (id == 0 || id >= MANTIS_SLOTS) return;
-    m->bx[id] = x; m->by[id] = y; m->have_pos[id] = measured ? 1 : 0;
+    m->bx[id] = x; m->by[id] = y;
+    m->have_pos[id]     = 1;                    // we can place it
+    m->pos_measured[id] = measured ? 1 : 0;     // but was it surveyed?
+}
+
+// How much of the geometry is surveyed rather than assumed.  Surfaced so
+// the UI can say "assumed layout" instead of presenting a guess with the
+// same confidence as a measurement.
+static inline float mantis_mesh_geometry_confidence(const MantisMesh *m) {
+    if (m->n_beacons == 0) return 0.0f;
+    int meas = 0;
+    for (uint8_t i = 1; i <= m->n_beacons && i < MANTIS_SLOTS; i++)
+        if (m->pos_measured[i]) meas++;
+    return (float)meas / (float)m->n_beacons;
 }
 
 // Fold one beacon's perspective in.  ASSIGNMENT, never accumulation --
@@ -123,6 +162,23 @@ static inline void mantis_mesh_ingest(MantisMesh *m,
             m->base[idx] = (n == 0) ? a : (m->base[idx] + (a - m->base[idx]) / (float)(n + 1));
             if (m->base_n[idx] < 65535) m->base_n[idx]++;
             m->atten[idx] = 0.0f;
+        } else if (m->base_n[idx] < MANTIS_MESH_BASE_MIN) {
+            // NO REFERENCE, NO MEASUREMENT.
+            //
+            // A link that never finished learning has base == 0, so the
+            // subtraction below turns its ordinary noise into a full
+            // perturbation.  Those phantom chords then intersect with
+            // the real ones and manufacture extra targets: one person
+            // in the room produced three, two of them nowhere near
+            // anybody.
+            //
+            // Zero quality rather than zero attenuation -- the chord
+            // builder weights by quality, so this removes the link from
+            // the solve entirely instead of contributing a confident
+            // "clear" it has not earned.
+            m->atten[idx] = 0.0f;
+            m->qual[idx]  = 0.0f;
+            continue;
         } else {
             // Perturbation relative to THIS link's own quiet reference,
             // converted to ATTENUATION.
@@ -146,7 +202,6 @@ static inline void mantis_mesh_ingest(MantisMesh *m,
 }
 
 // Is the per-link baseline usable yet?
-#define MANTIS_MESH_BASE_MIN 20
 static inline bool mantis_mesh_baseline_ready(const MantisMesh *m) {
     int ready = 0, total = 0;
     for (uint8_t i = 1; i <= m->n_beacons; i++)
@@ -155,10 +210,19 @@ static inline bool mantis_mesh_baseline_ready(const MantisMesh *m) {
             total++;
             if (m->base_n[i * MANTIS_SLOTS + j] >= MANTIS_MESH_BASE_MIN) ready++;
         }
-    // Two thirds is enough: a link that never reports is a beacon pair
-    // that cannot hear each other, and waiting for it would block
-    // forever on a geometry that will never improve.
-    return total > 0 && ready * 3 >= total * 2;
+    // NINE TENTHS, not two thirds.
+    //
+    // Two thirds let the baseline latch with a third of the links
+    // unreferenced, and a sparse chord set makes streak artefacts strong
+    // relative to real peaks: at 20 of 30 links a ghost reached 80% of
+    // the true target and was reported as a second person.  With full
+    // coverage the strongest artefact is 61% and is rejected cleanly.
+    //
+    // The backstop in mantis_rx_solve() still latches a PARTIAL baseline
+    // if coverage never completes -- a beacon pair that genuinely cannot
+    // hear each other must not block the system forever -- and that case
+    // is flagged rather than hidden.
+    return total > 0 && ready * 10 >= total * 9;
 }
 
 // Rebuild the chord set and reconstruct.  Cheap enough to run at the
