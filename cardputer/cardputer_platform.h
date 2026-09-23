@@ -128,22 +128,15 @@ typedef enum : uint8_t {
 //
 // ESP8266Audio 1.9.7 (that exact version) bridged onto
 // m5::Speaker_Class, which is the chain the working Cardputer-Adv MP3
-// players use.  See cardputer_mp3.h.
+// players use.  See mantis_mp3.h.
 //
 // Decoding runs on its own FreeRTOS task, not in loop().  Sounding an
 // alarm must never stall the sensing loop -- a device that briefly stops
 // watching the room in order to announce something is exactly backwards.
-typedef enum : uint8_t {
-    CPA_NONE = 0,
-    CPA_PERIMETER,     // perimeter crossed
-    CPA_NEW_PRESENCE,  // a target appeared that was not there
-    CPA_MOTION,        // general motion
-    CPA_TRIPWIRE,      // tripwire broken
-    CPA_MESH_FAULT,    // a beacon moved or dropped out
-    CPA_COUNT
-} CardputerAlarm;
+// The alarm enum lives in mantis_alarms.h beside the table it indexes.
+// Splitting an enum from the array it indexes across two headers is how
+// the Core2 build failed on CPA_COUNT.
 
-#define CP_ALARM_DIR "/mantis/alarms"
 
 // ── SD card ───────────────────────────────────────────────────
 // THESE PINS ARE REQUIRED AND THEY ARE THE ONE EXCEPTION TO THIS FILE'S

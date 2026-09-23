@@ -44,9 +44,9 @@
 
 #include "cardputer_platform.h"
 #include "cardputer_input.h"
-#include "cardputer_imu.h"
-#include "cardputer_audio.h"
-#include "cardputer_mp3.h"
+#include "mantis_imu.h"
+#include "mantis_alarms.h"
+#include "mantis_mp3.h"
 #include "cardputer_ui.h"
 #include "cardputer_session.h"
 

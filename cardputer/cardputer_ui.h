@@ -30,8 +30,8 @@
 // ═══════════════════════════════════════════════════════════════
 #include "cardputer_platform.h"
 #include "cardputer_input.h"
-#include "cardputer_imu.h"
-#include "cardputer_audio.h"
+#include "mantis_imu.h"
+#include "mantis_alarms.h"
 #include "mantis_caps.h"
 
 // Palette, kept deliberately identical in MEANING to the T-Display so an

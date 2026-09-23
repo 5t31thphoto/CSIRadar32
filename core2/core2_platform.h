@@ -11,7 +11,7 @@
 //  identical shared capability gating, so a deployment does not care
 //  which hand-held device is present.
 //
-//  The IMU work is shared outright -- cardputer_imu.h is pure
+//  The IMU work is shared outright -- mantis_imu.h is pure
 //  arithmetic over accel and gyro samples and has no Cardputer in it.
 //  Duplicating it for a second board would give two step counters that
 //  drift apart.

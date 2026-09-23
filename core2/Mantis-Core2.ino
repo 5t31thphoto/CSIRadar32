@@ -45,9 +45,9 @@
 
 #include "core2_platform.h"
 #include "core2_input.h"
-#include "cardputer_imu.h"      // shared: pure arithmetic, no Cardputer in it
-#include "cardputer_audio.h"    // shared: alarm table and debounce
-#include "cardputer_mp3.h"      // shared: decoder task
+#include "mantis_imu.h"      // shared: pure arithmetic, no Cardputer in it
+#include "mantis_alarms.h"    // shared: alarm table and debounce
+#include "mantis_mp3.h"      // shared: decoder task
 
 #include "mantis_air.h"
 #include "mantis_receiver.h"
