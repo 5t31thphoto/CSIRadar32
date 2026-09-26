@@ -1,4 +1,4 @@
-# MantisSec CSI-Radar-S3 (v0.6)
+# MantisSec CSI-Radar-S3 
 
 Wi-Fi CSI **scene reconstruction** engine for the LilyGo T-Display-S3.
 Two receivers, three beacons, a calibration walk, and a live top-down
