@@ -172,7 +172,15 @@ static inline bool mantis_report_valid(const MantisPerspective *p, uint16_t len,
     if (mantis_crc8((const uint8_t *)&t + MANTIS_CRC_SKIP,
                     (uint16_t)(sizeof(t) - MANTIS_CRC_SKIP)) != got) return false;
 
+    // Bounded by the ARRAY as well as by n_beacons.
+    //
+    // n_beacons is supplied by the caller, and by_id[] is sized
+    // MANTIS_SLOTS.  Today every caller derives n_beacons from ids that
+    // are already range-checked, so the two agree -- but a validator
+    // that trusts its caller for a bound is one refactor away from an
+    // out-of-bounds write, and this costs one comparison.
     if (p->reporter_id == 0 || p->reporter_id > n_beacons) return false;
+    if (p->reporter_id >= MANTIS_SLOTS) return false;
     if (p->n_links > MANTIS_MAX_LINKS)                     return false;
     for (uint8_t i = 0; i < p->n_links; i++) {
         const uint8_t id = p->links[i].peer_id;

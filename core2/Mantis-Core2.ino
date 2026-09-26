@@ -197,7 +197,12 @@ static void footer(const char *a, const char *b, const char *c) {
     }
 }
 
-static void flush() { if (g_canvas_ok) g_cv.pushSprite(0, 0); }
+static void flush() {
+    // No canvas means the frame cannot be presented.  Reported once at
+    // boot on the panel itself; silently skipping here is correct at
+    // this point BECAUSE the operator was already told.
+    if (g_canvas_ok) g_cv.pushSprite(0, 0);
+}
 
 static void draw_map() {
     const int cx = C2_MAP_CX, cy = C2_MAP_CY, r = C2_MAP_R;
@@ -520,7 +525,33 @@ void setup() {
     M5.begin(cfg);
     M5.Display.setRotation(1);          // 320x240 landscape
 
+    // ── CANVAS, WITH A REAL FALLBACK ──────────────────────────
+    //
+    // 320x240 at 16bpp is 153,600 bytes.  The Core2 has PSRAM and
+    // M5Canvas will normally use it, but if that allocation fails the
+    // previous code simply set g_canvas_ok = false and every flush()
+    // became a no-op -- a device that boots, runs, responds to touch
+    // and shows a BLANK SCREEN, with nothing anywhere saying why.
+    //
+    // Half the depth before giving up: 8bpp is 76,800 bytes and the UI
+    // uses a dozen flat colours, so the loss is invisible.
     g_canvas_ok = g_cv.createSprite(C2_SCREEN_W, C2_SCREEN_H);
+    if (!g_canvas_ok) {
+        g_cv.setColorDepth(8);
+        g_canvas_ok = g_cv.createSprite(C2_SCREEN_W, C2_SCREEN_H);
+    }
+    if (!g_canvas_ok) {
+        // Still nothing.  Say so ON THE PANEL rather than presenting a
+        // black screen: the device is otherwise working and the
+        // operator needs to know it is a memory problem, not a dead
+        // unit.
+        M5.Display.fillScreen(C_BG);
+        M5.Display.setTextColor(C_ALERT, C_BG);
+        M5.Display.setCursor(8, 100);
+        M5.Display.print("display buffer alloc failed");
+        M5.Display.setCursor(8, 120);
+        M5.Display.print("sensing continues; UI degraded");
+    }
 
     c2_input_begin(&g_in);
     cp_imu_begin(&g_imu, C2_STRIDE_M_DEFAULT);

@@ -552,7 +552,20 @@ void setup() {
     M5Cardputer.begin(cfg, true);          // true = enable keyboard
     M5Cardputer.Display.setRotation(1);    // landscape
 
+    // 240x135 at 16bpp is 64,800 bytes.  Same reasoning as the Core2:
+    // halve the depth before giving up, and if it still fails say so on
+    // the panel instead of running with a blank screen.
     g_canvas_ok = g_cv.createSprite(CP_SCREEN_W, CP_SCREEN_H);
+    if (!g_canvas_ok) {
+        g_cv.setColorDepth(8);
+        g_canvas_ok = g_cv.createSprite(CP_SCREEN_W, CP_SCREEN_H);
+    }
+    if (!g_canvas_ok) {
+        M5Cardputer.Display.fillScreen(CPC_BG);
+        M5Cardputer.Display.setTextColor(CPC_ALERT, CPC_BG);
+        M5Cardputer.Display.setCursor(6, 56);
+        M5Cardputer.Display.print("display buffer alloc failed");
+    }
 
     cp_input_begin(&g_in);
     cp_imu_begin(&g_imu, CP_STRIDE_M_DEFAULT);

@@ -40,6 +40,11 @@
 #include "mantis_air.h"
 #include "mantis_receiver.h"
 #include "mantis_control.h"
+// MBC_SC_MAX sizes the CSI buffer below.  Missing this compiled fine on
+// a host build because the whole body lives behind #if defined(ARDUINO)
+// -- the host only ever saw the empty else-branch, so the header
+// "passed" every standalone check while being broken on every device.
+#include "mantis_beacon_csi.h"
 
 #if defined(ARDUINO)
   #include <WiFi.h>
