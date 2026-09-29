@@ -58,7 +58,13 @@
 // Alive if heard within three superframes: long enough to ride out two
 // lost transmissions, short enough that a dead beacon's slot is not
 // wasted for long.
-#define MANTIS_MEMBER_TIMEOUT_US  (3 * (int64_t)MANTIS_FRAME_US)
+// A beacon is silent BY DESIGN for up to three consecutive frames of the
+// 16-frame macro (CHORD, DENSE and SLEEP frames carry only part of the
+// mesh), and ESP-NOW loses a few percent on top.  Three frames -- the old
+// value -- sat inside that envelope, so healthy members blinked out, the
+// lowest-live test briefly pointed at the wrong node, and timekeeping
+// flapped.  Eight frames clears the schedule gap plus two lost frames.
+#define MANTIS_MEMBER_TIMEOUT_US  (8 * (int64_t)MANTIS_FRAME_US)
 
 // How long to wait after the incumbent timekeeper goes quiet before
 // assuming the role.  Staggered by id so two candidates never take over
@@ -83,7 +89,8 @@ typedef struct {
 } MantisMember;
 
 typedef struct {
-    uint8_t      my_id;             // 1..6, set at flash time
+    uint8_t      my_id;             // 1..6, claimed (mantis_identity.h)
+    uint16_t     my_uid;            // our box, the conflict tiebreak key
     MantisMember member[MANTIS_SLOTS];
     MantisSched  sched;
 
@@ -97,9 +104,11 @@ typedef struct {
     uint32_t frames_tx, frames_rx, id_conflicts;
 } MantisMembership;
 
-static inline void mantis_mesh_init(MantisMembership *M, uint8_t my_id) {
+static inline void mantis_mesh_init(MantisMembership *M, uint8_t my_id,
+                                    uint16_t my_uid = 0) {
     *M = MantisMembership{};
-    M->my_id = my_id;
+    M->my_id  = my_id;
+    M->my_uid = my_uid;
     M->sched.my_slot = (uint8_t)(my_id - 1);   // identity IS the schedule
 }
 
@@ -135,11 +144,16 @@ static inline void mantis_mesh_on_frame(MantisMembership *M,
     if (f->beacon_id == 0 || f->beacon_id >= MANTIS_SLOTS) return;
     M->frames_rx++;
 
-    // ── our own id, from someone else ──
-    // Yield, do not fight.  Both beacons transmitting in one slot means
-    // neither is usable; one standing down leaves a working system and a
-    // diagnosable fault.
     if (f->beacon_id == M->my_id) {
+        // SAME ID, DIFFERENT BOX.  Decided by uid, the same rule the
+        // identity layer applies, so exactly one side stands down.
+        //
+        // The winner used to latch id_conflict too, and nothing ever
+        // cleared it -- so BOTH boxes went silent: the loser to re-claim,
+        // the winner forever.  Now the winner ignores the frame and keeps
+        // transmitting, and a loser whose rival has gone quiet recovers
+        // in mantis_mesh_tick().
+        if (M->my_uid != 0 && f->uid != 0 && M->my_uid < f->uid) return;
         if (!M->id_conflict) M->id_conflicts++;
         M->id_conflict      = true;
         M->conflict_seen_us = rx_us;
@@ -154,27 +168,31 @@ static inline void mantis_mesh_on_frame(MantisMembership *M,
     m->rssi              = rssi;
     m->claims_timekeeper = sender_is_timekeeper;
 
-    // ── sync from ANY packet ──
-    // Every transmission carries (seq, slot), so the epoch is derivable
-    // from whoever happens to be heard.  Preferring the timekeeper keeps
-    // everyone on one origin; accepting anyone means a node with a bad
-    // link to the timekeeper still stays aligned via its neighbours.
-    const bool prefer = sender_is_timekeeper || !M->sched.synced;
-    if (prefer) {
-        // MASK THE FLAG OFF.  The timekeeper bit rides in the slot
-        // field's high bit, and passing the raw byte here made slot 0
-        // read as 128 -- so every synced node computed an epoch ~128
-        // slots in the past, its own slot never came round, and it never
-        // transmitted at all.  One unmasked byte silently disabled the
-        // entire mesh: no conflict detection, no failover, no reports.
-        mantis_sched_sync(&M->sched, rx_us, f->seq, mantis_frame_slot(f));
-        if (sender_is_timekeeper) {
+    // WHOSE CLOCK TO FOLLOW.
+    //
+    // Only the LOWEST-id timekeeper is authoritative.  Beacons that boot
+    // together all cold-start as timekeeper; the previous rule re-synced
+    // to ANY frame carrying the TK bit, so the true (lowest) timekeeper
+    // would slave itself to a higher one that was about to step down,
+    // and followers ping-ponged between competing epochs until the
+    // higher ones noticed.  Now:
+    //   - unsynced: take anything, a slot grid beats no slot grid
+    //   - a TK claim from an id lower than ours, and lower than (or
+    //     equal to) the TK we follow, wins
+    //   - the TK we follow having gone quiet frees us to take another
+    if (sender_is_timekeeper) {
+        const bool tk_stale = (M->tk_id == 0)
+                           || (rx_us - M->tk_last_heard_us) > MANTIS_MEMBER_TIMEOUT_US;
+        const bool outranks_me   = (f->beacon_id < M->my_id) || M->my_id == 0;
+        const bool outranks_tk   = tk_stale || f->beacon_id <= M->tk_id;
+        if (!M->sched.synced || (outranks_me && outranks_tk)) {
+            mantis_sched_sync(&M->sched, rx_us, f->seq, mantis_frame_slot(f));
             M->tk_id            = f->beacon_id;
             M->tk_last_heard_us = rx_us;
-            // Someone lower than us is keeping time: stand down.
-            if (M->is_timekeeper && f->beacon_id < M->my_id)
-                M->is_timekeeper = false;
+            if (M->is_timekeeper) M->is_timekeeper = false;   // outranked
         }
+    } else if (!M->sched.synced) {
+        mantis_sched_sync(&M->sched, rx_us, f->seq, mantis_frame_slot(f));
     }
 }
 
@@ -189,16 +207,18 @@ static inline void mantis_mesh_tick(MantisMembership *M, int64_t now) {
             (now - M->member[i].last_heard_us) > MANTIS_MEMBER_TIMEOUT_US)
             M->member[i].present = false;
 
+    // A conflict with a box that has since stopped transmitting is over.
+    if (M->id_conflict && (now - M->conflict_seen_us) > MANTIS_MEMBER_TIMEOUT_US * 3)
+        M->id_conflict = false;
     if (M->id_conflict) { M->is_timekeeper = false; return; }
 
     const uint8_t lowest = mantis_mesh_lowest_live(M, now);
-    if (lowest != M->my_id) {
-        // Not our job.  If the incumbent is gone the lower node will take
-        // over first; we only act if IT does not.
-        if (M->tk_id != 0 && (now - M->tk_last_heard_us) > MANTIS_MEMBER_TIMEOUT_US)
-            M->tk_id = 0;
-        return;
-    }
+    // Not the lowest live node: timekeeping is someone else's job.  Do NOT
+    // forget who the timekeeper is on a short silence -- clearing tk_id
+    // here is what let the tick below crown a new timekeeper the instant
+    // this node momentarily looked lowest.  The staggered wait is the
+    // only path to taking over.
+    if (lowest != M->my_id) return;
 
     // We are the lowest live id.  Take over once the incumbent has been
     // silent past our staggered deadline.

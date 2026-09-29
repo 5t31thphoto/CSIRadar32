@@ -132,6 +132,12 @@ uint32_t comboHeldMs() {
     return held;
 }
 
+void input_inject(ButtonId b, bool long_press) {
+    if (b >= BTN_COUNT) return;
+    if (long_press) s_btn[b].ev_long  = true;
+    else            s_btn[b].ev_short = true;
+}
+
 void inputClearEdges() {
     for (int i = 0; i < BTN_COUNT; i++) {
         s_btn[i].ev_short  = false;

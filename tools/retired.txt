@@ -1,0 +1,19 @@
+# Paths removed from the repo when a zip drop is applied.
+# (A drop can only add or overwrite files; this is how it deletes.)
+# One path or glob per line.  Comments start with '#'.
+
+# Per-id beacon firmware: retired.  ONE beacon firmware per chip now; the
+# beacon claims its id from the mesh at runtime.
+docs/manifests/beacon-1.json
+docs/manifests/beacon-2.json
+docs/manifests/beacon-3.json
+docs/manifests/beacon-4.json
+docs/manifests/beacon-5.json
+docs/manifests/beacon-6.json
+docs/bins/csi-beacon-c3-id*-merged.bin
+docs/bins/csi-beacon-s3-id*-merged.bin
+
+# Superseded by the shared mantis_imu.h / mantis_mp3.h / mantis_alarms.h.
+cardputer/cardputer_mp3.h
+cardputer/cardputer_audio.h
+cardputer/cardputer_imu.h

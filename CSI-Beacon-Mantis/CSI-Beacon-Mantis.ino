@@ -94,11 +94,13 @@ static MantisBeaconLink  g_link[MANTIS_SLOTS];      // one per peer id
 // publisher costs nothing and guarantees exactly one publisher.
 static int8_t   g_peer_rssi[MANTIS_SLOTS][MANTIS_SLOTS];   // [hearer][heard]
 static uint8_t  g_rssi_n[MANTIS_SLOTS][MANTIS_SLOTS];
+static float    g_rssi_f[MANTIS_SLOTS][MANTIS_SLOTS];   // our own row, unrounded
 static float    g_geo_x[MANTIS_SLOTS], g_geo_y[MANTIS_SLOTS];
 static uint8_t  g_geo_stress = 255;
 static uint16_t g_geo_cm     = 0;
 static bool     g_geo_ready  = false;
 static uint32_t g_geo_last_ms = 0;
+static uint32_t g_row_ms[MANTIS_SLOTS];   // when each RSSI row was last refreshed
 
 static uint8_t  g_dop[MANTIS_SLOTS][MANTIS_DENSE_DOP_BINS];
 static float    g_prev_phi[MANTIS_SLOTS];
@@ -135,13 +137,16 @@ struct RawCsi {
     uint32_t t_us;
 };
 static RawCsi g_raw[MANTIS_SLOTS];
+// The last COMPLETE capture per link, kept after process_csi() consumes
+// the raw slot.  The dense payload used to read g_raw[i] directly --
+// whose len process_csi() had just zeroed -- so every subcarrier profile
+// ever transmitted was built from an empty buffer.
+static int8_t  g_last_csi[MANTIS_SLOTS][MBC_SC_MAX * 2];
+static int     g_last_len[MANTIS_SLOTS];
+static int8_t  g_last_noise[MANTIS_SLOTS];
 
 static uint8_t id_from_mac(const uint8_t *mac) {
-    // Beacons use a fixed MAC prefix with the id in the last byte, which
-    // is how a beacon identifies a peer without needing a directory.
-    if (mac[0] != 0x1A) return 0;
-    const uint8_t id = mac[5];
-    return (id >= 1 && id < MANTIS_SLOTS) ? id : 0;
+    return mantis_beacon_id_from_mac(mac);     // 1A:00:uid:uid:00:id
 }
 
 // ── CSI callback: copy only ───────────────────────────────────
@@ -160,10 +165,15 @@ static void csi_cb(void *, wifi_csi_info_t *info) {
     // The genuine per-link RSSI, from the PHY.  now_recv() only ever
     // sees the ESP-NOW callback, which does not carry it.
     if (beacon_id && beacon_id < MANTIS_SLOTS) {
-        int8_t &pr = g_peer_rssi[beacon_id][from];
+        // Averaged in FLOAT.  The integer form (pr*7 + rssi)/8 truncates
+        // toward zero, which for negative dBm is toward a STRONGER signal:
+        // it settles up to 6 dB high, reads every link as shorter than it
+        // is, and warps the survey.
+        float &pf = g_rssi_f[beacon_id][from];
         uint8_t &pn = g_rssi_n[beacon_id][from];
-        pr = (pn == 0) ? (int8_t)info->rx_ctrl.rssi
-                       : (int8_t)((pr * 7 + info->rx_ctrl.rssi) / 8);
+        pf = (pn == 0) ? (float)info->rx_ctrl.rssi
+                       : pf + ((float)info->rx_ctrl.rssi - pf) * 0.125f;
+        g_peer_rssi[beacon_id][from] = (int8_t)lrintf(pf);
         if (pn < 255) pn++;
     }
     r.noise   = info->rx_ctrl.noise_floor;
@@ -173,27 +183,51 @@ static void csi_cb(void *, wifi_csi_info_t *info) {
 
 // ── ESP-NOW receive: the air frame, and the mesh bookkeeping ──
 static void now_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-    if (!info || len < (int)sizeof(MantisAirFrame) + 4) return;
+    if (!info || len < (int)(sizeof(uint32_t) + sizeof(MantisAirFrame))) return;
     const uint8_t from = id_from_mac(info->src_addr);
     if (from == 0) return;
-    // Identity bookkeeping runs on EVERY frame, in every state -- an id
-    // can be lost after it is committed if a lower-MAC box claims it.
-    mantis_id_saw(&g_id, from, info->src_addr, millis());
 
     // Payload layout: legacy counter, then the air frame.
-    const MantisAirFrame *f =
-        (const MantisAirFrame *)(data + sizeof(uint32_t));
-    if (f->magic != MANTIS_AIR_MAGIC) return;
+    MantisAirFrame f;
+    memcpy(&f, data + sizeof(uint32_t), sizeof(f));
+    if (f.magic != MANTIS_AIR_MAGIC) return;
+    if (f.uid == g_uid) return;                 // our own frame, echoed
+
+    // Identity bookkeeping runs on EVERY frame, in every state -- an id
+    // can be lost after it is committed if a lower-uid box claims it.
+    mantis_id_saw(&g_id, from, f.uid, millis());
 
     const int64_t now = esp_timer_get_time();
-    mantis_mesh_on_frame(&g_mesh, f, now, -50, mantis_frame_is_tk(f));
+    mantis_mesh_on_frame(&g_mesh, &f, now, -50, mantis_frame_is_tk(&f));
+
+    // ── Other beacons' RSSI rows ───────────────────────────────
+    // A REPORT carries the reporter's own row of the pairwise RSSI
+    // matrix.  Collecting them is what gives the timekeeper the WHOLE
+    // matrix to survey from, rather than only the row it measures itself.
+    const int body = len - (int)(sizeof(uint32_t) + sizeof(MantisAirFrame));
+    if (body == (int)sizeof(MantisPerspective)) {
+        MantisPerspective p;
+        memcpy(&p, data + sizeof(uint32_t) + sizeof(MantisAirFrame), sizeof(p));
+        if (mantis_report_valid(&p, sizeof(p), MANTIS_MAX_BEACON_ID)) {
+            const uint8_t h = p.reporter_id;
+            for (uint8_t k = 0; k < p.n_links; k++) {
+                const uint8_t j = p.links[k].peer_id;
+                const int8_t  r = p.link_rssi[k];
+                if (j == 0 || j >= MANTIS_SLOTS || r == 0) continue;
+                g_peer_rssi[h][j] = r;
+                if (g_rssi_n[h][j] < 255) g_rssi_n[h][j]++;
+            }
+            g_row_ms[h] = millis();
+        }
+    }
 }
 
 // ── Radio ─────────────────────────────────────────────────────
 static void radio_begin() {
     WiFi.mode(WIFI_STA);
     // Fixed MAC so peers can identify each other by id alone.
-    uint8_t mac[6] = {0x1A, 0x00, 0x00, 0x00, 0x00, beacon_id};
+    uint8_t mac[6];
+    mantis_beacon_mac(g_uid, beacon_id, mac);   // unique per box, see mantis_air.h
     esp_wifi_set_mac(WIFI_IF_STA, mac);
 
     esp_wifi_set_promiscuous(true);
@@ -261,6 +295,9 @@ static void process_csi() {
 
         mantis_beacon_link_update(&g_link[i], amp, phi, q, g_learning,
                                   nullptr, i);
+        memcpy(g_last_csi[i], local, n);
+        g_last_len[i]   = n;
+        g_last_noise[i] = r.noise;
         r.len = 0;
     }
 }
@@ -274,43 +311,100 @@ static void process_csi() {
 // The result REPLACES the assumed ring.  Until it runs, every position
 // downstream is relative to a fiction -- a perfect hexagon that the
 // beacons were never actually placed in.
+static uint8_t g_geo_ids[MANTIS_SLOTS];     // solved index -> beacon id
+static uint8_t g_geo_n = 0;
+
 static void survey_geometry(uint32_t now_ms) {
-    if (!g_mesh.is_timekeeper) return;
+    // Only the timekeeper publishes, and never a stale solve: a node that
+    // becomes timekeeper again after a handover re-surveys before it
+    // echoes anything.
+    if (!g_mesh.is_timekeeper) { g_geo_ready = false; return; }
     if (now_ms - g_geo_last_ms < MANTIS_SURVEY_INTERVAL_MS) return;
     g_geo_last_ms = now_ms;
 
-    const uint8_t n = MANTIS_MAX_BEACON_ID;
-    static float dist[MANTIS_MAX_BEACON_ID * MANTIS_MAX_BEACON_ID];
-    uint8_t live = 0;
-    for (uint8_t i = 0; i < n; i++)
-        if (g_rssi_n[beacon_id][i + 1] > 0 || (i + 1) == beacon_id) live++;
+    // Our own row is live by construction; other rows are live while the
+    // reports that carry them keep arriving.
+    g_row_ms[beacon_id] = now_ms;
 
-    // We only hold OUR OWN row of the matrix directly.  The other rows
-    // arrive as peers' reports, and a beacon that cannot hear a pair has
-    // no opinion about that pair -- so unmeasured entries are marked
-    // negative and the solver skips them.  That is exactly why stress
-    // majorisation was chosen over classical MDS.
+    // Solve over LIVE ids only, compactly indexed.  Solving over all six
+    // left dead ids sitting on the seed ring, and they were then
+    // published as if measured.
+    uint8_t ids[MANTIS_SLOTS]; uint8_t n = 0;
+    for (uint8_t id = 1; id <= MANTIS_MAX_BEACON_ID; id++) {
+        const bool me = (id == beacon_id);
+        const bool heard = g_mesh.member[id].present
+                        || (g_rssi_n[beacon_id][id] > 0
+                            && (now_ms - g_row_ms[id]) < 3 * MANTIS_SURVEY_INTERVAL_MS);
+        if (me || heard) ids[n++] = id;
+    }
+    g_geo_n = n;
+    if (n < 3) { g_geo_ready = false; return; }
+
+    // Unmeasured pairs are marked negative and the stress solver skips
+    // them -- which is why stress majorisation was chosen over classical
+    // MDS.  A pair is averaged over both directions when both are known.
+    static float dist[MANTIS_SLOTS * MANTIS_SLOTS];
     for (uint8_t i = 0; i < n; i++)
         for (uint8_t j = 0; j < n; j++) {
             if (i == j) { dist[i * n + j] = 0.0f; continue; }
-            const uint8_t a = (uint8_t)(i + 1), b = (uint8_t)(j + 1);
-            int8_t r = 0; uint8_t cnt = 0;
-            if (g_rssi_n[a][b]) { r = g_peer_rssi[a][b]; cnt++; }
-            if (g_rssi_n[b][a]) { r = (int8_t)((r + g_peer_rssi[b][a]) / (cnt ? 2 : 1)); cnt++; }
-            dist[i * n + j] = cnt ? mantis_rssi_to_m(r) : -1.0f;
+            const uint8_t a = ids[i], b = ids[j];
+            int sum = 0; int cnt = 0;
+            if (g_rssi_n[a][b]) { sum += g_peer_rssi[a][b]; cnt++; }
+            if (g_rssi_n[b][a]) { sum += g_peer_rssi[b][a]; cnt++; }
+            dist[i * n + j] = cnt ? mantis_rssi_to_m((int8_t)(sum / cnt)) : -1.0f;
         }
 
     float x[MANTIS_SLOTS], y[MANTIS_SLOTS];
     const float stress = mantis_geom_solve(dist, n, x, y, 120);
     mantis_geom_canonical(x, y, n);
     g_geo_cm = mantis_geom_normalise(x, y, n);
-    for (uint8_t i = 0; i < n; i++) { g_geo_x[i] = x[i]; g_geo_y[i] = y[i]; }
-    g_geo_stress = (uint8_t)(stress * 255.0f > 255.0f ? 255 : stress * 255.0f);
-    // Publish even a poor solve -- the CONFIDENCE travels with it, and a
-    // receiver that knows the layout is 40% trusted can draw it faintly.
-    // Suppressing it entirely would leave the receiver on the assumed
-    // ring with no idea a better answer existed.
-    g_geo_ready = (live >= 3);
+    for (uint8_t i = 0; i < MANTIS_SLOTS; i++) { g_geo_x[i] = 0; g_geo_y[i] = 0; g_geo_ids[i] = 0; }
+    for (uint8_t i = 0; i < n; i++) { g_geo_x[i] = x[i]; g_geo_y[i] = y[i]; g_geo_ids[i] = ids[i]; }
+    const float sq = stress * 255.0f;
+    g_geo_stress = (uint8_t)(sq > 255.0f ? 255.0f : (sq < 0 ? 0 : sq));
+    // Publish even a poor solve -- the CONFIDENCE travels with it, and the
+    // receiver decides what it trusts.
+    g_geo_ready = true;
+}
+
+// Fill the geometry packet.  Indexed by BEACON ID (node[id-1]); ids the
+// survey did not solve are left without MANTIS_GN_VALID.
+static void build_geometry(MantisGeomPacket *g, uint32_t seq) {
+    *g = MantisGeomPacket{};
+    g->counter     = g_counter;
+    g->reporter_id = beacon_id;
+    g->seq         = seq;
+    g->n_nodes     = MANTIS_MAX_BEACON_ID;
+    g->stress_q8   = g_geo_stress;
+    g->scale_known = 0;            // RSSI ranges: shape yes, metres no
+    g->cm_per_unit = g_geo_cm;
+    for (uint8_t i = 0; i < g_geo_n; i++) {
+        const uint8_t id = g_geo_ids[i];
+        if (id == 0 || id > MANTIS_MAX_BEACON_ID) continue;
+        MantisGeomNode &nd = g->node[id - 1];
+        nd.x_q10 = (int16_t)(g_geo_x[i] * 1024.0f);
+        nd.y_q10 = (int16_t)(g_geo_y[i] * 1024.0f);
+        nd.noise_floor = g_last_noise[id];
+        uint8_t heard = 0;
+        for (uint8_t j = 1; j <= MANTIS_MAX_BEACON_ID; j++)
+            if (j != id && g_rssi_n[id][j]) heard |= (uint8_t)(1u << (j - 1));
+        nd.heard_mask = heard;
+        nd.uptime_s = (uint16_t)((millis() / 1000) > 65535 ? 65535 : (millis() / 1000));
+        nd.flags = MANTIS_GN_VALID;
+        if (__builtin_popcount(heard) < 2) nd.flags |= MANTIS_GN_ISOLATED;
+    }
+    mantis_geom_seal(g);
+}
+
+// The lowest noise floor any link reported recently.  The report used to
+// read g_raw[1] -- beacon 1's link -- which beacon 1 itself never has.
+static int8_t quietest_noise() {
+    int8_t best = 0;
+    for (uint8_t i = 1; i < MANTIS_SLOTS; i++) {
+        if (i == beacon_id || g_last_len[i] == 0) continue;
+        if (best == 0 || g_last_noise[i] < best) best = g_last_noise[i];
+    }
+    return best;
 }
 
 // ── Build and send this slot's payload ────────────────────────
@@ -334,7 +428,7 @@ static void transmit(MantisPayloadKind kind) {
         MantisPerspective p{};
         p.reporter_id = beacon_id;
         p.seq         = f.seq;
-        p.noise_floor = g_raw[1].noise;
+        p.noise_floor = quietest_noise();
         p.rssi_self   = -50;
         p.flags = (g_mesh.sched.synced ? MANTIS_RF_SYNCED : 0)
                 | (g_learning ? 0 : MANTIS_RF_BASELINE_OK);
@@ -348,6 +442,7 @@ static void transmit(MantisPayloadKind kind) {
                                       g_link[i].phi_ema,
                                       g_link[i].last_quality,
                                       false, &p.links[k], i);
+            p.link_rssi[k] = g_rssi_n[beacon_id][i] ? g_peer_rssi[beacon_id][i] : 0;
             k++;
         }
         p.n_links = k;
@@ -364,7 +459,7 @@ static void transmit(MantisPayloadKind kind) {
         d.counter     = g_counter;
         d.reporter_id = beacon_id;
         d.seq         = f.seq;
-        d.noise_floor = g_raw[1].noise;
+        d.noise_floor = quietest_noise();
         // Two links per dense packet, rotating, so a full deep sweep
         // completes over several macroframes without ever making one
         // packet large.
@@ -376,7 +471,7 @@ static void transmit(MantisPayloadKind kind) {
             MantisDenseLink &L = d.link[k];
             L.peer_id = i;
             L.quality = g_link[i].last_quality;
-            mantis_dense_profile((const int8_t *)g_raw[i].buf, g_raw[i].len,
+            mantis_dense_profile(g_last_csi[i], g_last_len[i],
                                  L.sc_profile, &L.delay_spread_q12);
             float da = 0.0f;
             if (g_link[i].base_n > 0 && g_link[i].amp_base > 1e-3f)
@@ -393,6 +488,14 @@ static void transmit(MantisPayloadKind kind) {
         d.n_links = k;
         mantis_dense_seal(&d);
         if (off + sizeof(d) <= sizeof(pkt)) { memcpy(pkt + off, &d, sizeof(d)); off += sizeof(d); }
+    } else if (kind == MPL_ECHO) {
+        // THE SURVEYED LAYOUT.  This branch did not exist: the slot was
+        // scheduled, the timekeeper solved the geometry every 5 s, and
+        // then transmitted a bare frame -- so no receiver anywhere ever
+        // learned where the beacons actually are.
+        MantisGeomPacket g;
+        build_geometry(&g, f.seq);
+        if (off + sizeof(g) <= sizeof(pkt)) { memcpy(pkt + off, &g, sizeof(g)); off += sizeof(g); }
     }
 
     esp_now_send(BROADCAST, pkt, off);
@@ -413,7 +516,7 @@ void setup() {
     // room's survey and baselines valid across a power cycle.
     g_nvs.begin("mantis", false);
     const uint8_t stored = (uint8_t)g_nvs.getUChar("bid", 0);
-    mantis_id_begin(&g_id, mac, stored, millis());
+    mantis_id_begin(&g_id, g_uid, stored, millis());
 
     radio_begin();
     Serial.printf("[mantis] uid %u, stored id %u, %s\n",
@@ -430,8 +533,9 @@ void loop() {
     if (mantis_id_tick(&g_id, now_ms)) {
         beacon_id = g_id.id;
         if (mantis_id_may_tx(&g_id)) {
-            mantis_mesh_init(&g_mesh, beacon_id);
-            uint8_t mac[6] = {0x1A, 0x00, 0x00, 0x00, 0x00, beacon_id};
+            mantis_mesh_init(&g_mesh, beacon_id, g_uid);
+            uint8_t mac[6];
+            mantis_beacon_mac(g_uid, beacon_id, mac);
             esp_wifi_set_mac(WIFI_IF_STA, mac);
             Serial.printf("[mantis] id %u claimed (uid %u), slot %u\n",
                           beacon_id, g_uid, g_mesh.sched.my_slot);
@@ -501,7 +605,7 @@ void loop() {
         // the geometry slot sends its perspective instead, so the slot
         // is never wasted on a packet that would have been empty.
         MantisPayloadKind k = duty.payload;
-        if (k == MPL_ECHO && !(g_mesh.is_timekeeper && g_geo_ready)) k = MPL_REPORT;
+        if (k == MPL_ECHO && !(g_mesh.is_timekeeper && g_geo_ready)) k = duty.fallback;
         transmit(k);
     }
 

@@ -1,4 +1,5 @@
 #pragma once
+#include <string.h>
 // ═══════════════════════════════════════════════════════════════
 //  MANTIS RECEIVER INGEST
 //  Turning beacon broadcasts into a live mesh estimate
@@ -91,6 +92,11 @@ typedef struct {
     bool     baseline_latched;
     bool     baseline_partial;   // latched on the backstop, not on coverage
     uint32_t first_report_ms;
+    // Which timekeeper the adopted survey came from.  During a handover a
+    // node can briefly publish a stale partial survey; the LOWEST id that
+    // has published recently is the authority.
+    uint8_t  geom_from;
+    uint32_t geom_from_ms;
 } MantisReceiver;
 
 // ── WHEN TO STOP LEARNING THE QUIET ROOM ─────────────────────
@@ -125,7 +131,10 @@ typedef struct {
 static inline void mantis_rx_begin(MantisReceiver *r, float extent,
                                    uint8_t tdisplays, uint8_t cardputers,
                                    bool docked) {
-    *r = MantisReceiver{};
+    // memset, not *r = MantisReceiver{}: this struct is ~12 KB and the
+    // value-initialised form may materialise a temporary on the caller's
+    // stack -- which on an 8 KB Arduino task is a boot-time crash.
+    memset(r, 0, sizeof(*r));
     r->mesh.extent = extent;
     r->deploy.tdisplays  = tdisplays;
     r->deploy.cardputers = cardputers;
@@ -138,6 +147,64 @@ static inline void mantis_rx_begin(MantisReceiver *r, float extent,
 // `now_ms` is the local clock; the mesh's own sequencing comes from the
 // air frame, so a receiver with a wandering millis() cannot corrupt the
 // ordering of reports.
+
+// ── LIVE SET ──────────────────────────────────────────────────
+// A beacon is live once heard directly or named in a peer's report, and
+// stays live for MANTIS_RX_LIVE_MS after the last mention.  Everything
+// that used to treat "highest id" as "number of beacons" goes through
+// here instead: ids can have holes, and a hole is not a beacon.
+#ifndef MANTIS_RX_LIVE_MS
+  #define MANTIS_RX_LIVE_MS 10000
+#endif
+
+// Place every live beacon the survey has NOT measured on a ring, evenly
+// by rank.  Without positions the tomography builds no chords at all --
+// which is exactly what happened before: nothing ever seeded geometry,
+// the survey packet was never sent, and the mesh solver ran on an empty
+// chord set on every device.  An assumed ring is drawn hollow and the
+// survey replaces it the moment one arrives.
+static inline void mantis_rx_reseed(MantisReceiver *r) {
+    uint8_t ids[MANTIS_SLOTS]; uint8_t k = 0;
+    for (uint8_t i = 1; i < MANTIS_SLOTS; i++) if (r->mesh.live[i]) ids[k++] = i;
+    if (k == 0) return;
+    for (uint8_t n = 0; n < k; n++) {
+        const uint8_t id = ids[n];
+        if (r->mesh.pos_measured[id]) continue;
+        const float t = (float)M_PI / 2.0f + 2.0f * (float)M_PI * (float)n / (float)k;
+        mantis_mesh_set_pos(&r->mesh, id, 0.92f * cosf(t), 0.92f * sinf(t), false);
+    }
+}
+
+static inline void mantis_rx_refresh_deploy(MantisReceiver *r) {
+    uint8_t hi = 0;
+    for (uint8_t i = 1; i < MANTIS_SLOTS; i++) if (r->mesh.live[i]) hi = i;
+    r->mesh.n_beacons        = hi;
+    r->deploy.beacons        = mantis_mesh_live_count(&r->mesh);
+    r->deploy.geometry_known = (mantis_mesh_geometry_confidence(&r->mesh) > 0.5f);
+    r->caps = mantis_caps(&r->deploy);
+}
+
+static inline void mantis_rx_mark_live(MantisReceiver *r, uint8_t id, uint32_t now_ms) {
+    if (id == 0 || id > MANTIS_MAX_BEACON_ID) return;
+    const bool was = r->mesh.live[id];
+    r->mesh.live[id]    = 1;
+    r->mesh.live_ms[id] = now_ms;
+    if (!was) { mantis_rx_reseed(r); mantis_rx_refresh_deploy(r); }
+}
+
+// Age out beacons nobody has heard or mentioned for a while.
+static inline void mantis_rx_expire(MantisReceiver *r, uint32_t now_ms) {
+    bool changed = false;
+    for (uint8_t i = 1; i < MANTIS_SLOTS; i++) {
+        if (!r->mesh.live[i]) continue;
+        if ((now_ms - r->mesh.live_ms[i]) > MANTIS_RX_LIVE_MS) {
+            r->mesh.live[i] = 0;
+            changed = true;
+        }
+    }
+    if (changed) { mantis_rx_reseed(r); mantis_rx_refresh_deploy(r); }
+}
+
 static inline bool mantis_rx_adopt_geometry(MantisReceiver *r,
                                             const MantisGeomPacket *g,
                                             uint16_t len);
@@ -217,10 +284,16 @@ static inline bool mantis_rx_packet(MantisReceiver *r, uint8_t from_id,
     // ── perspective ──
     if (rest >= (int)sizeof(MantisPerspective)) {
         const MantisPerspective *p = (const MantisPerspective *)body;
+        // Validated against the ID SPACE, not against what this receiver
+        // happens to hear.  A beacon out of our own range is still real,
+        // and rejecting the whole report because it names one threw away
+        // every other link in it.
         if (mantis_report_valid(p, sizeof(MantisPerspective),
-                                r->mesh.n_beacons)) {
+                                MANTIS_MAX_BEACON_ID)) {
+            for (uint8_t i = 0; i < p->n_links; i++)
+                mantis_rx_mark_live(r, p->links[i].peer_id, now_ms);
             if (mantis_store_apply(&r->store, p, sizeof(*p),
-                                   r->mesh.n_beacons, now_ms)) {
+                                   MANTIS_MAX_BEACON_ID, now_ms)) {
                 // Phase RATE, before the mesh ingest overwrites state.
                 // One frame interval per superframe, known exactly from
                 // the schedule -- which is what makes this a measurement
@@ -254,6 +327,11 @@ static inline bool mantis_rx_packet(MantisReceiver *r, uint8_t from_id,
     if (rest >= (int)sizeof(MantisGeomPacket)) {
         const MantisGeomPacket *g = (const MantisGeomPacket *)body;
         if (mantis_geom_valid(g, sizeof(MantisGeomPacket))) {
+            const bool authority = (r->geom_from == 0)
+                                || (g->reporter_id <= r->geom_from)
+                                || (now_ms - r->geom_from_ms) > 15000;
+            if (!authority) { r->geom_rejected++; return true; }
+            r->geom_from = g->reporter_id; r->geom_from_ms = now_ms;
             if (mantis_rx_adopt_geometry(r, g, sizeof(MantisGeomPacket))) {
                 r->geom_in++;
                 r->geom_stress = g->stress_q8;
@@ -273,7 +351,7 @@ static inline bool mantis_rx_packet(MantisReceiver *r, uint8_t from_id,
     if (rest >= (int)sizeof(MantisDensePacket)) {
         const MantisDensePacket *d = (const MantisDensePacket *)body;
         if (mantis_dense_valid(d, sizeof(MantisDensePacket),
-                               r->mesh.n_beacons)) {
+                               MANTIS_MAX_BEACON_ID)) {
             for (uint8_t i = 0; i < d->n_links; i++) {
                 const uint8_t peer = d->link[i].peer_id;
                 const int idx = d->reporter_id * MANTIS_SLOTS + peer;
@@ -313,6 +391,7 @@ static inline bool mantis_rx_solve(MantisReceiver *r, uint32_t now_ms,
                                    float dt_s) {
     if ((now_ms - r->last_solve_ms) < 100) return false;
     r->last_solve_ms = now_ms;
+    mantis_rx_expire(r, now_ms);
 
     if (!r->baseline_latched) {
         if (!r->first_report_ms) return false;
@@ -355,14 +434,7 @@ static inline bool mantis_rx_solve(MantisReceiver *r, uint32_t now_ms,
 // Seed beacon geometry.  Until a survey runs this is the nominal ring --
 // and `measured` says which it is, so nothing downstream mistakes an
 // assumption for a measurement.
-static inline void mantis_rx_seed_geometry(MantisReceiver *r, bool measured) {
-    const uint8_t n = r->mesh.n_beacons;
-    if (n == 0) return;
-    for (uint8_t i = 1; i <= n; i++) {
-        const float t = (float)M_PI / 2.0f + 2.0f * (float)M_PI * (i - 1) / n;
-        mantis_mesh_set_pos(&r->mesh, i, cosf(t), sinf(t), measured);
-    }
-}
+static inline void mantis_rx_seed_geometry(MantisReceiver *r, bool) { mantis_rx_reseed(r); }
 
 // Adopt a surveyed layout, and REBUILD WHAT RESTED ON THE OLD ONE.
 //
@@ -386,6 +458,7 @@ static inline bool mantis_rx_adopt_geometry(MantisReceiver *r,
     float moved = 0.0f;
     for (uint8_t i = 0; i < g->n_nodes && i + 1 < MANTIS_SLOTS; i++) {
         const uint8_t id = (uint8_t)(i + 1);
+        if (!(g->node[i].flags & MANTIS_GN_VALID)) continue;   // not solved
         const float nx = (float)g->node[i].x_q10 / 1024.0f;
         const float ny = (float)g->node[i].y_q10 / 1024.0f;
         if (r->mesh.have_pos[id]) {
@@ -396,6 +469,8 @@ static inline bool mantis_rx_adopt_geometry(MantisReceiver *r,
         mantis_mesh_set_pos(&r->mesh, id, nx, ny, true);
     }
     r->geom_shift = moved;
+    mantis_rx_reseed(r);           // unmeasured ids re-spaced around them
+    mantis_rx_refresh_deploy(r);
 
     // ABSOLUTE SCALE, when the mesh has it.  An RSSI survey gives shape
     // without metres; an FTM one gives both.  Carrying cm_per_unit is

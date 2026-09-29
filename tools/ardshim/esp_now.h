@@ -8,3 +8,7 @@ static inline int esp_now_init(){return 0;}
 static inline int esp_now_send(const uint8_t*,const uint8_t*,size_t){return 0;}
 static inline int esp_now_add_peer(const esp_now_peer_info_t*){return 0;}
 static inline void esp_now_register_recv_cb(void(*)(const esp_now_recv_info_t*,const uint8_t*,int)){}
+
+static inline int esp_now_del_peer(const uint8_t*){return 0;}
+static inline int esp_now_deinit(){return 0;}
+static inline bool esp_now_is_peer_exist(const uint8_t*){return false;}

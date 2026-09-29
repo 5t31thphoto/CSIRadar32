@@ -52,6 +52,9 @@
 #define MANTIS_SLOTS            8
 #define MANTIS_SLOT_SILENCE     (MANTIS_SLOTS - 1)   // slot 7
 #define MANTIS_SLOT_GUARD       (MANTIS_SLOTS - 2)   // slot 6
+// Highest beacon id.  slot = id-1, so ids live in slots 0..5 and never
+// touch the guard (CHORD/CHORUS) or the silence slot.
+#define MANTIS_MAX_BEACON_ID    (MANTIS_SLOTS - 2)
 
 // Superframe period in microseconds.  30 Hz nominal; the silence and
 // guard slots mean the EFFECTIVE per-beacon sounding rate is
@@ -128,6 +131,41 @@ static inline uint16_t mantis_uid_from_mac(const uint8_t *mac) {
     h ^= h >> 16;
     const uint16_t u = (uint16_t)(h & 0xFFFF);
     return u ? u : 1;      // 0 means "unknown", so never hand it out
+}
+
+// ── Beacon MAC address ────────────────────────────────────────
+//
+//     1A : 00 : uid_hi : uid_lo : 00 : beacon_id
+//
+// 0x1A is locally administered, unicast.  The id sits in the last byte,
+// where every receiver has always looked for it, and the MAC-derived uid
+// sits in the middle so NO TWO BOXES EVER SHARE AN ADDRESS -- even two
+// that briefly claim the same id.
+//
+// That matters more than it looks.  With the old 1A:00:00:00:00:id form,
+// two boxes on the same id had byte-identical MACs: the radio could drop
+// the other's frames as its own echo, so the collision was invisible, and
+// every receiver merged two physical links into one garbage stream.  With
+// the uid in the address the collision is heard, the tiebreak runs, and
+// receivers can tell the boxes apart for the one exchange it takes.
+//
+// A legacy beacon (1A:00:00:00:00:id) still matches, because the match
+// only requires 1A:00:??:??:00 with a valid id.
+#define MANTIS_BEACON_MAC0 0x1A
+static inline void mantis_beacon_mac(uint16_t uid, uint8_t id, uint8_t out[6]) {
+    out[0] = MANTIS_BEACON_MAC0; out[1] = 0x00;
+    out[2] = (uint8_t)(uid >> 8); out[3] = (uint8_t)(uid & 0xFF);
+    out[4] = 0x00; out[5] = id;
+}
+// 0 = not a beacon.  Accepts ids 1..6 only.
+static inline uint8_t mantis_beacon_id_from_mac(const uint8_t *mac) {
+    if (!mac || mac[0] != MANTIS_BEACON_MAC0 || mac[1] != 0x00 || mac[4] != 0x00) return 0;
+    const uint8_t id = mac[5];
+    return (id >= 1 && id <= MANTIS_MAX_BEACON_ID) ? id : 0;
+}
+// The uid carried in the address (0 for a legacy beacon).
+static inline uint16_t mantis_beacon_uid_from_mac(const uint8_t *mac) {
+    return (uint16_t)(((uint16_t)mac[2] << 8) | mac[3]);
 }
 
 // ── Beacon-to-beacon report ───────────────────────────────────

@@ -26,3 +26,9 @@ uint32_t comboHeldMs();
 // Consume any pending short-press events so that releasing the combo
 // doesn't immediately fire a short-press on either button.
 void inputClearEdges();
+
+// A press that did not come from this unit's own buttons: a hand-held
+// probe (Core2 / Cardputer ADV) pressing them remotely.  Delivered through
+// the SAME event flags the physical buttons set, so every screen handles
+// it identically and a remote cannot do anything the buttons cannot.
+void input_inject(ButtonId b, bool long_press);

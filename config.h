@@ -138,7 +138,7 @@ const PsramProbe &psram_probe();   // evaluated once at boot
 
 // ── Version & identity ─────────────────────────────────────────
 #define FW_NAME     "MantisSec"
-#define FW_VERSION  "0.9.5"
+#define FW_VERSION  "1.1.0"
 
 // ── Wi-Fi / CSI (unchanged from v0.2) ─────────────────────────
 #define CSI_CHANNEL             11
@@ -658,6 +658,9 @@ enum DashView : uint8_t {
     // tracks, the perimeter contact.  Sits at the END so existing view
     // indices are unchanged.
     DV_TACTICAL,
+    // v1.1: the beacon mesh -- live beacons, survey, links, alignment to
+    // this radar, contacts.  Appended so existing view indices hold.
+    DV_MESH,
     DV_COUNT
 };
 
@@ -912,7 +915,8 @@ struct BeaconState {
     // observed makes a failed command visible.
     uint16_t cmd_rate_hz;        // 0 = never commanded
     uint16_t reported_rate_hz;   // from PONG, 0 = never answered
-    uint8_t  fw_marker;          // 1 = extended firmware (from PONG)
+    uint8_t  fw_marker;          // 1 = extended firmware (from PONG), 2 = mesh beacon
+    uint16_t uid;                // mesh beacons: MAC-derived box identity
     uint8_t  sleep_enabled;      // from PONG
     uint32_t last_pong_ms;
     bool     rate_mismatch_logged;   // one-shot, so the log is not spammed
@@ -984,7 +988,9 @@ struct PeerHelloPacket {
     uint8_t  own_mac[6];
     uint32_t uptime_ms;
     uint8_t  role_wanted;
-    uint8_t  _pad[1];
+    // v1.1: the AppState this unit is in.  Was padding (always 0), so an
+    // older unit reads as "state unknown" rather than as a wrong state.
+    uint8_t  app_state;
 };
 
 struct PeerCsiSummary {
@@ -1029,7 +1035,74 @@ enum : uint8_t {
     // renders the same step the operator is actually performing instead
     // of being stuck on the first one.
     PEER_OP_TAC_STEP        = 12,
+    // v1.1 — HAND-HELD PROBES (Core2 / Cardputer ADV) drive the anchor.
+    //
+    // REMOTE_KEY presses one of the anchor's own two buttons, remotely:
+    //   arg_u8  = 1 LEFT short, 2 RIGHT short, 3 LEFT long, 4 RIGHT long
+    //   arg_u16 = sequence number; the anchor applies each seq ONCE and
+    //             echoes the last one it applied in PeerAnchorStatus, so
+    //             the probe retries until it sees its press land.
+    // Driving the anchor's REAL input path -- rather than a parallel set
+    // of remote commands -- means the probe cannot ask for anything the
+    // anchor's own buttons could not do, and the two can never disagree
+    // about what a press means.
+    PEER_OP_REMOTE_KEY      = 13,
+    // Liveness from a hand-held probe.  arg_u8 = device kind (1 Core2,
+    // 2 Cardputer ADV).  Starts the anchor's status broadcast.
+    PEER_OP_PROBE_HELLO     = 14,
 };
+
+#define PEER_ANCHOR_STATUS_MAGIC 0xC5A57A75UL
+#define ANCHOR_STATUS_TRACKS     6
+
+// ANCHOR → every hand-held probe, broadcast at ~4 Hz while one is present.
+//
+// Everything a probe needs to MIRROR the anchor rather than guess at it:
+// the state, what the anchor's screen is asking the operator to do, what
+// its two buttons do right now, and what it sees.  The probe renders from
+// this; it keeps no copy of the anchor's state machine, so the two cannot
+// drift apart.
+//
+// Track positions are in the MESH SURVEY FRAME when the anchor has aligned
+// its radar to the mesh (flags & AS_FRAME_MESH), so a probe can draw them
+// on the same map as its own mesh contacts.  Otherwise they are in the
+// anchor's scene frame, anchor at the origin.
+struct __attribute__((packed)) PeerAnchorStatus {
+    uint32_t magic;
+    uint32_t uptime_ms;
+    uint8_t  app_state;
+    uint8_t  dash_view;
+    uint16_t remote_ack;      // last REMOTE_KEY seq applied
+    uint8_t  flags;           // AS_*
+    uint8_t  beacons;         // beacons the anchor hears
+    uint8_t  mesh_beacons;    // live mesh beacons
+    uint8_t  n_tracks;
+    uint8_t  step, steps;     // wizard position (0/0 outside the walk)
+    uint8_t  progress;        // 0..100 for whatever the screen shows
+    uint8_t  mesh_contacts;   // believed mesh contacts
+    int16_t  anchor_x_q10, anchor_y_q10;   // the anchor, in the track frame
+    char     title[16];
+    char     hint[40];
+    char     left[12];
+    char     right[12];
+    struct __attribute__((packed)) Track {
+        int16_t x_q10, y_q10;
+        uint8_t conf;         // 0..255
+        uint8_t flags;        // AT_*
+    } track[ANCHOR_STATUS_TRACKS];
+};
+#define AS_CAL_COMPLETE   0x01
+#define AS_TACTICAL       0x02
+#define AS_ALERT          0x04
+#define AS_FRAME_MESH     0x08
+#define AS_MESH_BASELINE  0x10
+#define AS_REMOTE_DRIVES  0x20   // this probe's keys are driving the anchor
+#define AS_STEREO         0x40   // the anchor has its T-Display stereo peer
+#define AT_ACTIVE         0x01
+#define AT_SELF           0x02
+#define AT_CORROBORATED   0x04   // the mesh sees someone here too
+#define AT_MESH_ONLY      0x08   // a mesh contact the anchor has no track for
+
 
 struct PeerBaselinePacket {
     uint32_t magic;

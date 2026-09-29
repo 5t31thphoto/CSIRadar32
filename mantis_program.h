@@ -149,6 +149,8 @@ static inline void mantis_chord_pair(uint32_t seq, uint8_t n_beacons,
 typedef struct {
     bool              transmit;     // do we key the radio at all this slot?
     MantisPayloadKind payload;
+    // Sent instead when payload is MPL_ECHO and this node has no survey.
+    MantisPayloadKind fallback;
     bool              listen;       // measure CSI from whoever is speaking
     bool              may_sleep;    // nothing required of us until the next slot
     MantisFrameRole   role;
@@ -207,20 +209,24 @@ static inline MantisDuty mantis_duty(const MantisSched *s, int64_t now_us,
             break;
         default:   // MFR_SOLO
             d.transmit = (d.slot == (uint8_t)(my_id - 1));
-            // The payload rides the transmission we were making anyway.
+            d.fallback = (my_id == mantis_report_turn(seq, n_beacons))
+                       ? MPL_REPORT : MPL_SOUND;
+            // THE SURVEY SLOT.  Frame 13 of every 4th macroframe (~0.5 Hz)
+            // is offered to EVERY beacon as an echo.  Only the timekeeper
+            // holds a solved layout, so only it actually sends one; every
+            // other beacon sends its fallback (mantis_program cannot know
+            // who keeps time, so the beacon decides).
             //
-            // Once per macroframe the slot that would carry a REPORT
-            // carries the SURVEYED GEOMETRY instead.  Only the
-            // timekeeper fills it (mantis_program cannot know who that
-            // is, so the beacon checks and falls back to SOUND), and it
-            // costs one report out of sixteen -- the layout changes far
-            // more slowly than the links do.
+            // It used to also require my_id == report_turn(seq).  Frame 13
+            // is odd and report_turn is (seq % 6) + 1, so the two could only
+            // coincide for EVEN ids -- and the timekeeper is the LOWEST id,
+            // normally 1, which was never offered the slot.  The survey was
+            // computed every five seconds and never published.
             if ((seq % MANTIS_MACRO_FRAMES) == 13
-                && my_id == mantis_report_turn(seq, n_beacons)) {
-                d.payload = MPL_ECHO;      // geometry, if this node has it
+                && ((seq / MANTIS_MACRO_FRAMES) % 4) == 0) {
+                d.payload = MPL_ECHO;
             } else {
-                d.payload = (my_id == mantis_report_turn(seq, n_beacons))
-                          ? MPL_REPORT : MPL_SOUND;
+                d.payload = d.fallback;
             }
             d.listen   = !d.transmit;
             break;

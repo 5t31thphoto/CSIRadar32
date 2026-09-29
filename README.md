@@ -1,11 +1,71 @@
-# MantisSec CSI-Radar-S3 (v0.6)
+# MantisSec CSI Radar (v1.1)
 
-Wi-Fi CSI **scene reconstruction** engine for the LilyGo T-Display-S3.
-Two receivers, three beacons, a calibration walk, and a live top-down
-map of who's in the room.
+Wi-Fi CSI **scene reconstruction** on ESP32: a T-Display-S3 anchor, a
+self-organising mesh of smart beacons, and hand-held probes (M5Stack
+Core2, Cardputer ADV), all built from one repo and flashed from the
+browser.
 
 please start here: https://5t31thphoto.github.io/CSIRadar32/
 Please get your hardware from my affiliate links on that site too!
+
+## The system, and how it scales
+
+Every piece works with whatever else is present, and says what the next
+piece of hardware would add.
+
+| Deployment | What you get |
+|---|---|
+| anchor + 1 beacon | tripwire / link presence |
+| anchor + 2 beacons | presence on two links; mesh presence |
+| anchor + 3+ beacons | **mesh contacts on the radar before any calibration** (beacon-to-beacon tomography), surveyed beacon layout |
+| + calibration walk | anchor tracks from the learned inverse model, **corroborated** by the mesh (double lime ring = both instruments agree) |
+| + 4-6 beacons | witness voting (ghost rejection), beacon-moved integrity check |
+| + a hand-held probe | the anchor's screen and buttons in your hand, alarms, its own mesh map with the anchor's tracks overlaid |
+| + a second T-Display | stereo AoA |
+
+**Beacons** (`CSI-Beacon-Mantis/`, one firmware per chip) claim the lowest
+free id (1..6) and persist it, elect the lowest id as timekeeper, share a
+33 ms / 8-slot TDMA frame, measure every beacon-to-beacon link, and
+publish perspectives, dense link detail and - from the timekeeper - a
+surveyed layout solved from the full pairwise RSSI matrix. Each box has
+a unique MAC (`1A:00:uid:uid:00:id`), so an id collision is heard and
+resolved by uid in one exchange.
+
+**The anchor** (`CSI-Radar-S3.ino` + `*.cpp`) runs its calibrated scene
+solver and the Rust RF chart as before, and now also hosts the same
+`mantis_receiver.h` the probes run (`mesh_anchor.cpp`). The mesh frame is
+aligned onto the radar through the beacons both frames know
+(`mantis_align.h`), so mesh contacts and tomography glow are drawn in the
+right place; dashboard view **MESH** shows beacons, survey, alignment
+and contacts.
+
+**Probes** (`core2/`, `cardputer/`) share `mantis_probe_app.h`: one alarm
+policy, one map renderer, one anchor remote. The anchor broadcasts its
+state, what its screen is asking for and what its two buttons do; a probe
+press is delivered through the anchor's own input path with a sequence
+number and shown as landed only when the anchor echoes it. Nothing about
+the anchor's state is guessed on the probe.
+
+## Building and checking
+
+    ./tools/preflight.sh
+
+compiles every firmware and every anchor translation unit against
+vendor-header shims, host-links the anchor, checks the probe/anchor wire
+contract, and runs two simulations:
+
+* `tools/mesh_sim.cpp` - 1..6 blank beacons booting together (and two
+  boxes with the same stored id): ids, timekeeping, survey accuracy and
+  person detection through the real receiver.
+* `tools/link_sim.cpp` - remote key presses under 30% loss both ways:
+  every press lands exactly once and confirmation is honest.
+
+CI (`.github/workflows/build.yml`) runs pre-flight, then builds the anchor
+(Rust core built with `-Z build-std=core`), Core2, Cardputer ADV and both
+beacon chips, and publishes the web flasher. Zip drops: put the workflow
+under `github/workflows` (no dot) in the zip and rename it after the drop
+lands; `tools/retired.txt` lists files a drop deletes.
+
 ## What it is
 
 An **empirical inverse sensor model**, 

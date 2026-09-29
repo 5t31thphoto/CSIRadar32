@@ -7,6 +7,8 @@
 #include "peer.h"
 #include "stereo.h"
 #include "scene.h"
+#include "mesh_anchor.h"
+#include "mantis_air.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
@@ -64,10 +66,12 @@ void ms_log_clear() { s_log_head = 0; s_log_count = 0; }
 #endif
 
 // ── Local helpers ───────────────────────────────────────────────
+// Beacon MACs are 1A:00:uid:uid:00:id (mesh firmware, unique per box) or
+// 1A:00:00:00:00:id (legacy).  One predicate for both, shared with the
+// beacons and the probes via mantis_air.h, so the three can never
+// disagree about what counts as a beacon.
 static inline bool mac_prefix_match(const uint8_t *m) {
-    for (int i = 0; i < 5; i++)
-        if (m[i] != BEACON_MAC_PREFIX[i]) return false;
-    return true;
+    return mantis_beacon_id_from_mac(m) != 0;
 }
 
 // Look up or allocate a beacon slot for this MAC. Returns index or -1.
@@ -86,6 +90,8 @@ static int IRAM_ATTR slot_for_mac(const uint8_t *mac) {
         if (!g_app.beacon[i].active) {
             for (int j = 0; j < 6; j++) g_app.beacon[i].mac[j] = mac[j];
             g_app.beacon[i].id     = mac[5];
+            g_app.beacon[i].fw_marker = 0;
+            g_app.beacon[i].uid       = mantis_beacon_uid_from_mac(mac);
             g_app.beacon[i].active = true;
             g_app.beacon[i].frames = 0;
             g_app.beacon[i].dirty  = false;
@@ -254,6 +260,24 @@ static void handle_espnow_common(const uint8_t *src, const uint8_t *data, int le
         uint32_t counter;
         memcpy(&counter, data, sizeof(counter));
         g_app.beacon[slot].last_counter = counter;
+    }
+
+    // MESH BEACON?  Its air frame follows the counter.  Everything after
+    // that -- perspectives, the surveyed layout, dense link detail -- is
+    // what the anchor used to discard.  Hand the packet to the mesh
+    // receiver, and stop treating this beacon as the legacy kind that
+    // takes rate commands: a mesh beacon keeps its own slot schedule and
+    // ignores them, so every one was wasted airtime on the measurement
+    // channel.
+    if (len >= (int)(sizeof(uint32_t) + sizeof(MantisAirFrame))) {
+        MantisAirFrame f;
+        memcpy(&f, data + sizeof(uint32_t), sizeof(f));
+        if (f.magic == MANTIS_AIR_MAGIC) {
+            BeaconState &b = g_app.beacon[slot];
+            if (b.fw_marker != 2) { b.fw_marker = 2; b.cfg_pending = false; }
+            b.uid = f.uid;
+            mesh_anchor_enqueue(b.id, data, len);
+        }
     }
 }
 
@@ -505,6 +529,15 @@ static void ensure_broadcast_peer() {
 
 void csi_beacon_command(uint8_t target_id, uint8_t op,
                         uint16_t arg_u16, uint32_t arg_u32) {
+    // Legacy control is for LEGACY beacons only.  Mesh beacons run their
+    // own absolute-deadline schedule and never read these.
+    bool any_legacy = false;
+    for (int i = 0; i < MAX_BEACONS; i++) {
+        const BeaconState &b = g_app.beacon[i];
+        if (!b.active || b.fw_marker == 2) continue;
+        if (target_id == 0 || b.id == target_id) { any_legacy = true; break; }
+    }
+    if (!any_legacy) return;
     ensure_broadcast_peer();
     BeaconCommand c = {};
     c.magic     = BEACON_CMD_MAGIC;
@@ -574,6 +607,7 @@ void csi_beacon_service() {
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active || !b.cfg_pending) continue;
+        if (b.fw_marker == 2) { b.cfg_pending = false; continue; }   // mesh
 
         // Confirmed?  The beacon reported the rate we asked for.
         if (b.reported_rate_hz == (uint16_t)BEACON_REQUEST_RATE_HZ) {
@@ -784,6 +818,7 @@ void csi_beacon_enforce_rate() {
     for (int i = 0; i < MAX_BEACONS; i++) {
         BeaconState &b = g_app.beacon[i];
         if (!b.active || b.cfg_pending) continue;      // already being worked
+        if (b.fw_marker == 2) continue;                 // mesh: keeps its own time
 
         // RE-COMMAND ONLY IF THE BEACON LOOKS LIKE IT RESET.
         //

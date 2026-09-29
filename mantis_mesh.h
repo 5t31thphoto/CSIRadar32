@@ -1,4 +1,5 @@
 #pragma once
+#include <string.h>
 // ═══════════════════════════════════════════════════════════════
 //  MANTIS MESH LAYER
 //  Beacon perspectives -> chords -> an independent spatial estimate
@@ -77,7 +78,11 @@ typedef struct {
     // confidence reporting care which kind it is.
     uint8_t have_pos[MANTIS_SLOTS];
     uint8_t pos_measured[MANTIS_SLOTS];
-    uint8_t n_beacons;
+    uint8_t n_beacons;         // HIGHEST id heard (ids are 1-based)
+    // Which ids are actually live.  n_beacons is a loop bound, not a
+    // count: ids can have holes, and a hole is not a beacon.
+    uint8_t live[MANTIS_SLOTS];
+    uint32_t live_ms[MANTIS_SLOTS];
     float   extent;            // chart half-width these coords live in
 
     // Per-link state, indexed [hearer][heard], 1-based ids collapsed to 0-based.
@@ -107,16 +112,19 @@ static inline void mantis_mesh_reset(MantisMesh *m) {
     const float ex = m->extent;
     const uint8_t n = m->n_beacons;
     float bx[MANTIS_SLOTS], by[MANTIS_SLOTS];
-    uint8_t hp[MANTIS_SLOTS], pm[MANTIS_SLOTS];
+    uint8_t hp[MANTIS_SLOTS], pm[MANTIS_SLOTS], lv[MANTIS_SLOTS];
+    uint32_t lm[MANTIS_SLOTS];
     for (int i = 0; i < MANTIS_SLOTS; i++) {
         bx[i]=m->bx[i]; by[i]=m->by[i];
         hp[i]=m->have_pos[i]; pm[i]=m->pos_measured[i];
+        lv[i]=m->live[i]; lm[i]=m->live_ms[i];
     }
-    *m = MantisMesh{};
+    memset(m, 0, sizeof(*m));      // 4 KB: never a stack temporary
     m->extent = ex; m->n_beacons = n;
     for (int i = 0; i < MANTIS_SLOTS; i++) {
         m->bx[i]=bx[i]; m->by[i]=by[i];
         m->have_pos[i]=hp[i]; m->pos_measured[i]=pm[i];
+        m->live[i]=lv[i]; m->live_ms[i]=lm[i];
     }
 }
 
@@ -135,11 +143,13 @@ static inline void mantis_mesh_set_pos(MantisMesh *m, uint8_t id,
 // the UI can say "assumed layout" instead of presenting a guess with the
 // same confidence as a measurement.
 static inline float mantis_mesh_geometry_confidence(const MantisMesh *m) {
-    if (m->n_beacons == 0) return 0.0f;
-    int meas = 0;
-    for (uint8_t i = 1; i <= m->n_beacons && i < MANTIS_SLOTS; i++)
+    int meas = 0, live = 0;
+    for (uint8_t i = 1; i < MANTIS_SLOTS; i++) {
+        if (!m->live[i]) continue;
+        live++;
         if (m->pos_measured[i]) meas++;
-    return (float)meas / (float)m->n_beacons;
+    }
+    return live ? (float)meas / (float)live : 0.0f;
 }
 
 // Fold one beacon's perspective in.  ASSIGNMENT, never accumulation --
@@ -202,27 +212,31 @@ static inline void mantis_mesh_ingest(MantisMesh *m,
 }
 
 // Is the per-link baseline usable yet?
+static inline uint8_t mantis_mesh_live_count(const MantisMesh *m) {
+    uint8_t n = 0;
+    for (uint8_t i = 1; i < MANTIS_SLOTS; i++) if (m->live[i]) n++;
+    return n;
+}
+
+// Baseline coverage, over the links that EXIST.
+//
+// This used to demand 90% of every (i, j) pair up to the highest id.
+// Two beacons that cannot hear each other (a wall, a long room) never
+// produce that pair, and an id hole produces a whole row and column of
+// pairs that can never arrive -- either one pinned coverage below 90%
+// forever and the mesh only started after the 45 s backstop, flagged
+// "partial".  A pair counts once it has been reported at all.
 static inline bool mantis_mesh_baseline_ready(const MantisMesh *m) {
     int ready = 0, total = 0;
-    for (uint8_t i = 1; i <= m->n_beacons; i++)
-        for (uint8_t j = 1; j <= m->n_beacons; j++) {
-            if (i == j) continue;
+    for (uint8_t i = 1; i <= m->n_beacons && i < MANTIS_SLOTS; i++)
+        for (uint8_t j = 1; j <= m->n_beacons && j < MANTIS_SLOTS; j++) {
+            if (i == j || !m->live[i] || !m->live[j]) continue;
+            const uint16_t n = m->base_n[i * MANTIS_SLOTS + j];
+            if (n == 0) continue;
             total++;
-            if (m->base_n[i * MANTIS_SLOTS + j] >= MANTIS_MESH_BASE_MIN) ready++;
+            if (n >= MANTIS_MESH_BASE_MIN) ready++;
         }
-    // NINE TENTHS, not two thirds.
-    //
-    // Two thirds let the baseline latch with a third of the links
-    // unreferenced, and a sparse chord set makes streak artefacts strong
-    // relative to real peaks: at 20 of 30 links a ghost reached 80% of
-    // the true target and was reported as a second person.  With full
-    // coverage the strongest artefact is 61% and is rejected cleanly.
-    //
-    // The backstop in mantis_rx_solve() still latches a PARTIAL baseline
-    // if coverage never completes -- a beacon pair that genuinely cannot
-    // hear each other must not block the system forever -- and that case
-    // is flagged rather than hidden.
-    return total > 0 && ready * 10 >= total * 9;
+    return total >= 3 && ready * 10 >= total * 9;
 }
 
 // Rebuild the chord set and reconstruct.  Cheap enough to run at the
@@ -230,7 +244,7 @@ static inline bool mantis_mesh_baseline_ready(const MantisMesh *m) {
 static inline void mantis_mesh_solve(MantisMesh *m) {
     m->n_chords  = 0;
     m->peak_valid = false;
-    if (m->n_beacons < 3 || !m->base_ready) return;
+    if (mantis_mesh_live_count(m) < 3 || !m->base_ready) return;
 
     // Pack 1-based ids into the dense 0-based form the builder wants.
     float bx[MANTIS_SLOTS], by[MANTIS_SLOTS];
@@ -238,7 +252,8 @@ static inline void mantis_mesh_solve(MantisMesh *m) {
     float at[MANTIS_SLOTS * MANTIS_SLOTS], qu[MANTIS_SLOTS * MANTIS_SLOTS];
     const uint8_t n = m->n_beacons;
     for (uint8_t i = 0; i < n; i++) {
-        bx[i] = m->bx[i + 1]; by[i] = m->by[i + 1]; hp[i] = m->have_pos[i + 1];
+        bx[i] = m->bx[i + 1]; by[i] = m->by[i + 1];
+        hp[i] = (uint8_t)(m->have_pos[i + 1] && m->live[i + 1]);
         for (uint8_t j = 0; j < n; j++) {
             at[i * n + j] = m->atten[(i + 1) * MANTIS_SLOTS + (j + 1)];
             qu[i * n + j] = m->qual [(i + 1) * MANTIS_SLOTS + (j + 1)];

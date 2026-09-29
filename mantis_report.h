@@ -54,7 +54,7 @@
 #include "mantis_air.h"
 #include <stddef.h>   // offsetof, used by the CRC coverage macro
 
-#define MANTIS_REPORT_VERSION   1
+#define MANTIS_REPORT_VERSION   2   // v2: link_rssi[] appended
 #define MANTIS_MAX_LINKS        (MANTIS_SLOTS - 2)   // peers a beacon can hear
 
 // ── One link, as one beacon sees it ───────────────────────────
@@ -122,7 +122,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  crc8;         // over everything after this field
     uint8_t  _pad;         // explicit: keeps links[] 2-byte aligned
     MantisLinkView links[MANTIS_MAX_LINKS];
+    // The PHY RSSI this beacon measures on each of those links, in the
+    // same order as links[].  This is the row of the pairwise RSSI matrix
+    // only THIS beacon can measure; publishing it is what lets the
+    // timekeeper assemble the WHOLE matrix and survey the real layout
+    // instead of solving from its own row alone.  0 = not measured.
+    int8_t   link_rssi[MANTIS_MAX_LINKS];
 } MantisPerspective;
+#define MANTIS_REPORT_VERSION_RSSI 2
 
 // flags
 #define MANTIS_RF_SYNCED       0x01   // reporter believes its slots are aligned
@@ -232,7 +239,12 @@ static inline bool mantis_store_apply(MantisPerspectiveStore *s,
 // A reporter is live only if it spoke recently.  Stale views are not
 // deleted -- they are simply not trusted, so a beacon that returns picks
 // up where it left off without a re-handshake.
-#define MANTIS_REPORT_STALE_MS 400
+// Each beacon reports every 6th SOLO frame; with the CHORD/CHORUS/DENSE/
+// SLEEP/ECHO frames of the 16-frame macro that is a worst case of 12
+// frames = 400 ms between reports.  The old 400 ms staleness window was
+// EXACTLY that gap, so a perfectly healthy beacon flickered stale, and a
+// single lost packet blanked it.  2.5 report periods rides out one loss.
+#define MANTIS_REPORT_STALE_MS 1000
 static inline bool mantis_store_fresh(const MantisPerspectiveStore *s,
                                       uint8_t id, uint32_t now_ms) {
     if (id >= MANTIS_SLOTS || !s->by_id[id].present) return false;
@@ -259,3 +271,9 @@ static inline int16_t mantis_q8(float v)   { return (int16_t)(v * 256.0f); }
 static inline float   mantis_unq8(int16_t v){ return (float)v / 256.0f; }
 static inline int16_t mantis_q12(float v)  { return (int16_t)(v * 4096.0f); }
 static inline float   mantis_unq12(int16_t v){ return (float)v / 4096.0f; }
+
+#ifdef __cplusplus
+static_assert(sizeof(MantisLinkView) == 6, "MantisLinkView layout changed");
+static_assert(sizeof(MantisPerspective) == 14 + 7 * MANTIS_MAX_LINKS,
+              "MantisPerspective layout changed");
+#endif

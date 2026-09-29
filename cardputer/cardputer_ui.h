@@ -67,7 +67,7 @@ static inline const char *cp_screen_name(CardputerScreen s) {
     switch (s) {
         case CPS_SPLASH:    return "MANTIS";
         case CPS_DISCOVERY: return "DISCOVERY";
-        case CPS_LINK:      return "LINK";
+        case CPS_LINK:      return "ANCHOR";
         case CPS_DASHBOARD: return "RADAR";
         case CPS_CAL_WALK:  return "CAL WALK";
         case CPS_TACTICAL:  return "TACTICAL";

@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  PRE-FLIGHT — compile every firmware before CI installs anything
+#  PRE-FLIGHT — every firmware, every translation unit, plus the mesh
 # ═══════════════════════════════════════════════════════════════
 #
-#  WHY THIS EXISTS
+#  Runs in seconds with nothing but g++.  CI runs it before spending ten
+#  minutes installing toolchains; run it locally before every drop.
 #
-#  A CI build spends ten minutes installing toolchains before it
-#  compiles a single line, so a missing #include costs ten minutes to
-#  discover and another ten to confirm a fix.  Worse, the checks that
-#  ran BEFORE the toolchain were host-only, and host builds skip every
-#  #if defined(ARDUINO) block -- which is how a header with a missing
-#  include passed every check and failed on the device.
+#   1. SKETCHES compiled exactly as arduino-cli lays them out: flat
+#      directory, ARDUINO defined, vendor header SHAPES from tools/ardshim.
+#   2. EVERY RECEIVER .cpp, not just the .ino.  The previous pre-flight
+#      only syntax-checked the sketch file, so csi.cpp / scene.cpp /
+#      ui.cpp -- 90% of the anchor -- were never looked at.
+#   3. A HOST LINK of the whole receiver: undefined or duplicate symbols
+#      across translation units fail here instead of in the Xtensa link.
+#   4. The probe control opcodes, compiled against config.h.
+#   5. THE MESH SIMULATION, across 1..6 beacons and an id conflict: the
+#      shared headers running together, proving the radios AGREE, not
+#      merely that they compile.
 #
-#  This compiles each sketch EXACTLY as arduino-cli sees it:
-#
-#    - flat directory: every header copied beside the sketch, because
-#      that is what the Arduino build does and it is where a missing
-#      copy actually shows up
-#    - ARDUINO defined: so the code that ships is the code checked
-#    - real vendor header shapes from tools/ardshim
-#
-#  It is a syntax check, not a link, and it needs no toolchain at all.
-#  It runs in seconds and catches the entire class of failure that was
-#  costing full CI cycles.
+#  What this cannot prove: that the real vendor headers match the shims
+#  exactly, or anything about RF.  Those are CI's and the bench's jobs.
 # ═══════════════════════════════════════════════════════════════
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -32,56 +29,97 @@ CXX="${CXX:-g++}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 fail=0
+FLAGS="-std=gnu++17 -DARDUINO=200 -DESP32 -Wno-psabi"
 
-# name : sketch : extra source dirs (headers copied flat beside it)
+# ── 1. sketches ────────────────────────────────────────────────
+# name : sketch : extra header dir
 SKETCHES="
 receiver:CSI-Radar-S3.ino:.
 beacon:CSI-Beacon-Mantis/CSI-Beacon-Mantis.ino:
 cardputer:cardputer/Mantis-Cardputer-Adv.ino:cardputer
 core2:core2/Mantis-Core2.ino:core2
 "
-
 for entry in $SKETCHES; do
   name="${entry%%:*}"; rest="${entry#*:}"
   sketch="${rest%%:*}"; extra="${rest#*:}"
   d="$TMP/$name"; mkdir -p "$d"
-
-  cp "$ROOT"/mantis_*.h "$d"/ 2>/dev/null
+  cp "$ROOT"/mantis_*.h "$d"/
   if [ "$extra" = "." ]; then
-    cp "$ROOT"/*.h "$ROOT"/*.cpp "$d"/ 2>/dev/null
-    cp "$ROOT"/rust/rfcore/*.h "$d"/ 2>/dev/null
+    cp "$ROOT"/*.h "$ROOT"/*.cpp "$d"/
+    cp "$ROOT"/rust/rfcore/*.h "$d"/
   elif [ -n "$extra" ]; then
-    cp "$ROOT/$extra"/*.h "$d"/ 2>/dev/null
+    cp "$ROOT/$extra"/*.h "$d"/
   fi
-  cp "$ROOT/$sketch" "$d/src.cpp"
+  cp "$ROOT/$sketch" "$d/sketch_main.cpp"
+  sed -i '1i #include <Arduino.h>' "$d/sketch_main.cpp"
 
-  # The Arduino build auto-includes Arduino.h and defines the fonts the
-  # M5 libraries declare; supply both so the check sees the same world.
-  sed -i '1i #include <Arduino.h>' "$d/src.cpp"
-  if grep -q "M5Unified.h\|M5Cardputer.h" "$d/src.cpp"; then
-    sed -i 's/auto cfg = M5.config();/CfgT cfg = M5.config();/' "$d/src.cpp"
-  fi
-
-  # EVERY LOCAL INCLUDE MUST RESOLVE IN THE FLAT DIRECTORY.
-  # This is the check that would have caught a header living under
-  # cardputer/ while another sketch needed it.
   for inc in $(grep -ho '#include "[^"]*"' "$d"/*.cpp "$d"/*.h 2>/dev/null \
                | sed 's/.*"\(.*\)"/\1/' | sort -u); do
     if [ ! -f "$d/$inc" ]; then
-      echo "::error::$name: '$inc' is not in the sketch directory"
-      fail=1
+      echo "::error::$name: '$inc' is not in the sketch directory"; fail=1
     fi
   done
 
-  if out=$("$CXX" -fsyntax-only -std=c++17 -DARDUINO=200 \
-            -I "$SHIM" -I "$d" "$d/src.cpp" 2>&1); then
-    echo "  ok   $name"
+  if out=$("$CXX" -fsyntax-only $FLAGS -I "$SHIM" -I "$d" "$d/sketch_main.cpp" 2>&1); then
+    echo "  ok   $name sketch"
   else
-    echo "::error::$name fails to compile as Arduino builds it"
-    echo "$out" | grep -E "error" | head -12
-    fail=1
+    echo "::error::$name sketch fails to compile"; echo "$out" | grep -E "error" | head -15; fail=1
   fi
 done
 
-[ $fail -eq 0 ] && echo "pre-flight: all firmwares compile"
+# ── 2 + 3. every receiver translation unit, then a host link ────
+d="$TMP/receiver"
+objs=()
+for f in "$d"/*.cpp; do
+  o="${f%.cpp}.o"
+  if out=$("$CXX" -c $FLAGS -w -I "$SHIM" -I "$d" "$f" -o "$o" 2>&1); then
+    objs+=("$o")
+  else
+    echo "::error::receiver: $(basename "$f") fails to compile"; echo "$out" | grep -E "error" | head -15; fail=1
+  fi
+done
+n_tu=$(ls "$d"/*.cpp | wc -l)
+if [ "${#objs[@]}" -eq "$n_tu" ]; then echo "  ok   receiver: all $n_tu translation units"; fi
+cat > "$TMP/hostmain.cpp" <<'CPP'
+#include <LovyanGFX.hpp>
+namespace lgfx { namespace fonts { const IFont Font0, Font2, Font4, Font6, Font7, Font8,
+  FreeMono9pt7b, FreeMonoBold9pt7b, FreeSans9pt7b, FreeSansBold9pt7b, FreeSansBold12pt7b, TomThumb; } }
+int main() { return 0; }
+CPP
+"$CXX" -c $FLAGS -w -I "$SHIM" "$TMP/hostmain.cpp" -o "$TMP/hostmain.o"
+if out=$("$CXX" "${objs[@]}" "$TMP/hostmain.o" -o "$TMP/rxlink" 2>&1); then
+  echo "  ok   receiver links (no undefined or duplicate symbols)"
+else
+  echo "::error::receiver does not link"; echo "$out" | grep -E "undefined|multiple" | head -15; fail=1
+fi
+
+# ── 4. probe opcodes vs config.h ───────────────────────────────
+if "$CXX" -std=c++17 -fsyntax-only -I . -I tools/hostshim tools/opcode_check.cpp; then
+  echo "  ok   probe control contract matches config.h"
+else
+  echo "::error::probe control contract drifted from config.h"; fail=1
+fi
+
+# ── 5. the mesh, simulated ─────────────────────────────────────
+if "$CXX" -std=c++17 -O2 -w -o "$TMP/mesh_sim" tools/mesh_sim.cpp; then
+  for args in "6" "6 1" "5" "4" "3" "2" "1"; do
+    if out=$("$TMP/mesh_sim" $args 2>&1); then
+      echo "  ok   mesh sim [$args]: $(echo "$out" | grep -E 'survey vs|MESH SIM' | tr '\n' ' ')"
+    else
+      echo "::error::mesh simulation failed [$args]"; echo "$out" | grep -E "FAIL"; fail=1
+    fi
+  done
+else
+  echo "::error::mesh simulation does not compile"; fail=1
+fi
+
+# ── 6. the probe <-> anchor link, simulated ────────────────────
+if "$CXX" -std=c++17 -O2 -w -I tools/hostshim -o "$TMP/link_sim" tools/link_sim.cpp \
+   && out=$("$TMP/link_sim" 2>&1); then
+  echo "  ok   link sim: $(echo "$out" | head -1)"
+else
+  echo "::error::probe/anchor link simulation failed"; echo "${out:-}"; fail=1
+fi
+
+[ $fail -eq 0 ] && echo "pre-flight: all firmware compile, receiver links, mesh and link agree"
 exit $fail

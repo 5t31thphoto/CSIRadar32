@@ -55,6 +55,7 @@
 #include "mantis_fuse.h"
 #include "mantis_control.h"
 #include "mantis_probe_radio.h"
+#include "mantis_probe_app.h"  // shared: alarm policy, map, anchor remote
 
 // ── State ─────────────────────────────────────────────────────
 static M5Canvas       g_cv(&M5.Display);
@@ -72,7 +73,7 @@ static bool g_vibe[CPA_COUNT];
 static bool g_vibe_master = true;
 
 typedef enum : uint8_t {
-    S_SPLASH = 0, S_DISCOVERY, S_RADAR, S_MENU, S_ALARMS, S_MESH, S_CAL,
+    S_SPLASH = 0, S_DISCOVERY, S_RADAR, S_MENU, S_ALARMS, S_MESH, S_ANCHOR,
     S_COUNT
 } Screen;
 static Screen   g_screen = S_SPLASH;
@@ -97,19 +98,51 @@ static void go(Screen s) { if (s != g_screen) { g_screen = s; g_entered = millis
 #define C_MESH   0xFD60
 
 // ── Alerts ────────────────────────────────────────────────────
+// The motor has no auto-off.  Every path that starts it sets the stop
+// time -- the previous version started it and never stopped it, so one
+// alert buzzed until the next one.
+static uint32_t g_vibe_until = 0;
+static void vibe_start(uint32_t ms) {
+    M5.Power.setVibration(180);
+    g_vibe_until = millis() + ms;
+}
+static void vibe_tick() {
+    if (g_vibe_until && (int32_t)(millis() - g_vibe_until) >= 0) {
+        M5.Power.setVibration(0);
+        g_vibe_until = 0;
+    }
+}
+
+// Tone fallback, NON-BLOCKING.  The old loop called delay() between
+// repeats, freezing the radio pump for up to a second on every alarm --
+// exactly when reports matter most.
+static uint16_t g_tone_hz = 0, g_tone_ms = 0;
+static uint8_t  g_tone_left = 0;
+static uint32_t g_tone_next = 0;
+static void tone_tick() {
+    if (!g_tone_left || (int32_t)(millis() - g_tone_next) < 0) return;
+    M5.Speaker.tone(g_tone_hz, g_tone_ms);
+    g_tone_left--;
+    g_tone_next = millis() + g_tone_ms + 60;
+}
+
+static uint32_t g_alarm_flash_until = 0;
+static CardputerAlarm g_last_alarm = CPA_NONE;
+
 static void fire_alarm(CardputerAlarm k) {
+    if (k <= CPA_NONE || k >= CPA_COUNT) return;
     const uint32_t now = millis();
+    g_last_alarm = k;
+    g_alarm_flash_until = now + 1500;
+    const bool vib = g_vibe_master && g_vibe[k];
     if (cp_audio_should_fire(&g_audio, k, now) != CPF_FIRE) {
-        // Even when the SOUND is suppressed, haptics may still be
-        // wanted: muting a speaker in a quiet room should not also
-        // disable the alert.  Debounce is shared, the channels are not.
-        if (g_vibe_master && g_vibe[k] && !g_audio.muted) M5.Power.setVibration(180);
+        // Sound suppressed (muted, disabled, debounced): haptics are a
+        // separate channel and a muted speaker must not disable them.
+        if (vib && g_audio.muted) vibe_start(350);
         return;
     }
     cp_audio_mark_fired(&g_audio, k, now);
-
-    if (g_vibe_master && g_vibe[k]) M5.Power.setVibration(180);
-
+    if (vib) vibe_start(350);
     const CardputerAlarmDef &d = CP_ALARMS[k];
     if (g_audio.sd_present && g_audio.file_ok[k] && !cp_mp3_busy()) {
         char path[96];
@@ -117,21 +150,8 @@ static void fire_alarm(CardputerAlarm k) {
         if (cp_mp3_play(path, g_audio.volume)) return;
     }
     M5.Speaker.setVolume(g_audio.volume);
-    for (uint8_t i = 0; i < d.repeats; i++) {
-        M5.Speaker.tone(d.tone_hz, d.tone_ms);
-        delay(d.tone_ms + 60);
-    }
-}
-
-// The motor has no auto-off, so it has to be stopped explicitly or it
-// runs until the next call.  Easy to miss, and the symptom is a device
-// that buzzes forever after one alert.
-static uint32_t g_vibe_until = 0;
-static void vibe_tick() {
-    if (g_vibe_until && millis() > g_vibe_until) {
-        M5.Power.setVibration(0);
-        g_vibe_until = 0;
-    }
+    g_tone_hz = d.tone_hz; g_tone_ms = d.tone_ms;
+    g_tone_left = d.repeats; g_tone_next = now;
 }
 
 // ── Input ─────────────────────────────────────────────────────
@@ -204,68 +224,13 @@ static void flush() {
     if (g_canvas_ok) g_cv.pushSprite(0, 0);
 }
 
+static const MantisProbePalette PAL = {
+    C_BG, C_INK, C_MID, C_DIM, C_LIME, C_TEAL, C_VIOLET, C_ALERT, C_WARN, C_MESH };
+
 static void draw_map() {
-    const int cx = C2_MAP_CX, cy = C2_MAP_CY, r = C2_MAP_R;
-    g_cv.drawCircle(cx, cy, r, C_DIM);
-    const MantisMesh &m = g_rx.mesh;
-    if (m.extent <= 0) return;
-    const float sc = (float)r / m.extent;
-
-    // Mesh underglow first: backdrop, never over the tracks.
-    float hi = 0;
-    for (int i = 0; i < MANTIS_TOMO_CELLS; i++) if (m.field[i] > hi) hi = m.field[i];
-    if (hi > MANTIS_MESH_MIN_LLR * 0.5f) {
-        const float step = (2.0f * m.extent) / (float)MANTIS_TOMO_DIM;
-        for (int gy = 0; gy < MANTIS_TOMO_DIM; gy++)
-            for (int gx = 0; gx < MANTIS_TOMO_DIM; gx++) {
-                const float v = m.field[gy * MANTIS_TOMO_DIM + gx];
-                if (v <= 0) continue;
-                const float t = v / hi;
-                if (t < 0.40f) continue;
-                const int px = cx + (int)((-m.extent + (gx + 0.5f) * step) * sc);
-                const int py = cy - (int)(( m.extent - (gy + 0.5f) * step) * sc);
-                if ((px-cx)*(px-cx) + (py-cy)*(py-cy) > r*r) continue;
-                g_cv.fillCircle(px, py, t > 0.75f ? 4 : 3, C_MESH);
-            }
-    }
-
-    // Beacons.  A SURVEYED position is drawn solid; an assumed one
-    // hollow, because presenting a guess with the same weight as a
-    // measurement is the mistake this whole survey exists to correct.
-    for (uint8_t i = 1; i <= m.n_beacons && i < MANTIS_SLOTS; i++) {
-        if (!m.have_pos[i]) continue;
-        const int px = cx + (int)(m.bx[i] * sc), py = cy - (int)(m.by[i] * sc);
-        const bool sus = (g_rx.integrity.geometry_suspect && g_rx.integrity.worst_id == i);
-        if (m.pos_measured[i]) g_cv.fillCircle(px, py, 4, sus ? C_ALERT : C_LIME);
-        else                   g_cv.drawCircle(px, py, 4, sus ? C_ALERT : C_MID);
-        g_cv.setFont(&fonts::Font0);
-        g_cv.setTextColor(C_INK, C_BG);
-        g_cv.setCursor(px - 3, py - 13);
-        g_cv.printf("%d", i);
-    }
-
-    // Contacts, on top, from the FUSED view rather than raw shadowing --
-    // the fused one is what survived cross-checking.
-    for (int i = 0; i < MANTIS_FUSE_MAX; i++) {
-        const MantisFused &t = g_rx.fusion.t[i];
-        if (!t.active) continue;
-        const int px = cx + (int)(t.x * sc), py = cy - (int)(t.y * sc);
-        const bool believed = mantis_fuse_believed(&t);
-        const uint16_t col = !believed ? C_VIOLET
-                           : (t.cls == MFC_STATIC ? C_TEAL : C_LIME);
-        if (believed) g_cv.fillCircle(px, py, 6, col);
-        else          g_cv.drawCircle(px, py, 6, col);
-        // A ring marks a STATIC contact -- present but not moving is the
-        // case ordinary CSI radar cannot see, and it should be obvious.
-        if (t.cls == MFC_STATIC) g_cv.drawCircle(px, py, 10, col);
-    }
-
-    if (g_rx.probe.known) {
-        const int px = cx + (int)(g_rx.probe.x * sc);
-        const int py = cy - (int)(g_rx.probe.y * sc);
-        g_cv.drawLine(px-6, py, px+6, py, C_VIOLET);
-        g_cv.drawLine(px, py-6, px, py+6, C_VIOLET);
-    }
+    g_cv.setFont(&fonts::Font0);
+    mantis_probe_draw_map(g_cv, g_rx, g_link, millis(),
+                          C2_MAP_CX, C2_MAP_CY, C2_MAP_R, PAL);
 }
 
 static void draw_status() {
@@ -279,7 +244,7 @@ static void draw_status() {
         g_cv.setCursor(x, C2_CONTENT_Y + 4 + row * C2_ROW_H);
         g_cv.print(buf); row++;
     };
-    line(C_MID,  "bcn  %d", g_rx.mesh.n_beacons);
+    line(C_MID,  "bcn  %d", g_rx.deploy.beacons);
     line(C_MID,  "link %d", g_rx.mesh.n_chords);
 
     int believed = 0;
@@ -291,8 +256,16 @@ static void draw_status() {
         const MantisFused &t = g_rx.fusion.t[i];
         if (!t.active) continue;
         line(t.cls == MFC_STATIC ? C_TEAL : C_LIME, "%s %d/%d",
-             mantis_fuse_class_name(t.cls), t.witnesses, g_rx.mesh.n_beacons);
+             mantis_fuse_class_name(t.cls), t.witnesses, g_rx.deploy.beacons);
     }
+    // The anchor, always one line: what it is doing, and whether it sees
+    // anyone.  "no anchor" is information too.
+    const uint32_t now = millis();
+    if (mantis_probe_anchor_live(&g_link, now))
+        line((g_link.st.flags & MAS_ALERT) ? C_ALERT : C_TEAL, "A:%s",
+             mantis_anchor_state_name(g_link.st.app_state));
+    else
+        line(C_DIM, "A:%s", mantis_probe_link_state(&g_link, now));
 
     // Geometry provenance, always visible.  An operator should never
     // have to wonder whether the map is measured or assumed.
@@ -327,7 +300,7 @@ static void s_discovery() {
     g_cv.setFont(&fonts::Font2);
     g_cv.setTextColor(C_INK, C_BG);
     g_cv.setCursor(8, C2_CONTENT_Y + 8);
-    g_cv.printf("beacons heard: %d", g_rx.mesh.n_beacons);
+    g_cv.printf("beacons heard: %d", g_rx.deploy.beacons);
     g_cv.setCursor(8, C2_CONTENT_Y + 8 + C2_ROW_H);
     g_cv.printf("links: %d", g_rx.caps.chords);
 
@@ -339,9 +312,16 @@ static void s_discovery() {
         g_cv.setCursor(8, C2_CONTENT_Y + 8 + 4 * C2_ROW_H);
         g_cv.print(g_rx.caps.blocker);
     }
-    footer("", "", g_rx.mesh.n_beacons ? "GO" : "");
+    const bool anchor = mantis_probe_anchor_live(&g_link, millis());
+    g_cv.setTextColor(anchor ? C_TEAL : C_DIM, C_BG);
+    g_cv.setCursor(8, C2_CONTENT_Y + 8 + 6 * C2_ROW_H);
+    g_cv.print(anchor ? "anchor: linked" : "anchor: not heard");
+    const bool ready = g_rx.deploy.beacons || anchor;
+    footer("", "", ready ? "GO" : "");
     flush();
-    if (c2_was_short(&g_in, BTN_RIGHT) && g_rx.mesh.n_beacons) go(S_RADAR);
+    // Automatically onward once there is anything to show: the operator
+    // should not have to press GO to be told someone is in the room.
+    if ((c2_was_short(&g_in, BTN_RIGHT) || age() > 6000) && ready) go(S_RADAR);
 }
 
 static void s_radar() {
@@ -350,18 +330,27 @@ static void s_radar() {
     g_cv.drawLine(C2_SPLIT_X, C2_CONTENT_Y, C2_SPLIT_X,
                   C2_SCREEN_H - C2_FOOTER_H, C_DIM);
     draw_status();
-    footer("MENU", g_audio.muted ? "UNMUTE" : "MUTE", "");
+    if ((int32_t)(millis() - g_alarm_flash_until) < 0) {
+        g_cv.drawRect(0, C2_CONTENT_Y, C2_SCREEN_W, C2_CONTENT_H, C_ALERT);
+        g_cv.drawRect(1, C2_CONTENT_Y + 1, C2_SCREEN_W - 2, C2_CONTENT_H - 2, C_ALERT);
+        g_cv.setTextColor(C_ALERT, C_BG);
+        g_cv.setCursor(6, C2_CONTENT_Y + 4);
+        g_cv.print(CP_ALARMS[g_last_alarm].label);
+    }
+    const bool anchor = g_link.anchor_seen;
+    footer("MENU", g_audio.muted ? "UNMUTE" : "MUTE", anchor ? "ANCHOR" : "");
     flush();
     if (c2_was_short(&g_in, BTN_LEFT)) go(S_MENU);
+    if (c2_was_short(&g_in, BTN_RIGHT) && anchor) go(S_ANCHOR);
     if (g_in.select) g_audio.muted = !g_audio.muted;
 }
 
-static const char *MENU[] = { "Alarms", "Mesh health", "Calibrate", "Radar" };
+static const char *MENU[] = { "Alarms", "Mesh health", "Anchor remote", "Radar" };
 static const int   MENU_N = 4;
 
 static void s_menu() {
     chrome("MENU");
-    const bool avail[MENU_N] = { true, g_rx.caps.localize, g_rx.caps.tactical, true };
+    const bool avail[MENU_N] = { true, true, g_link.anchor_seen, true };
     // Touch selects a row directly; the zones still step through it, so
     // nothing here needs the screen.
     if (g_in.touched_row >= 0 && g_in.touched_row < MENU_N) g_sel = g_in.touched_row;
@@ -380,8 +369,7 @@ static void s_menu() {
         if (!avail[i] && i == g_sel) {
             g_cv.setTextColor(C_WARN, C_DIM);
             g_cv.setCursor(C2_SPLIT_X + 6, y);
-            g_cv.print(mantis_caps_why(&g_rx.deploy, &g_rx.caps,
-                       i == 2 ? "tactical" : "localize"));
+            g_cv.print(i == 2 ? "no anchor heard" : "");
         }
     }
     footer("BACK", "NEXT", "SELECT");
@@ -391,7 +379,7 @@ static void s_menu() {
         switch (g_sel) {
             case 0: go(S_ALARMS); break;
             case 1: go(S_MESH);   break;
-            case 2: go(S_CAL);    break;
+            case 2: go(S_ANCHOR); break;
             default: go(S_RADAR); break;
         }
     }
@@ -450,6 +438,7 @@ static void s_mesh() {
     chrome("MESH");
     g_cv.setFont(&fonts::Font2);
     for (uint8_t i = 1; i <= g_rx.mesh.n_beacons && i < 7; i++) {
+        if (!g_rx.mesh.live[i]) continue;
         const bool sus = (g_rx.integrity.geometry_suspect && g_rx.integrity.worst_id == i);
         g_cv.setTextColor(sus ? C_ALERT : (g_rx.mesh.pos_measured[i] ? C_LIME : C_MID), C_BG);
         g_cv.setCursor(10, C2_CONTENT_Y + 4 + (i - 1) * C2_ROW_H);
@@ -466,55 +455,73 @@ static void s_mesh() {
     if (c2_was_short(&g_in, BTN_LEFT)) go(S_MENU);
 }
 
-static void s_cal() {
-    chrome("CAL WALK");
-    // Mirror the step to the anchor so it renders what the operator is
-    // actually doing.  A hint, so it is re-sent rather than retried.
-    static uint32_t s_hint_ms = 0;
-    if (millis() - s_hint_ms > 500) {
-        s_hint_ms = millis();
-        mantis_probe_send(&g_link, MPC_CAL_STEP_HINT, (uint8_t)g_sel, 0, 0,
-                          millis(), true);
-    }
-    const int cx = C2_MAP_CX, cy = C2_MAP_CY, r = C2_MAP_R;
-    g_cv.drawCircle(cx, cy, r, C_DIM);
-    const float h = g_imu.heading_rad;
-    g_cv.drawLine(cx, cy, cx + (int)(sinf(h) * r * 0.85f),
-                          cy - (int)(cosf(h) * r * 0.85f), C_ALERT);
-    g_cv.setFont(&fonts::Font2);
-    const int x = C2_SPLIT_X + 6;
-    g_cv.setTextColor(C_INK, C_BG);
-    g_cv.setCursor(x, C2_CONTENT_Y + 8);
-    g_cv.printf("turn %5.0f", cp_turn_degrees(&g_turn));
-    g_cv.setCursor(x, C2_CONTENT_Y + 8 + C2_ROW_H);
-    g_cv.printf("step %5lu", (unsigned long)g_imu.steps);
-    g_cv.setCursor(x, C2_CONTENT_Y + 8 + 2 * C2_ROW_H);
-    g_cv.printf("dist %5.1fm", cp_turn_distance_m(&g_turn, &g_imu));
-    g_cv.setTextColor(g_imu.bias_ready ? C_MID : C_WARN, C_BG);
-    g_cv.setCursor(x, C2_CONTENT_Y + 8 + 4 * C2_ROW_H);
-    g_cv.print(g_imu.bias_ready ? "imu ready" : "imu warming");
-    // Link state, always visible.  A silent failure here wastes the
-    // whole walk and the operator finds out when the model comes out
-    // wrong -- which is far too late to do anything about.
-    g_cv.setTextColor(mantis_probe_anchor_live(&g_link, millis()) ? C_MID : C_WARN, C_BG);
-    g_cv.setCursor(x, C2_CONTENT_Y + 8 + 5 * C2_ROW_H);
-    g_cv.print(mantis_probe_link_state(&g_link, millis()));
+// ── THE ANCHOR, IN YOUR HAND ──────────────────────────────────
+// A mirror of the anchor's own screen and a remote for its two buttons.
+// Nothing here is inferred: the state, the instruction and the button
+// labels are what the anchor broadcast about the frame it just DREW, and
+// a press is shown as landed only when the anchor reports having applied
+// it.  The probe cannot drift from the anchor because it keeps no copy of
+// the anchor's state machine to drift.
+static void s_anchor() {
+    const uint32_t now = millis();
+    const bool live = mantis_probe_anchor_live(&g_link, now);
+    const MantisAnchorStatus &st = g_link.st;
+    chrome("ANCHOR");
+    g_cv.setFont(&fonts::Font4);
+    g_cv.setTextColor(!live ? C_WARN : ((st.flags & MAS_ALERT) ? C_ALERT : C_LIME), C_BG);
+    g_cv.setCursor(8, C2_CONTENT_Y + 6);
+    g_cv.print(live ? mantis_anchor_state_name(st.app_state) : "NO ANCHOR");
 
-    footer("BACK", "", "MARK");
+    g_cv.setFont(&fonts::Font2);
+    g_cv.setTextColor(g_link.key_tries ? C_WARN : C_MID, C_BG);
+    const char *ls = mantis_probe_link_state(&g_link, now);
+    g_cv.setCursor(C2_SCREEN_W - 8 - g_cv.textWidth(ls), C2_CONTENT_Y + 10);
+    g_cv.print(ls);
+
+    int y = C2_CONTENT_Y + 38;
+    if (live) {
+        if (st.title[0]) {
+            g_cv.setTextColor(C_MID, C_BG);
+            g_cv.setCursor(8, y); g_cv.printf("screen: %s", st.title); y += C2_ROW_H;
+        }
+        char lines[5][48];
+        const int n = mantis_wrap(st.hint, 36, lines, 5);
+        g_cv.setTextColor(C_INK, C_BG);
+        for (int i = 0; i < n; i++) { g_cv.setCursor(8, y); g_cv.print(lines[i]); y += C2_ROW_H; }
+        if (st.steps) {
+            g_cv.setTextColor(C_TEAL, C_BG);
+            g_cv.setCursor(8, y); g_cv.printf("step %u of %u", st.step, st.steps); y += C2_ROW_H;
+        }
+        if (st.progress) {
+            g_cv.drawRect(8, y + 2, C2_SCREEN_W - 16, 10, C_DIM);
+            g_cv.fillRect(9, y + 3, (C2_SCREEN_W - 18) * st.progress / 100, 8, C_LIME);
+            y += C2_ROW_H;
+        }
+        g_cv.setTextColor(C_MID, C_BG);
+        g_cv.setCursor(8, C2_SCREEN_H - C2_FOOTER_H - C2_ROW_H);
+        g_cv.printf("bcn %u  mesh %u  tracks %u  mesh contacts %u",
+                    st.beacons, st.mesh_beacons, st.n_tracks, st.mesh_contacts);
+    } else {
+        g_cv.setTextColor(C_MID, C_BG);
+        g_cv.setCursor(8, y);
+        g_cv.print(g_link.anchor_seen ? "Anchor went quiet - is it on?" : "Power the T-Display anchor on.");
+        g_cv.setCursor(8, y + C2_ROW_H);
+        g_cv.print("Hold a zone: long press.");
+    }
+
+    // Footer: the ANCHOR's labels on A and C, ours on B.
+    char la[16] = "", lc[16] = "";
+    if (live && st.left[0])  snprintf(la, sizeof(la), "<%s", st.left);
+    if (live && st.right[0]) snprintf(lc, sizeof(lc), "%s>", st.right);
+    footer(la, "BACK", lc);
     flush();
-    if (c2_was_short(&g_in, BTN_LEFT)) {
-        // Leaving the walk closes the anchor's capture window.  Without
-        // this it keeps recording an empty room into the training set.
-        mantis_probe_send(&g_link, MPC_CAL_END, 0, 0, 0, millis(), true);
-        go(S_MENU);
-    }
-    if (c2_was_short(&g_in, BTN_RIGHT)) {
-        cp_turn_begin(&g_turn, &g_imu);
-        // The operator is holding this device, so THIS device advances
-        // the script.  Walking back to the anchor to press a button
-        // would put body motion into the walk that is not part of it.
-        mantis_probe_send(&g_link, MPC_CAL_BEGIN, 0, 0, 0, millis(), true);
-    }
+
+    if (g_in.select) { go(S_RADAR); return; }
+    if (!live) return;
+    if (c2_was_short(&g_in, BTN_LEFT))  mantis_probe_press(&g_link, MRK_LEFT, now);
+    if (c2_was_short(&g_in, BTN_RIGHT)) mantis_probe_press(&g_link, MRK_RIGHT, now);
+    if (c2_was_long(&g_in, BTN_LEFT))   mantis_probe_press(&g_link, MRK_LEFT_LONG, now);
+    if (c2_was_long(&g_in, BTN_RIGHT))  mantis_probe_press(&g_link, MRK_RIGHT_LONG, now);
 }
 
 // ── Arduino ───────────────────────────────────────────────────
@@ -586,17 +593,24 @@ void loop() {
     poll_input();
     poll_imu();
     vibe_tick();
+    tone_tick();
 
     // Drain the radio EVERY loop, not on the solve interval: reports
     // arrive at up to 180 Hz across six beacons and the queue is eight
     // deep, so anything slower loses them.
     mantis_probe_pump(&g_rx, millis());
-    mantis_probe_retry_tick(&g_link, millis());
+    mantis_probe_service(&g_link, MANTIS_PROBE_KIND_CORE2, millis());
 
     static uint32_t last = 0;
+    static MantisAlarmWatch watch = {};
     if (millis() - last >= 100) {
         last = millis();
         mantis_rx_solve(&g_rx, millis(), 0.1f);
+        // The anchor counts as a display in the capability picture.
+        g_rx.deploy.tdisplays = mantis_probe_anchor_live(&g_link, millis()) ? 1 : 0;
+        g_rx.caps = mantis_caps(&g_rx.deploy);
+        const CardputerAlarm k = mantis_alarm_eval(&watch, &g_rx, &g_link, millis());
+        if (k != CPA_NONE) fire_alarm(k);
     }
 
     switch (g_screen) {
@@ -606,7 +620,7 @@ void loop() {
         case S_MENU:      s_menu();      break;
         case S_ALARMS:    s_alarms();    break;
         case S_MESH:      s_mesh();      break;
-        case S_CAL:       s_cal();       break;
+        case S_ANCHOR:    s_anchor();    break;
         default:
             // Never sit on an unhandled screen: a frozen display with
             // live controls is indistinguishable from a crash.

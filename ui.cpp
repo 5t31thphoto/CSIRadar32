@@ -9,6 +9,7 @@
 #include "scene.h"
 #include <math.h>
 #include "peer.h"
+#include "mesh_anchor.h"
 // ── Display globals ─────────────────────────────────────────────
 static LGFX_TDisplayS3 g_lcd;
 static LGFX_Sprite     g_canvas(&g_lcd);
@@ -50,13 +51,27 @@ static void flush() {
     if (g_canvas_ok) g_canvas.pushSprite(0, 0);
 }
 
+static char s_chrome_title[16] = "";
+static char s_chrome_left[12]  = "";
+static char s_chrome_right[12] = "";
+void ui_last_chrome(const char **t, const char **l, const char **r) {
+    if (t) *t = s_chrome_title;
+    if (l) *l = s_chrome_left;
+    if (r) *r = s_chrome_right;
+}
+
 static void clear() {
+    // A new frame: forget the old one's labels, so a screen without a
+    // footer is not described with the previous screen's buttons.
+    s_chrome_title[0] = s_chrome_left[0] = s_chrome_right[0] = 0;
     if (g_canvas_ok) g_canvas.fillSprite(COL_BG);
     else             g_lcd.fillScreen(COL_BG);
 }
 
 static void draw_header(const char *title) {
     auto &g = gfx();
+    strncpy(s_chrome_title, title ? title : "", sizeof(s_chrome_title) - 1);
+    s_chrome_title[sizeof(s_chrome_title) - 1] = 0;
     g.fillRect(0, 0, SCREEN_W, HEADER_H, COL_MS_CHROME);
     // Two-pixel MantisSec accent line: violet on top of thin teal
     g.drawFastHLine(0, HEADER_H,     SCREEN_W, COL_MS_CHROME_LINE);
@@ -87,6 +102,9 @@ static void draw_header(const char *title) {
 
 static void draw_footer(const char *left_label, const char *right_label) {
     auto &g = gfx();
+    strncpy(s_chrome_left,  left_label  ? left_label  : "", sizeof(s_chrome_left)  - 1);
+    strncpy(s_chrome_right, right_label ? right_label : "", sizeof(s_chrome_right) - 1);
+    s_chrome_left[sizeof(s_chrome_left) - 1] = s_chrome_right[sizeof(s_chrome_right) - 1] = 0;
     int y0 = SCREEN_H - FOOTER_H;
     g.fillRect(0, y0, SCREEN_W, FOOTER_H, COL_MS_CHROME);
     g.drawFastHLine(0, y0,     SCREEN_W, COL_MS_TEAL);
@@ -1493,7 +1511,11 @@ extern void render_field_view();
 void ui_dashboard() {
     clear();
     // Header shows current view name
-    const char *hdrs[] = {"RADAR", "FIELD", "AOA", "TRIPWIRE", "LINKS", "CSI", "PEER"};
+    // One title per DashView, in enum order.  This array had seven
+    // entries for eight views, so DV_TACTICAL read past its end.
+    static const char *const hdrs[] = {"RADAR", "FIELD", "AOA", "TRIPWIRE",
+                                       "LINKS", "CSI", "PEER", "RF CHART", "MESH"};
+    static_assert(sizeof(hdrs) / sizeof(hdrs[0]) == DV_COUNT, "one title per DashView");
     const char *h = (g_app.dash_view < DV_COUNT) ? hdrs[g_app.dash_view] : "?";
     draw_header(h);
 
@@ -1512,6 +1534,7 @@ void ui_dashboard() {
         case DV_LINKS:    draw_view_links();    break;
         case DV_CSI:      draw_view_csi();      break;
         case DV_PEER:     draw_view_peer();     break;
+        case DV_MESH:     mesh_anchor_draw_view(); break;
         default: break;
     }
 
@@ -1523,6 +1546,7 @@ void ui_dashboard() {
     if (g_app.dash_view == DV_PEER) rlabel = "-";
     if (g_app.dash_view == DV_FIELD) rlabel = "-";
     if (g_app.dash_view == DV_TACTICAL) rlabel = "-";
+    if (g_app.dash_view == DV_MESH) rlabel = "-";
     draw_footer("view", rlabel);
     flush();
 }

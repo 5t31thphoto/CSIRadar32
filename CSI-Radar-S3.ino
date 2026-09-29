@@ -39,6 +39,7 @@
 #include "rfcore.h"      // -I rust/rfcore supplied by the build flags
 #include "rfarchive.h"   // PSRAM cold tier for the response archive
 #include "tactical.h"    // MANTIS tactical deployment ceremony
+#include "mesh_anchor.h" // the beacon mesh, fused into this radar
 
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
@@ -475,6 +476,7 @@ static void state_splash() {
         // model still works from its in-DRAM coreset, it just re-fits
         // from fewer samples.
         rf_archive_begin();
+        mesh_anchor_begin();     // before the radio: packets start at once
         csi_engine_begin();
         peer_begin();
         // v0.9: bring up the wired peer link.  Harmless with no cable
@@ -1205,6 +1207,9 @@ static void state_dashboard() {
         // view at all, and on a Full Mode session there is nothing in it.
         if (g_app.dash_view == DV_TACTICAL && !tactical_ready())
             g_app.dash_view = (DashView)((g_app.dash_view + 1) % DV_COUNT);
+        // Same for the mesh view: only when there is a mesh to show.
+        if (g_app.dash_view == DV_MESH && !mesh_anchor_present())
+            g_app.dash_view = (DashView)((g_app.dash_view + 1) % DV_COUNT);
     }
     if (wasShortPressed(BTN_RIGHT)) {
         switch (g_app.dash_view) {
@@ -1589,6 +1594,9 @@ void loop() {
     if (g_app.state != ST_SPLASH) {
         peer_tick();
         peer_wire_poll();   // v0.9: drain the wired link, if present
+        // v1.1: the beacon mesh -- parse, solve (10 Hz, self-limited),
+        // align to this radar, and serve any hand-held probe.
+        mesh_anchor_tick();
         // v0.9: keep beacons on the commanded rate. A beacon that reboots
         // or powers up late would otherwise stay at the 100 Hz
         // compatibility default indefinitely.

@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════════════════════
 #include "peer.h"
 #include "stereo.h"
+#include "mesh_anchor.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
@@ -299,6 +300,7 @@ void peer_send_hello() {
     p.uptime_ms = millis();
     memcpy(p.fw_version, FW_VERSION, sizeof(p.fw_version));
     p.role_wanted = (uint8_t)g_app.peer.role;
+    p.app_state   = (uint8_t)g_app.state;
     add_broadcast_peer_once();
     esp_now_send(BROADCAST_MAC, (const uint8_t*)&p, sizeof(p));
 }
@@ -552,6 +554,18 @@ bool peer_try_consume(const uint8_t *src_mac, const uint8_t *data, int len) {
             if (len >= (int)sizeof(PeerCommand)) {
                 PeerCommand c;
                 memcpy(&c, data, sizeof(c));
+                // HAND-HELD PROBE ops are handled apart from the T-Display
+                // peer protocol: they must not refresh the stereo peer's
+                // liveness, or a Core2 in the room would keep a vanished
+                // T-Display "present" forever.
+                if (c.op == PEER_OP_REMOTE_KEY) {
+                    mesh_anchor_remote_key(c.arg_u8, c.arg_u16);
+                    return true;
+                }
+                if (c.op == PEER_OP_PROBE_HELLO) {
+                    mesh_anchor_note_probe(c.arg_u8);
+                    return true;
+                }
                 peer_handle_command(c);
             }
             return true;

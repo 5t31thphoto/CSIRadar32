@@ -65,6 +65,7 @@
 #include "mantis_fuse.h"
 #include "mantis_control.h"
 #include "mantis_probe_radio.h"
+#include "mantis_probe_app.h"  // shared: alarm policy, map, anchor remote
 
 // ── State ─────────────────────────────────────────────────────
 static M5Canvas          g_cv(&M5Cardputer.Display);
@@ -133,31 +134,37 @@ static void poll_keys() {
 // Play an alarm: the WAV from SD when it is there, a tone when it is
 // not.  The caller never has to know which happened, because the ONE
 // guarantee this function makes is that it makes a noise.
+static uint16_t g_tone_hz = 0, g_tone_ms = 0;
+static uint8_t  g_tone_left = 0;
+static uint32_t g_tone_next = 0;
+static uint32_t g_alarm_flash_until = 0;
+static CardputerAlarm g_last_alarm = CPA_NONE;
+
+// Tone repeats run from loop(), never delay(): a blocking beep froze the
+// radio pump for up to a second, exactly when the reports mattered.
+static void tone_tick() {
+    if (!g_tone_left || (int32_t)(millis() - g_tone_next) < 0) return;
+    M5Cardputer.Speaker.tone(g_tone_hz, g_tone_ms, CP_MP3_CHANNEL + 1);
+    g_tone_left--;
+    g_tone_next = millis() + g_tone_ms + 60;
+}
+
 static void play_alarm(CardputerAlarm k) {
+    if (k <= CPA_NONE || k >= CPA_COUNT) return;
     const uint32_t now = millis();
+    g_last_alarm = k;
+    g_alarm_flash_until = now + 1500;      // visual alarm fires even muted
     if (cp_audio_should_fire(&g_audio, k, now) != CPF_FIRE) return;
     cp_audio_mark_fired(&g_audio, k, now);
-
     const CardputerAlarmDef &d = CP_ALARMS[k];
-
-    // MP3 from SD first.  cp_mp3_play() QUEUES and returns immediately --
-    // the decoder task does the work, so this function never blocks the
-    // sensing loop no matter how long the clip is.
     if (g_audio.sd_present && g_audio.file_ok[k] && !cp_mp3_busy()) {
         char path[96];
         snprintf(path, sizeof(path), "%s/%s", CP_ALARM_DIR, d.file);
         if (cp_mp3_play(path, g_audio.volume)) return;
     }
-
-    // Tone fallback.  Reached when there is no card, no file, the decoder
-    // never started, or a clip is already sounding.  Short and blocking
-    // is acceptable here precisely because it IS short -- a few hundred
-    // milliseconds against a 100 ms solve interval.
     M5Cardputer.Speaker.setVolume(g_audio.volume);
-    for (uint8_t i = 0; i < d.repeats; i++) {
-        M5Cardputer.Speaker.tone(d.tone_hz, d.tone_ms, CP_MP3_CHANNEL + 1);
-        delay(d.tone_ms + 60);
-    }
+    g_tone_hz = d.tone_hz; g_tone_ms = d.tone_ms;
+    g_tone_left = d.repeats; g_tone_next = now;
 }
 
 // ── IMU ───────────────────────────────────────────────────────
@@ -174,27 +181,94 @@ static void poll_imu() {
 // Decided from what is actually heard, never from a setting.  A mode
 // that claims a stereo pair that is not there would silently produce
 // AoA from one radio.
-static uint8_t g_tdisplay_seen = 0;
-static uint32_t g_last_tdisplay_ms = 0;
-
 static void update_mode() {
     const uint32_t now = millis();
-    const bool anchor_live = (now - g_last_tdisplay_ms) < 2000;
-    const uint8_t nb = g_mesh.n_beacons;
-
+    const bool anchor_live = mantis_probe_anchor_live(&g_link, now);
     CardputerMode m;
-    if (anchor_live && g_tdisplay_seen >= 2)      m = CPM_PROBE_STEREO;
-    else if (anchor_live)                          m = CPM_PROBE_SOLO;
-    else if (nb >= 3)                              m = CPM_STANDALONE;
-    else                                           m = CPM_SEARCHING;
+    if (anchor_live && (g_link.st.flags & MAS_STEREO)) m = CPM_PROBE_STEREO;
+    else if (anchor_live)                              m = CPM_PROBE_SOLO;
+    else if (g_rx.deploy.beacons >= 1)                 m = CPM_STANDALONE;
+    else                                               m = CPM_SEARCHING;
+    g_mode = m;
+    // What the probe can do follows from what it actually hears.
+    g_rx.deploy.tdisplays = anchor_live ? ((g_link.st.flags & MAS_STEREO) ? 2 : 1) : 0;
+    g_rx.deploy.docked    = anchor_live && (g_link.st.flags & MAS_STEREO);
+    g_rx.caps = mantis_caps(&g_rx.deploy);
+}
 
-    if (m != g_mode) {
-        g_mode = m;
-        // A mode change alters what the device can do, so it is worth an
-        // alarm: an operator whose anchor just died should not find out
-        // by noticing the screen looks different.
-        if (m == CPM_STANDALONE || m == CPM_SEARCHING) play_alarm(CPA_MESH_FAULT);
+// ── Session recording ─────────────────────────────────────────
+// The recorder the Sessions screen always promised.  One header, then
+// one fixed-size frame per 100 ms: for each reporting beacon, the MEAN
+// of its reported links (amp, phase, quality, RSSI) and its noise floor,
+// plus where the probe thinks it is and the IMU heading and steps.  The
+// geometry at capture time is in the header, so a replay knows which
+// room it was.
+static File     g_sess_file;
+static uint32_t g_sess_seq = 0, g_sess_flush_ms = 0, g_sess_last_ms = 0;
+
+static void session_start() {
+    if (!g_sess.card_present || g_sess.recording) return;
+    for (int n = 1; n < 10000; n++) {
+        snprintf(g_sess.path, sizeof(g_sess.path), "%s/s%04d.bin", CP_DIR_SESSIONS, n);
+        if (!SD.exists(g_sess.path)) break;
     }
+    g_sess_file = SD.open(g_sess.path, FILE_WRITE);
+    if (!g_sess_file) { g_sess.card_full = true; return; }
+    CardputerSessionHeader h = {};
+    h.magic = CP_SESSION_MAGIC; h.version = CP_SESSION_VERSION;
+    h.n_beacons = g_rx.deploy.beacons; h.start_ms = millis();
+    h.frame_bytes = sizeof(CardputerSessionFrame);
+    h.mode = (uint8_t)g_mode; h.flags = CP_SF_HAS_IMU;
+    if (mantis_mesh_geometry_confidence(&g_mesh) > 0.99f) h.flags |= CP_SF_GEOMETRY_MEASURED;
+    for (int i = 0; i < 8 && i + 1 < MANTIS_SLOTS; i++) { h.beacon_x[i] = g_mesh.bx[i + 1]; h.beacon_y[i] = g_mesh.by[i + 1]; }
+    snprintf(h.note, sizeof(h.note), "%s", cp_mode_name(g_mode));
+    g_sess_file.write((const uint8_t *)&h, sizeof(h));
+    g_sess.recording = true; g_sess.frames_written = 0; g_sess.bytes_written = sizeof(h);
+    g_sess.dropped = 0; g_sess_seq = 0;
+}
+
+static void session_stop(bool truncated) {
+    if (!g_sess.recording) return;
+    g_sess.recording = false;
+    if (!g_sess_file) return;
+    // Patch the frame count in place: 0 in a file means "never closed".
+    g_sess_file.seek(offsetof(CardputerSessionHeader, frame_count));
+    const uint32_t n = g_sess.frames_written;
+    g_sess_file.write((const uint8_t *)&n, sizeof(n));
+    if (truncated) {
+        g_sess_file.seek(offsetof(CardputerSessionHeader, flags));
+        uint8_t f = CP_SF_HAS_IMU | CP_SF_TRUNCATED;
+        g_sess_file.write(&f, 1);
+    }
+    g_sess_file.close();
+}
+
+static void session_tick(uint32_t now) {
+    if (!g_sess.recording || now - g_sess_last_ms < 100) return;
+    g_sess_last_ms = now;
+    CardputerSessionFrame f = {};
+    f.seq = g_sess_seq++; f.t_ms = now;
+    for (uint8_t id = 1; id <= 8 && id < MANTIS_SLOTS; id++) {
+        if (!mantis_store_fresh(&g_rx.store, id, now)) continue;
+        const MantisPerspective &v = g_rx.store.by_id[id].view;
+        if (!v.n_links) continue;
+        int32_t a = 0, ph = 0, q = 0, r = 0, rn = 0;
+        for (uint8_t k = 0; k < v.n_links; k++) {
+            a += v.links[k].amp_q8; ph += v.links[k].phase_q12; q += v.links[k].quality;
+            if (v.link_rssi[k]) { r += v.link_rssi[k]; rn++; }
+        }
+        const int i = id - 1;
+        f.amp_q8[i] = (int16_t)(a / v.n_links); f.phase_q12[i] = (int16_t)(ph / v.n_links);
+        f.quality[i] = (uint8_t)(q / v.n_links); f.rssi[i] = rn ? (int8_t)(r / rn) : 0;
+        f.noise[i] = v.noise_floor; f.fresh_mask |= (uint8_t)(1u << i);
+    }
+    if (g_probe.known) { f.probe_x_q10 = (int16_t)(g_probe.x * 1024); f.probe_y_q10 = (int16_t)(g_probe.y * 1024); }
+    f.imu_heading_q12 = (int16_t)(g_imu.heading_rad * 4096.0f / 8.0f);
+    f.steps = (uint16_t)g_imu.steps;
+    const size_t w = g_sess_file.write((const uint8_t *)&f, sizeof(f));
+    if (w != sizeof(f)) { g_sess.card_full = true; session_stop(true); return; }
+    g_sess.frames_written++; g_sess.bytes_written += w;
+    if (now - g_sess_flush_ms > 2000) { g_sess_flush_ms = now; g_sess_file.flush(); }
 }
 
 // ── Drawing ───────────────────────────────────────────────────
@@ -239,68 +313,13 @@ static void flush() {
     if (g_canvas_ok) g_cv.pushSprite(0, 0);
 }
 
-// The map half: beacons, mesh glow, targets.
+static const MantisProbePalette PAL = {
+    CPC_BG, CPC_INK, CPC_MID, CPC_DIM, CPC_LIME, CPC_TEAL, CPC_VIOLET, CPC_ALERT, CPC_WARN, CPC_MESH };
+
+// The map half: the SAME renderer the Core2 uses.
 static void draw_map() {
-    const int cx = CP_MAP_CX, cy = CP_MAP_CY, r = CP_MAP_R;
-    g_cv.drawCircle(cx, cy, r, CPC_DIM);
-
-    // Mesh underglow first -- backdrop, never over the tracks.
-    float hi = 0;
-    for (int i = 0; i < MANTIS_TOMO_CELLS; i++)
-        if (g_mesh.field[i] > hi) hi = g_mesh.field[i];
-    if (hi > MANTIS_MESH_MIN_LLR * 0.5f) {
-        const float step = (2.0f * g_mesh.extent) / (float)MANTIS_TOMO_DIM;
-        const float sc   = (float)r / g_mesh.extent;
-        for (int gy = 0; gy < MANTIS_TOMO_DIM; gy++)
-            for (int gx = 0; gx < MANTIS_TOMO_DIM; gx++) {
-                const float v = g_mesh.field[gy * MANTIS_TOMO_DIM + gx];
-                if (v <= 0) continue;
-                const float t = v / hi;
-                if (t < 0.45f) continue;
-                const float ux = -g_mesh.extent + (gx + 0.5f) * step;
-                const float uy =  g_mesh.extent - (gy + 0.5f) * step;
-                const int px = cx + (int)(ux * sc), py = cy - (int)(uy * sc);
-                if ((px-cx)*(px-cx) + (py-cy)*(py-cy) > r*r) continue;
-                g_cv.fillCircle(px, py, t > 0.8f ? 3 : 2, CPC_MESH);
-            }
-    }
-
-    // Beacons, at MEASURED positions when the survey has run.
-    for (uint8_t i = 1; i <= g_mesh.n_beacons && i < MANTIS_SLOTS; i++) {
-        if (!g_mesh.have_pos[i]) continue;
-        const float sc = (float)r / g_mesh.extent;
-        const int px = cx + (int)(g_mesh.bx[i] * sc);
-        const int py = cy - (int)(g_mesh.by[i] * sc);
-        const bool suspect = (g_integ.geometry_suspect && g_integ.worst_id == i);
-        g_cv.fillCircle(px, py, 3, suspect ? CPC_ALERT : CPC_LIME);
-        g_cv.setFont(&fonts::Font0);
-        g_cv.setTextColor(CPC_INK, CPC_BG);
-        g_cv.setCursor(px - 2, py - 10);
-        g_cv.printf("%d", i);
-    }
-
-    // Targets on top.
-    for (int i = 0; i < g_targets.n; i++) {
-        const MantisTarget &t = g_targets.t[i];
-        if (!t.active) continue;
-        const float sc = (float)r / g_mesh.extent;
-        const int px = cx + (int)(t.x * sc), py = cy - (int)(t.y * sc);
-        const uint16_t c = (t.kind == MT_STATIC) ? CPC_TEAL : CPC_LIME;
-        g_cv.fillCircle(px, py, 4, c);
-        // A STATIC target gets a ring, because "present but not moving"
-        // is the case ordinary CSI radar cannot see and the operator
-        // should be able to tell at a glance that this is that case.
-        if (t.kind == MT_STATIC) g_cv.drawCircle(px, py, 7, c);
-    }
-
-    // The operator, from the probe's own known position.
-    if (g_probe.known) {
-        const float sc = (float)r / g_mesh.extent;
-        const int px = cx + (int)(g_probe.x * sc);
-        const int py = cy - (int)(g_probe.y * sc);
-        g_cv.drawLine(px - 4, py, px + 4, py, CPC_VIOLET);
-        g_cv.drawLine(px, py - 4, px, py + 4, CPC_VIOLET);
-    }
+    g_cv.setFont(&fonts::Font0);
+    mantis_probe_draw_map(g_cv, g_rx, g_link, millis(), CP_MAP_CX, CP_MAP_CY, CP_MAP_R, PAL);
 }
 
 static void draw_status_col() {
@@ -309,17 +328,29 @@ static void draw_status_col() {
     int row = 0;
 
     g_cv.setTextColor(CPC_MID, CPC_BG);
-    g_cv.setCursor(x, cp_row_y(row++)); g_cv.printf("bcn  %d", g_mesh.n_beacons);
+    g_cv.setCursor(x, cp_row_y(row++)); g_cv.printf("bcn  %d", g_rx.deploy.beacons);
     g_cv.setCursor(x, cp_row_y(row++)); g_cv.printf("lnk  %d", g_mesh.n_chords);
 
-    g_cv.setTextColor(g_targets.n ? CPC_LIME : CPC_MID, CPC_BG);
-    g_cv.setCursor(x, cp_row_y(row++)); g_cv.printf("tgt  %d", g_targets.n);
-
-    for (int i = 0; i < g_targets.n && row < cp_rows() - 3; i++) {
-        const MantisTarget &t = g_targets.t[i];
-        g_cv.setTextColor(t.kind == MT_STATIC ? CPC_TEAL : CPC_LIME, CPC_BG);
+    // FUSED contacts -- what survived cross-checking -- not raw shadowing.
+    int believed = 0;
+    for (int i = 0; i < MANTIS_FUSE_MAX; i++) if (mantis_fuse_believed(&g_rx.fusion.t[i])) believed++;
+    g_cv.setTextColor(believed ? CPC_LIME : CPC_MID, CPC_BG);
+    g_cv.setCursor(x, cp_row_y(row++)); g_cv.printf("cont %d", believed);
+    for (int i = 0; i < MANTIS_FUSE_MAX && row < cp_rows() - 3; i++) {
+        const MantisFused &t = g_rx.fusion.t[i];
+        if (!mantis_fuse_believed(&t)) continue;
+        g_cv.setTextColor(t.cls == MFC_STATIC ? CPC_TEAL : CPC_LIME, CPC_BG);
         g_cv.setCursor(x, cp_row_y(row++));
-        g_cv.printf("%s", t.kind == MT_STATIC ? "STATIC" : "MOVING");
+        g_cv.printf("%s %u", mantis_fuse_class_name(t.cls), t.witnesses);
+    }
+    const uint32_t now = millis();
+    g_cv.setCursor(x, cp_row_y(row++));
+    if (mantis_probe_anchor_live(&g_link, now)) {
+        g_cv.setTextColor((g_link.st.flags & MAS_ALERT) ? CPC_ALERT : CPC_TEAL, CPC_BG);
+        g_cv.printf("A %s", mantis_anchor_state_name(g_link.st.app_state));
+    } else {
+        g_cv.setTextColor(CPC_DIM, CPC_BG);
+        g_cv.printf("A %s", mantis_probe_link_state(&g_link, now));
     }
 
     // Anything wrong gets the bottom rows, always.
@@ -356,9 +387,9 @@ static void screen_discovery() {
     g_cv.setFont(&fonts::Font0);
     g_cv.setTextColor(CPC_INK, CPC_BG);
     g_cv.setCursor(6, cp_row_y(0));
-    g_cv.printf("beacons heard: %d", g_mesh.n_beacons);
+    g_cv.printf("beacons heard: %d", g_rx.deploy.beacons);
     g_cv.setCursor(6, cp_row_y(1));
-    g_cv.printf("anchor: %s", (millis() - g_last_tdisplay_ms) < 2000 ? "yes" : "none");
+    g_cv.printf("anchor: %s", mantis_probe_anchor_live(&g_link, millis()) ? "linked" : "none");
 
     // What this deployment can do, and the single most useful thing to
     // add next.  Both from the shared capability layer, so the menu can
@@ -376,9 +407,10 @@ static void screen_discovery() {
         g_cv.print(caps.blocker);
     }
 
-    draw_footer("", g_mesh.n_beacons ? "go" : "");
+    const bool ready = g_rx.deploy.beacons || mantis_probe_anchor_live(&g_link, millis());
+    draw_footer("", ready ? "go" : "");
     flush();
-    if (cp_was_short(&g_in, BTN_RIGHT) && g_mesh.n_beacons) go(CPS_DASHBOARD);
+    if ((cp_was_short(&g_in, BTN_RIGHT) || screen_age() > 6000) && ready) go(CPS_DASHBOARD);
 }
 
 static void screen_dashboard() {
@@ -387,12 +419,19 @@ static void screen_dashboard() {
     g_cv.drawLine(CP_SPLIT_X, CP_CONTENT_Y, CP_SPLIT_X,
                   CP_SCREEN_H - CP_FOOTER_H, CPC_DIM);
     draw_status_col();
-    draw_footer("menu", "views");
+    if ((int32_t)(millis() - g_alarm_flash_until) < 0) {
+        g_cv.drawRect(0, CP_CONTENT_Y, CP_SCREEN_W, CP_CONTENT_H, CPC_ALERT);
+        g_cv.setTextColor(CPC_ALERT, CPC_BG);
+        g_cv.setCursor(4, CP_CONTENT_Y + 2);
+        g_cv.print(CP_ALARMS[g_last_alarm].label);
+    }
+    if (g_sess.recording) { g_cv.fillCircle(CP_SCREEN_W - 6, CP_CONTENT_Y + 5, 3, CPC_ALERT); }
+    draw_footer("menu", g_link.anchor_seen ? "anchor" : "");
     flush();
 
     if (cp_was_short(&g_in, BTN_LEFT))  go(CPS_SETTINGS);
-    if (g_in.tab) g_dash_view = (uint8_t)((g_dash_view + 1) % 3);
-    if (g_in.esc) go(CPS_DASHBOARD);
+    if (cp_was_short(&g_in, BTN_RIGHT) && g_link.anchor_seen) go(CPS_LINK);
+    if (g_in.tab && g_link.anchor_seen) go(CPS_LINK);
 }
 
 static void screen_alarms() {
@@ -435,21 +474,27 @@ static void screen_sessions() {
         g_cv.setCursor(6, cp_row_y(3));
         g_cv.printf("dropped %lu (card slow)", (unsigned long)g_sess.dropped);
     }
+    if (g_sess.recording) {
+        g_cv.setTextColor(CPC_MID, CPC_BG);
+        g_cv.setCursor(6, cp_row_y(4)); g_cv.printf("%s", g_sess.path);
+    }
     draw_footer("back", g_sess.recording ? "stop" : "record");
     flush();
     if (cp_was_short(&g_in, BTN_LEFT))  go(CPS_SETTINGS);
-    if (cp_was_short(&g_in, BTN_RIGHT)) g_sess.recording = !g_sess.recording;
+    if (cp_was_short(&g_in, BTN_RIGHT)) { if (g_sess.recording) session_stop(false); else session_start(); }
 }
 
 static void screen_mesh() {
     draw_chrome("MESH");
     g_cv.setFont(&fonts::Font0);
+    int row = 0;
     for (uint8_t i = 1; i <= g_mesh.n_beacons && i < 7; i++) {
+        if (!g_mesh.live[i]) continue;
         const bool sus = (g_integ.geometry_suspect && g_integ.worst_id == i);
-        g_cv.setTextColor(sus ? CPC_ALERT : (g_mesh.have_pos[i] ? CPC_LIME : CPC_MID), CPC_BG);
-        g_cv.setCursor(6, cp_row_y(i - 1));
+        g_cv.setTextColor(sus ? CPC_ALERT : (g_mesh.pos_measured[i] ? CPC_LIME : CPC_MID), CPC_BG);
+        g_cv.setCursor(6, cp_row_y(row++));
         g_cv.printf("B%d %s (%+.2f,%+.2f)%s", i,
-                    g_mesh.have_pos[i] ? "surveyed" : "assumed ",
+                    g_mesh.pos_measured[i] ? "surveyed" : "assumed ",
                     g_mesh.bx[i], g_mesh.by[i], sus ? " MOVED" : "");
     }
     draw_footer("back", "");
@@ -461,13 +506,11 @@ static void screen_settings() {
     draw_chrome("SETTINGS");
     g_cv.setFont(&fonts::Font0);
     static int sel = 0;
-    const MantisDeployment &dep = g_rx.deploy;
-    const MantisCaps &caps = g_rx.caps;
-    const char *items[] = { "Alarms", "Sessions", "Mesh health", "Radar", "Calibrate" };
+    const char *items[] = { "Alarms", "Sessions", "Mesh health", "Radar", "Anchor remote" };
     // Calibrate needs a fixed anchor, which a hand-held device is not.
     // Shown either way, with the reason -- a greyed row that explains
     // itself is help; one that does not is a support question.
-    const bool avail[] = { true, true, caps.localize, true, caps.tactical };
+    const bool avail[] = { true, g_sess.card_present, true, true, g_link.anchor_seen };
     const int n = 5;
     if (g_in.down) sel = (sel + 1) % n;
     if (g_in.up)   sel = (sel + n - 1) % n;
@@ -479,8 +522,7 @@ static void screen_settings() {
         if (!ok && i == sel) {
             g_cv.setTextColor(CPC_WARN, CPC_BG);
             g_cv.setCursor(cp_status_x(), cp_row_y(i));
-            g_cv.print(mantis_caps_why(&dep, &caps,
-                       i == 4 ? "tactical" : "localize"));
+            g_cv.print(i == 4 ? "no anchor heard" : (i == 1 ? "no SD card" : ""));
         }
     }
     draw_footer("radar", "select");
@@ -492,58 +534,67 @@ static void screen_settings() {
             case 1: go(CPS_SESSIONS);  break;
             case 2: go(CPS_MESH);      break;
             case 3: go(CPS_DASHBOARD); break;
-            case 4: go(CPS_CAL_WALK);  break;
+            case 4: go(CPS_LINK);      break;
         }
     }
 }
 
-// The cal walk, with the IMU compass -- the screen that most justifies
-// this hardware.  The red needle is MEASURED here, not estimated.
-static void screen_cal_walk() {
-    draw_chrome("CAL WALK");
-    // Mirror the step to the anchor so it renders what the operator is
-    // actually doing rather than sitting on the first one.  A hint, so
-    // it is re-sent periodically rather than retried.
-    static uint32_t s_hint_ms = 0;
-    if (millis() - s_hint_ms > 500) {
-        s_hint_ms = millis();
-        mantis_probe_send(&g_link, MPC_CAL_STEP_HINT, 0, 0, 0, millis(), true);
-    }
-    const int cx = CP_MAP_CX, cy = CP_MAP_CY, r = CP_MAP_R;
-    g_cv.drawCircle(cx, cy, r, CPC_DIM);
-
-    const float imu = g_imu.heading_rad;
-    const int ix = cx + (int)(sinf(imu) * r * 0.85f);
-    const int iy = cy - (int)(cosf(imu) * r * 0.85f);
-    g_cv.drawLine(cx, cy, ix, iy, CPC_ALERT);
-
+// ── THE ANCHOR, IN YOUR HAND ──────────────────────────────────
+// Mirrors the anchor's screen and drives its two buttons:
+//   ,  or  del    = anchor LEFT        hold = long press
+//   /  or  enter  = anchor RIGHT       hold = long press
+//   esc / tab     = back to the radar
+// Everything shown came from the anchor, about the frame it last drew.
+static void screen_link() {
+    const uint32_t now = millis();
+    const bool live = mantis_probe_anchor_live(&g_link, now);
+    const MantisAnchorStatus &st = g_link.st;
+    draw_chrome("ANCHOR");
+    g_cv.setFont(&fonts::Font2);
+    g_cv.setTextColor(!live ? CPC_WARN : ((st.flags & MAS_ALERT) ? CPC_ALERT : CPC_LIME), CPC_BG);
+    g_cv.setCursor(4, CP_CONTENT_Y + 1);
+    g_cv.print(live ? mantis_anchor_state_name(st.app_state) : "NO ANCHOR");
     g_cv.setFont(&fonts::Font0);
-    const int x = cp_status_x();
-    g_cv.setTextColor(CPC_INK, CPC_BG);
-    g_cv.setCursor(x, cp_row_y(0)); g_cv.printf("turn %5.0f", cp_turn_degrees(&g_turn));
-    g_cv.setCursor(x, cp_row_y(1)); g_cv.printf("step %5lu", (unsigned long)g_imu.steps);
-    g_cv.setCursor(x, cp_row_y(2)); g_cv.printf("dist %5.1fm",
-                   cp_turn_distance_m(&g_turn, &g_imu));
-    g_cv.setTextColor(g_imu.bias_ready ? CPC_MID : CPC_WARN, CPC_BG);
-    g_cv.setCursor(x, cp_row_y(4));
-    g_cv.print(g_imu.bias_ready ? "imu ready" : "imu warming");
+    const char *ls = mantis_probe_link_state(&g_link, now);
+    g_cv.setTextColor(g_link.key_tries ? CPC_WARN : CPC_MID, CPC_BG);
+    g_cv.setCursor(CP_SCREEN_W - 4 - 6 * (int)strlen(ls), CP_CONTENT_Y + 4);
+    g_cv.print(ls);
 
-    g_cv.setTextColor(mantis_probe_anchor_live(&g_link, millis()) ? CPC_MID : CPC_WARN, CPC_BG);
-    g_cv.setCursor(x, cp_row_y(5));
-    g_cv.print(mantis_probe_link_state(&g_link, millis()));
-
-    draw_footer("back", "mark");
+    int y = CP_CONTENT_Y + 20;
+    if (live) {
+        char lines[4][48];
+        const int n = mantis_wrap(st.hint, 38, lines, 4);
+        g_cv.setTextColor(CPC_INK, CPC_BG);
+        for (int i = 0; i < n; i++) { g_cv.setCursor(4, y); g_cv.print(lines[i]); y += 10; }
+        if (st.steps) {
+            g_cv.setTextColor(CPC_TEAL, CPC_BG);
+            g_cv.setCursor(4, y); g_cv.printf("step %u / %u", st.step, st.steps); y += 10;
+        }
+        if (st.progress) {
+            g_cv.drawRect(4, y + 1, CP_SCREEN_W - 8, 7, CPC_DIM);
+            g_cv.fillRect(5, y + 2, (CP_SCREEN_W - 10) * st.progress / 100, 5, CPC_LIME);
+            y += 10;
+        }
+        g_cv.setTextColor(CPC_MID, CPC_BG);
+        g_cv.setCursor(4, CP_SCREEN_H - CP_FOOTER_H - 10);
+        g_cv.printf("bcn %u mesh %u trk %u %s", st.beacons, st.mesh_beacons, st.n_tracks,
+                    st.title);
+    } else {
+        g_cv.setTextColor(CPC_MID, CPC_BG);
+        g_cv.setCursor(4, y);
+        g_cv.print(g_link.anchor_seen ? "Anchor went quiet." : "Power on the T-Display anchor.");
+    }
+    char l[16] = "", r[16] = "";
+    if (live) { snprintf(l, sizeof(l), "%s", st.left); snprintf(r, sizeof(r), "%s", st.right); }
+    draw_footer(l, r);
     flush();
-    if (cp_was_short(&g_in, BTN_LEFT)) {
-        // Closes the anchor's capture window; otherwise it keeps
-        // recording an empty room into the training set.
-        mantis_probe_send(&g_link, MPC_CAL_END, 0, 0, 0, millis(), true);
-        go(CPS_SETTINGS);
-    }
-    if (cp_was_short(&g_in, BTN_RIGHT)) {
-        cp_turn_begin(&g_turn, &g_imu);
-        mantis_probe_send(&g_link, MPC_CAL_BEGIN, 0, 0, 0, millis(), true);
-    }
+
+    if (g_in.esc || g_in.tab) { go(CPS_DASHBOARD); return; }
+    if (!live) return;
+    if (cp_was_short(&g_in, BTN_LEFT))  mantis_probe_press(&g_link, MRK_LEFT, now);
+    if (cp_was_short(&g_in, BTN_RIGHT)) mantis_probe_press(&g_link, MRK_RIGHT, now);
+    if (cp_was_long(&g_in, BTN_LEFT))   mantis_probe_press(&g_link, MRK_LEFT_LONG, now);
+    if (cp_was_long(&g_in, BTN_RIGHT))  mantis_probe_press(&g_link, MRK_RIGHT_LONG, now);
 }
 
 // ── Arduino ───────────────────────────────────────────────────
@@ -623,11 +674,17 @@ void loop() {
     // Drain the radio EVERY loop, not on the solve interval: reports
     // arrive faster than the solve runs and the queue is eight deep.
     mantis_probe_pump(&g_rx, millis());
-    mantis_probe_retry_tick(&g_link, millis());
+    mantis_probe_service(&g_link, MANTIS_PROBE_KIND_CARDPUTER, millis());
+    tone_tick();
 
     // One call. It rate-limits itself, latches the baseline on coverage,
     // applies dense link quality, runs both channels and fuses them.
-    mantis_rx_solve(&g_rx, millis(), 0.1f);
+    static MantisAlarmWatch watch = {};
+    if (mantis_rx_solve(&g_rx, millis(), 0.1f)) {
+        const CardputerAlarm k = mantis_alarm_eval(&watch, &g_rx, &g_link, millis());
+        if (k != CPA_NONE) play_alarm(k);
+    }
+    session_tick(millis());
 
     switch (g_screen) {
         case CPS_SPLASH:    screen_splash();    break;
@@ -636,7 +693,7 @@ void loop() {
         case CPS_ALARMS:    screen_alarms();    break;
         case CPS_SESSIONS:  screen_sessions();  break;
         case CPS_MESH:      screen_mesh();      break;
-        case CPS_CAL_WALK:  screen_cal_walk();  break;
+        case CPS_LINK:      screen_link();      break;
         case CPS_SETTINGS:  screen_settings();  break;
         default:
             // Never sit on an unhandled screen: a frozen display with

@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════════════════════
 #include "render.h"
 #include "scene.h"
+#include "mesh_anchor.h"
 #include "lgfx_tdisplay_s3.h"
 #include <math.h>
 
@@ -128,8 +129,14 @@ void render_radar_view() {
     g.print(mode_lbl);
 
     int n_tracks = scene_active_track_count();
-    char tbuf[16];
-    snprintf(tbuf, sizeof(tbuf), "%d tgt", n_tracks);
+    const int n_mesh = mesh_anchor_believed();
+    char tbuf[24];
+    if (mesh_anchor_present())
+        snprintf(tbuf, sizeof(tbuf), "%d tgt  M%u:%d", n_tracks,
+                 (unsigned)mesh_anchor_live(), n_mesh);
+    else
+        snprintf(tbuf, sizeof(tbuf), "%d tgt", n_tracks);
+    if (n_mesh > 0 && n_tracks == 0) n_tracks = n_mesh;   // colour the band
     g.setTextColor(n_tracks > 0 ? COL_MS_LIME : COL_MS_DIM, COL_MS_BG);
     int tw = g.textWidth(tbuf);
     g.setCursor((SCREEN_W - tw) / 2, status_y);
@@ -194,6 +201,13 @@ void render_radar_view() {
             }
         }
     }
+
+    // ── Mesh layer ──
+    // The beacon mesh's own tomography and contacts, mapped onto this
+    // radar through the surveyed beacon positions.  Drawn UNDER the
+    // anchor's beacons and tracks: it is corroborating evidence, and on
+    // an uncalibrated anchor it is the only evidence there is.
+    mesh_anchor_draw_overlay(cx, cy, pix_per_unit, map_y + 1, map_y + map_h - 2);
 
     // ── Beacons ──
     // Convert normalized geometry to screen coords.  Use scene's derived
@@ -351,6 +365,15 @@ void render_radar_view() {
         // visually communicate uncertainty.
         uint16_t ellipse_col = t->ambiguity_flag ? COL_MS_WARN : COL_MS_DIM;
         draw_covariance_ellipse(tx, ty, pix_per_unit, cxx, cyy, cxy, ellipse_col);
+
+        // CORROBORATED: the beacon mesh independently sees a body here.
+        // Two instruments with different physics agreeing is the
+        // strongest statement this system can make, so it gets the
+        // brightest mark on the screen.
+        if (mesh_anchor_corroborates(t->pos[0], t->pos[1])) {
+            g.drawCircle(tx, ty, 10, COL_MS_LIME);
+            g.drawCircle(tx, ty, 11, COL_MS_LIME);
+        }
 
         // Target rings
         g.drawCircle(tx, ty, 6, tc);

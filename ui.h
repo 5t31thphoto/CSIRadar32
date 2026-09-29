@@ -9,6 +9,12 @@
 #include "scene.h"    // CalReport (ui_cal_stash_report / ui_cal_results)
 #include "csi.h"      // csi_baseline_progress() used in ui_cal_empty_room
 
+// The title and button labels of the frame last drawn.  The anchor
+// broadcasts these to hand-held probes so their screen names exactly what
+// the anchor's two buttons do right now -- taken from what was DRAWN, so
+// the probe can never describe a different screen than the one showing.
+void ui_last_chrome(const char **title, const char **left, const char **right);
+
 void ui_begin();
 
 // One-shot screens (called once when the state entered, use ui_should_redraw()

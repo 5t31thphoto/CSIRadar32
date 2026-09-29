@@ -9,6 +9,7 @@
 namespace fonts { struct F{int _;}; extern F Font0,Font2,Font4; }
 struct M5Canvas { M5Canvas(void*){}
   bool createSprite(int,int){return true;} void pushSprite(int,int){}
+  int32_t textWidth(const char*){return 0;} int32_t fontHeight(){return 8;}
   void fillSprite(uint16_t){} void fillRect(int,int,int,int,uint16_t){}
   void drawRect(int,int,int,int,uint16_t){} void drawCircle(int,int,int,uint16_t){}
   void fillCircle(int,int,int,uint16_t){} void drawLine(int,int,int,int,uint16_t){}

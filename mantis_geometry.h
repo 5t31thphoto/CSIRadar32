@@ -74,6 +74,10 @@ typedef struct __attribute__((packed)) {
 #define MANTIS_GN_LOWBATT  0x02
 #define MANTIS_GN_ISOLATED 0x04   // hears fewer than two peers
 #define MANTIS_GN_MOVED    0x08   // its ranges changed after the survey
+// Set on every node the survey actually SOLVED.  A node without it is a
+// placeholder for an id that is not live, and a receiver must not adopt
+// its coordinates as a measurement.
+#define MANTIS_GN_VALID    0x10
 
 typedef struct __attribute__((packed)) {
     uint32_t counter;          // FIRST, so legacy receivers still work
@@ -133,9 +137,9 @@ static inline float mantis_rssi_to_m(int8_t rssi) {
 // `dist` is n x n in metres; a non-positive entry means "not measured".
 // `out_x/out_y` receive the solution; the return value is residual
 // stress, normalised, where 0 is a perfect fit.
-static inline float mantis_geom_solve(const float *dist, uint8_t n,
-                                      float *out_x, float *out_y,
-                                      int iters) {
+static inline float mantis_geom_solve_seeded(const float *dist, uint8_t n,
+                                             float *out_x, float *out_y,
+                                             int iters, const uint8_t *order) {
     if (n < 3) return 1.0f;
 
     // Seed on a circle.  Any non-degenerate start converges; a circle
@@ -146,7 +150,7 @@ static inline float mantis_geom_solve(const float *dist, uint8_t n,
             if (i != j && dist[i * n + j] > 0) { mean_d += dist[i * n + j]; md_n++; }
     const float R = (md_n > 0) ? (mean_d / (float)md_n) * 0.6f : 1.0f;
     for (uint8_t i = 0; i < n; i++) {
-        const float a = 2.0f * (float)M_PI * (float)i / (float)n;
+        const float a = 2.0f * (float)M_PI * (float)order[i] / (float)n;
         out_x[i] = R * cosf(a);
         out_y[i] = R * sinf(a);
     }
@@ -185,6 +189,44 @@ static inline float mantis_geom_solve(const float *dist, uint8_t n,
             den += d * d;
         }
     return (den > 0) ? sqrtf(num / den) : 1.0f;
+}
+
+// MULTI-START.  Stress majorisation is a local method, and a ring seeded
+// in ID ORDER only finds the right layout when the beacons were placed
+// around the room in id order.  Nothing enforces that -- ids are claimed
+// by boot order -- and a quadrilateral seeded 1,2,3,4 that is really
+// 1,3,2,4 folds into a bow-tie with low-but-wrong stress and stays there.
+//
+// So try every cyclic seed order (n <= 6: at most 60 distinct rings once
+// rotation and reflection are factored out), take the lowest stress, and
+// polish it.  Worst case ~40 ms on an S3, once every five seconds, on the
+// one beacon that keeps time.
+static inline bool mantis_geom_next_perm(uint8_t *a, uint8_t n) {
+    int i = n - 2;
+    while (i >= 1 && a[i] >= a[i + 1]) i--;
+    if (i < 1) return false;                 // index 0 stays fixed
+    int j = n - 1;
+    while (a[j] <= a[i]) j--;
+    uint8_t t = a[i]; a[i] = a[j]; a[j] = t;
+    for (int l = i + 1, r = n - 1; l < r; l++, r--) { t = a[l]; a[l] = a[r]; a[r] = t; }
+    return true;
+}
+
+static inline float mantis_geom_solve(const float *dist, uint8_t n,
+                                      float *out_x, float *out_y,
+                                      int iters) {
+    if (n < 3) return 1.0f;
+    uint8_t order[8], best_order[8];
+    for (uint8_t i = 0; i < n; i++) { order[i] = i; best_order[i] = i; }
+    float best = 1e9f;
+    float tx[8], ty[8];
+    do {
+        // A ring and its mirror image are the same seed; skip one of each.
+        if (n >= 3 && order[1] > order[n - 1]) continue;
+        const float st = mantis_geom_solve_seeded(dist, n, tx, ty, 40, order);
+        if (st < best) { best = st; for (uint8_t i = 0; i < n; i++) best_order[i] = order[i]; }
+    } while (mantis_geom_next_perm(order, n));
+    return mantis_geom_solve_seeded(dist, n, out_x, out_y, iters, best_order);
 }
 
 // Put a solution into the canonical frame.

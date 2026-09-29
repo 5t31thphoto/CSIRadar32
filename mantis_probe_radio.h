@@ -82,17 +82,37 @@ typedef struct {
 static MantisProbeCsi s_csi[MANTIS_SLOTS];
 
 static uint8_t mantis_probe_id_from_mac(const uint8_t *mac) {
-    // Beacons use the fixed 0x1A prefix with the id in the last byte.
-    if (mac[0] != 0x1A) return 0;
-    const uint8_t id = mac[5];
-    return (id >= 1 && id < MANTIS_SLOTS) ? id : 0;
+    return mantis_beacon_id_from_mac(mac);      // 1A:00:uid:uid:00:id
 }
+
+// The anchor's latest status.  Same seqlock discipline as the beacon
+// queue: the Wi-Fi task copies and leaves.
+typedef struct {
+    volatile uint32_t seq;
+    uint8_t  data[sizeof(MantisAnchorStatus)];
+    bool     pending;
+} MantisAnchorSlot;
+static MantisAnchorSlot s_anchor_rx;
 
 static void mantis_probe_now_cb(const esp_now_recv_info_t *info,
                                 const uint8_t *data, int len) {
     if (!info || len <= 0 || len > (int)sizeof(s_q[0].data)) return;
     const uint8_t from = mantis_probe_id_from_mac(info->src_addr);
-    if (from == 0) return;
+    if (from == 0) {
+        // Not a beacon.  The ANCHOR's status broadcast is the one other
+        // thing a probe needs to hear -- the old radio dropped every
+        // non-beacon frame, so no probe ever heard its anchor at all.
+        if (len == (int)sizeof(MantisAnchorStatus)) {
+            uint32_t magic; memcpy(&magic, data, 4);
+            if (magic == MANTIS_ANCHOR_STATUS_MAGIC) {
+                s_anchor_rx.seq++;
+                memcpy((void *)s_anchor_rx.data, data, sizeof(MantisAnchorStatus));
+                s_anchor_rx.pending = true;
+                s_anchor_rx.seq++;
+            }
+        }
+        return;
+    }
 
     const uint8_t h = s_q_head;
     MantisRawPkt &p = s_q[h];
@@ -167,29 +187,47 @@ static inline int mantis_probe_pump(MantisReceiver *rx, uint32_t now_ms) {
     return n;
 }
 
-// Send a command to the anchor.
-//
-// Broadcast, not addressed: a docked pair shares state over its wired
-// link, so whichever unit hears it propagates to the other.  From
-// outside the bar they are one instrument and the probe should not be
-// tracking which half it reached.
-static inline bool mantis_probe_send(MantisProbeLink *L, MantisProbeOp op,
-                                     uint8_t a8, uint16_t a16, uint32_t a32,
-                                     uint32_t now_ms, bool first) {
+static inline bool mantis_probe_tx_cmd(MantisProbeOp op, uint8_t a8,
+                                       uint16_t a16, uint32_t a32) {
     MantisPeerCmd c{};
     const uint16_t n = mantis_probe_cmd(&c, op, a8, a16, a32);
-    const bool ok = (esp_now_send(MANTIS_BCAST, (const uint8_t *)&c, n) == ESP_OK);
-    if (ok) mantis_probe_note_sent(L, op, now_ms, first);
-    return ok;
+    return esp_now_send(MANTIS_BCAST, (const uint8_t *)&c, n) == ESP_OK;
 }
 
-// Repeat a critical command that has not been confirmed.
-static inline void mantis_probe_retry_tick(MantisProbeLink *L, uint32_t now_ms) {
-    if (!mantis_probe_should_retry(L, now_ms)) return;
-    MantisPeerCmd c{};
-    const uint16_t n = mantis_probe_cmd(&c, (MantisProbeOp)L->last_op, 0, 0, 0);
-    if (esp_now_send(MANTIS_BCAST, (const uint8_t *)&c, n) == ESP_OK)
-        mantis_probe_note_sent(L, (MantisProbeOp)L->last_op, now_ms, false);
+// Press one of the anchor's buttons.  Broadcast: a docked pair shares
+// state over its wire, so whichever unit hears it is the instrument.
+static inline void mantis_probe_press(MantisProbeLink *L, MantisRemoteKey k,
+                                      uint32_t now_ms) {
+    const uint16_t seq = mantis_probe_key_begin(L, k, now_ms);
+    mantis_probe_tx_cmd(MPC_REMOTE_KEY, (uint8_t)k, seq, 0);
+}
+
+// Everything the link needs, every loop: take in the anchor's status,
+// repeat an unconfirmed key press, announce ourselves.
+static inline void mantis_probe_service(MantisProbeLink *L, uint8_t kind,
+                                        uint32_t now_ms) {
+    if (s_anchor_rx.pending) {
+        const uint32_t s0 = s_anchor_rx.seq;
+        if (!(s0 & 1u)) {
+            MantisAnchorStatus st;
+            memcpy(&st, (const void *)s_anchor_rx.data, sizeof(st));
+            if (s_anchor_rx.seq == s0) {
+                s_anchor_rx.pending = false;
+                mantis_probe_on_status(L, &st, now_ms);
+            }
+        }
+    }
+    if (mantis_probe_key_due(L, now_ms)) {
+        L->key_tries++;
+        L->key_sent_ms = now_ms;
+        // SAME sequence number: the anchor applies each seq once, so a
+        // retry of a press that did land is harmless.
+        mantis_probe_tx_cmd(MPC_REMOTE_KEY, L->key_code, L->key_seq, 0);
+    }
+    if (now_ms - L->last_hello_ms >= MANTIS_PROBE_HELLO_MS) {
+        L->last_hello_ms = now_ms;
+        mantis_probe_tx_cmd(MPC_PROBE_HELLO, kind, 0, 0);
+    }
 }
 
 // Is this device hearing its own CSI from a given beacon?
@@ -200,11 +238,9 @@ static inline bool mantis_probe_csi_fresh(uint8_t beacon_id) {
 #else   // host build: radio is hardware-bound
 static inline void mantis_probe_radio_begin() {}
 static inline int  mantis_probe_pump(MantisReceiver *, uint32_t) { return 0; }
-static inline bool mantis_probe_send(MantisProbeLink *L, MantisProbeOp op,
-                                     uint8_t, uint16_t, uint32_t,
-                                     uint32_t now_ms, bool first) {
-    mantis_probe_note_sent(L, op, now_ms, first); return true;
+static inline void mantis_probe_press(MantisProbeLink *L, MantisRemoteKey k, uint32_t now_ms) {
+    mantis_probe_key_begin(L, k, now_ms);
 }
-static inline void mantis_probe_retry_tick(MantisProbeLink *, uint32_t) {}
+static inline void mantis_probe_service(MantisProbeLink *, uint8_t, uint32_t) {}
 static inline bool mantis_probe_csi_fresh(uint8_t) { return false; }
 #endif
