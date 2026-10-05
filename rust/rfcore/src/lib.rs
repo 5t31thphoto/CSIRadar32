@@ -130,7 +130,18 @@ impl Engine {
                 observation_count:0,last_check_x:0.0,last_check_y:0.0,check_valid:false,
                 feat_w:[1.0;FEATS],sensitivity:1.0 }
     }
-    fn reset(&mut self) { *self=Self::new(); }
+    // IN PLACE.  The engine is ~25 KB and reset() runs on the Arduino loop
+    // task (tactical_begin), whose stack is 8 KB.  `*self = Self::new()`
+    // is free to build the whole value as a stack temporary and then move
+    // it -- a crash the first time anyone starts a tactical deployment.
+    // All-zero is a valid bit pattern for every field (f32, u8, bool,
+    // usize, Edge), so zero the memory and set the three non-zero defaults.
+    fn reset(&mut self) {
+        unsafe { core::ptr::write_bytes(self as *mut Engine, 0u8, 1); }
+        let mut i=0; while i<MAX_NODES { self.nodes[i].weight=1.0; i+=1; }
+        let mut k=0; while k<FEATS { self.feat_w[k]=1.0; k+=1; }
+        self.sensitivity=1.0;
+    }
 
     fn feat_distance(a:&[f32;FEATS],b:&[f32;FEATS],nb:usize)->f32 {
         let mut sum=0.0f32; let mut w=0.0f32; let mut k=0;

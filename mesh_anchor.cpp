@@ -34,7 +34,9 @@ struct MaPkt {
     uint8_t  from;
     volatile bool pending;
 };
-static MaPkt s_q[MA_QUEUE];
+// Heap-allocated with the receiver (PSRAM): internal DRAM is held back for
+// the 108 KB display sprite, and CI gates on exactly that headroom.
+static MaPkt *s_q = nullptr;
 static volatile uint8_t s_head = 0;
 
 // ── Alignment mesh -> radar ───────────────────────────────────
@@ -67,6 +69,9 @@ void mesh_anchor_begin() {
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!R) R = (MantisReceiver *)calloc(1, sizeof(MantisReceiver));
     if (!R) { MSLOGLN("[mesh] receiver alloc FAILED - mesh disabled"); return; }
+    s_q = (MaPkt *)heap_caps_calloc(MA_QUEUE, sizeof(MaPkt), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_q) s_q = (MaPkt *)calloc(MA_QUEUE, sizeof(MaPkt));
+    if (!s_q) { MSLOGLN("[mesh] queue alloc FAILED - mesh disabled"); free(R); R = nullptr; return; }
     // This device is the fixed anchor: one T-Display, not docked unless
     // the stereo peer is present (updated as the session develops).
     mantis_rx_begin(R, 1.2f, /*tdisplays*/1, /*cardputers*/0, /*docked*/false);
@@ -74,7 +79,7 @@ void mesh_anchor_begin() {
 }
 
 void mesh_anchor_enqueue(uint8_t id, const uint8_t *data, int len) {
-    if (!data || len <= 0 || len > (int)sizeof(s_q[0].data)) return;
+    if (!s_q || !data || len <= 0 || len > (int)sizeof(s_q[0].data)) return;
     const uint8_t h = s_head;
     MaPkt &p = s_q[h];
     p.seq++;
@@ -87,6 +92,7 @@ void mesh_anchor_enqueue(uint8_t id, const uint8_t *data, int len) {
 }
 
 static void pump(uint32_t now) {
+    if (!s_q) return;
     for (int i = 0; i < MA_QUEUE; i++) {
         MaPkt &p = s_q[i];
         if (!p.pending) continue;

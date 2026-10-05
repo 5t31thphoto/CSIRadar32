@@ -121,5 +121,13 @@ else
   echo "::error::probe/anchor link simulation failed"; echo "${out:-}"; fail=1
 fi
 
+# ── 7a. the workflow itself ────────────────────────────────────
+if out=$(python3 tools/lint_workflow.py 2>&1); then echo "  ok   $out"
+else echo "$out"; fail=1; fi
+
+# ── 7. the ESP8266Audio prune, against a mock library ──────────
+if out=$(bash tools/test_prune.sh 2>&1); then echo "  ok   $out"
+else echo "::error::ESP8266Audio prune test failed: $out"; fail=1; fi
+
 [ $fail -eq 0 ] && echo "pre-flight: all firmware compile, receiver links, mesh and link agree"
 exit $fail

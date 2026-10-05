@@ -1,75 +1,98 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════
-#  Make ESP8266Audio 1.9.7 build on arduino-esp32 3.x (IDF 5.x)
+#  Trim ESP8266Audio 1.9.7 to exactly what the probes use
 # ═══════════════════════════════════════════════════════════════
 #
-#  WHAT FAILS, VERBATIM FROM CI (m5stack core 3.3.9):
+#  Arduino compiles EVERY source file in a library, used or not.
+#  ESP8266Audio ships a dozen decoders, sources and outputs, and on
+#  arduino-esp32 3.x several no longer compile.  CI met them one by one:
 #
-#    AudioOutputI2S.cpp:168   'esp_chip_info_t' was not declared
-#    AudioOutputI2S.cpp:232   'I2S_MCLK_MULTIPLE_DEFAULT' was not declared
-#    AudioOutputSPDIF.cpp:108 'I2S_MCLK_MULTIPLE_DEFAULT' was not declared
-#    AudioOutputSPDIF.cpp:186 'rtc_clk_apll_enable' was not declared
+#    run 1  AudioOutputI2S / AudioOutputSPDIF        IDF 4 legacy I2S
+#    run 2  AudioFileSourceHTTPStream / ICYStream    'WiFiClient' undeclared
 #
-#  Those are the library's OWN hardware output drivers, written against
-#  the IDF 4 legacy I2S driver.  IDF 5 removed those symbols.  Arduino
-#  compiles every .cpp in a library whether or not it is used, so an
-#  unused driver breaks the build.
+#  Chasing them one CI run at a time is the wrong game.  This is an
+#  ALLOW-LIST: start from the four headers mantis_mp3.h includes, follow
+#  #include transitively inside the library, keep that closure, delete the
+#  rest.  A file we never use can no longer break this build, and the
+#  legacy I2S driver -- which aborts at boot next to M5Unified's new one --
+#  can never be linked in.
 #
-#  WE DO NOT USE THEM.  mantis_mp3.h decodes with AudioGeneratorMP3 and
-#  plays through its own AudioOutput subclass into M5.Speaker.  So the
-#  fix is to remove the drivers, not to patch them -- and removing them
-#  is ALSO what keeps the legacy I2S driver out of the link.  IDF aborts
-#  at boot ("CONFLICT! driver_ng is not allowed to be used with the
-#  legacy driver") when the legacy driver and M5Unified's new one are
-#  both linked, which is a silent boot loop, not a build error.
+#  ROOTS is the only thing to update if mantis_mp3.h ever includes another
+#  ESP8266Audio header.
 #
-#  Removal is transitive: anything that references a removed class goes
-#  too, until nothing does.  The files we DO need are then asserted
-#  present, so a future library change fails HERE with a clear message.
+#  Usage: ci_prune_esp8266audio.sh [library_src_dir]
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
-LIBROOT="$(arduino-cli config get directories.user 2>/dev/null || echo "$HOME/Arduino")/libraries"
-SRC="$LIBROOT/ESP8266Audio/src"
-if [ ! -d "$SRC" ]; then
-  echo "::error::ESP8266Audio not installed at $SRC"
-  exit 1
+if [ $# -ge 1 ]; then
+  SRC="$1"
+else
+  LIBROOT="$(arduino-cli config get directories.user 2>/dev/null || echo "$HOME/Arduino")/libraries"
+  SRC="$LIBROOT/ESP8266Audio/src"
 fi
+[ -d "$SRC" ] || { echo "::error::ESP8266Audio src not found at $SRC"; exit 1; }
 
-removed=()
-remove_stem() {           # remove foo.cpp / foo.h for a class stem
-  local stem="$1"
-  for f in "$SRC/$stem.cpp" "$SRC/$stem.h"; do
-    if [ -f "$f" ]; then rm -f "$f"; removed+=("$(basename "$f")"); fi
-  done
-}
+python3 - "$SRC" <<'PY'
+import os, re, sys, shutil
 
-# The hardware drivers that cannot compile on IDF 5, and their
-# direct subclasses.
-for stem in AudioOutputI2S AudioOutputI2SNoDAC AudioOutputSPDIF AudioOutputULP; do
-  remove_stem "$stem"
-done
+src = os.path.abspath(sys.argv[1])
+ROOTS = ["AudioOutput.h", "AudioFileSourceSD.h", "AudioFileSourceID3.h", "AudioGeneratorMP3.h"]
+INC = re.compile(r'^\s*#\s*include\s*["<]([^">]+)[">]', re.M)
 
-# Transitive closure: drop anything still naming a removed class.
-changed=1
-while [ "$changed" -eq 1 ]; do
-  changed=0
-  for f in "$SRC"/*.cpp "$SRC"/*.h; do
-    [ -f "$f" ] || continue
-    if grep -qE '\b(AudioOutputI2S|AudioOutputI2SNoDAC|AudioOutputSPDIF|AudioOutputULP)\b' "$f"; then
-      rm -f "$f"; removed+=("$(basename "$f")"); changed=1
-    fi
-  done
-done
+def resolve(name, from_dir):
+    for base in (from_dir, src):
+        p = os.path.normpath(os.path.join(base, name))
+        if (p == src or p.startswith(src + os.sep)) and os.path.isfile(p):
+            return p
+    return None
 
-echo "pruned from ESP8266Audio: ${removed[*]:-(nothing)}"
+keep_files, keep_dirs, todo = set(), set(), []
+for r in ROOTS:
+    p = resolve(r, src)
+    if not p:
+        print(f"::error::ESP8266Audio no longer ships {r}; mantis_mp3.h needs it"); sys.exit(1)
+    todo.append(p)
 
-# What mantis_mp3.h actually uses must still be there.
-for need in AudioOutput.h AudioGenerator.h AudioGeneratorMP3.h AudioGeneratorMP3.cpp \
-            AudioFileSource.h AudioFileSourceSD.h AudioFileSourceID3.h AudioFileSourceID3.cpp; do
-  if [ ! -f "$SRC/$need" ]; then
-    echo "::error::ESP8266Audio no longer ships $need -- the MP3 path in mantis_mp3.h needs it"
-    exit 1
-  fi
-done
-echo "ESP8266Audio: MP3 decode path intact, legacy I2S drivers removed"
+while todo:
+    f = todo.pop()
+    if f in keep_files: continue
+    keep_files.add(f)
+    d = os.path.dirname(f)
+    if d != src:
+        # A decoder's own directory (libmad/...) is kept WHOLE: it is
+        # self-contained and its files include each other freely.
+        top = os.path.join(src, os.path.relpath(d, src).split(os.sep)[0])
+        if top not in keep_dirs:
+            keep_dirs.add(top)
+            for dp, _, fns in os.walk(top):
+                todo.extend(os.path.join(dp, fn) for fn in fns)
+    stem, ext = os.path.splitext(f)
+    if ext in (".h", ".hpp"):                 # a header brings its implementation
+        for e in (".cpp", ".c"):
+            if os.path.isfile(stem + e): todo.append(stem + e)
+    try:
+        text = open(f, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        continue
+    for m in INC.finditer(text):
+        p = resolve(m.group(1), d)
+        if p: todo.append(p)
+
+removed = []
+for entry in sorted(os.listdir(src)):
+    p = os.path.join(src, entry)
+    if os.path.isdir(p):
+        if p not in keep_dirs: shutil.rmtree(p); removed.append(entry + "/")
+    elif p not in keep_files:
+        os.remove(p); removed.append(entry)
+
+top_kept = sorted(os.path.relpath(f, src) for f in keep_files if os.path.dirname(f) == src)
+print("ESP8266Audio kept     :", " ".join(top_kept))
+print("ESP8266Audio kept dirs:", " ".join(os.path.relpath(x, src) + "/" for x in sorted(keep_dirs)) or "(none)")
+print("ESP8266Audio removed  :", " ".join(removed) or "(nothing)")
+
+bad = re.compile(r'\b(WiFiClient|HTTPClient|AudioOutputI2S|AudioOutputSPDIF|i2s_driver_install)\b')
+for f in keep_files:
+    if bad.search(open(f, encoding="utf-8", errors="ignore").read()):
+        print(f"::error::kept {os.path.relpath(f, src)} still references a removed dependency"); sys.exit(1)
+PY
