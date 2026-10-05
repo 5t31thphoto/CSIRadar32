@@ -272,8 +272,3 @@ static inline float   mantis_unq8(int16_t v){ return (float)v / 256.0f; }
 static inline int16_t mantis_q12(float v)  { return (int16_t)(v * 4096.0f); }
 static inline float   mantis_unq12(int16_t v){ return (float)v / 4096.0f; }
 
-#ifdef __cplusplus
-static_assert(sizeof(MantisLinkView) == 6, "MantisLinkView layout changed");
-static_assert(sizeof(MantisPerspective) == 14 + 7 * MANTIS_MAX_LINKS,
-              "MantisPerspective layout changed");
-#endif

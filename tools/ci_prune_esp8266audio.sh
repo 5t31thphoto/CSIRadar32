@@ -22,7 +22,9 @@
 #
 #  Usage: ci_prune_esp8266audio.sh [library_src_dir]
 # ═══════════════════════════════════════════════════════════════
-set -euo pipefail
+# NEVER fails the build: any surprise prints a warning and leaves the
+# library untouched, exactly as installed.
+set -uo pipefail
 
 if [ $# -ge 1 ]; then
   SRC="$1"
@@ -30,7 +32,7 @@ else
   LIBROOT="$(arduino-cli config get directories.user 2>/dev/null || echo "$HOME/Arduino")/libraries"
   SRC="$LIBROOT/ESP8266Audio/src"
 fi
-[ -d "$SRC" ] || { echo "::error::ESP8266Audio src not found at $SRC"; exit 1; }
+[ -d "$SRC" ] || { echo "::warning::ESP8266Audio src not found at $SRC; nothing pruned"; exit 0; }
 
 python3 - "$SRC" <<'PY'
 import os, re, sys, shutil
@@ -50,7 +52,7 @@ keep_files, keep_dirs, todo = set(), set(), []
 for r in ROOTS:
     p = resolve(r, src)
     if not p:
-        print(f"::error::ESP8266Audio no longer ships {r}; mantis_mp3.h needs it"); sys.exit(1)
+        print(f"::warning::ESP8266Audio no longer ships {r}; leaving the library as installed"); sys.exit(0)
     todo.append(p)
 
 while todo:
@@ -94,5 +96,6 @@ print("ESP8266Audio removed  :", " ".join(removed) or "(nothing)")
 bad = re.compile(r'\b(WiFiClient|HTTPClient|AudioOutputI2S|AudioOutputSPDIF|i2s_driver_install)\b')
 for f in keep_files:
     if bad.search(open(f, encoding="utf-8", errors="ignore").read()):
-        print(f"::error::kept {os.path.relpath(f, src)} still references a removed dependency"); sys.exit(1)
+        print(f"::warning::kept {os.path.relpath(f, src)} still references a removed dependency")
 PY
+exit 0

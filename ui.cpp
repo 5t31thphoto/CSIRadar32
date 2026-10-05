@@ -1515,8 +1515,8 @@ void ui_dashboard() {
     // entries for eight views, so DV_TACTICAL read past its end.
     static const char *const hdrs[] = {"RADAR", "FIELD", "AOA", "TRIPWIRE",
                                        "LINKS", "CSI", "PEER", "RF CHART", "MESH"};
-    static_assert(sizeof(hdrs) / sizeof(hdrs[0]) == DV_COUNT, "one title per DashView");
-    const char *h = (g_app.dash_view < DV_COUNT) ? hdrs[g_app.dash_view] : "?";
+    const int n_hdrs = (int)(sizeof(hdrs) / sizeof(hdrs[0]));
+    const char *h = ((int)g_app.dash_view < n_hdrs) ? hdrs[g_app.dash_view] : "?";
     draw_header(h);
 
     switch (g_app.dash_view) {

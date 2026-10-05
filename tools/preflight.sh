@@ -87,7 +87,10 @@ namespace lgfx { namespace fonts { const IFont Font0, Font2, Font4, Font6, Font7
 int main() { return 0; }
 CPP
 "$CXX" -c $FLAGS -w -I "$SHIM" "$TMP/hostmain.cpp" -o "$TMP/hostmain.o"
-if out=$("$CXX" "${objs[@]}" "$TMP/hostmain.o" -o "$TMP/rxlink" 2>&1); then
+# The Rust core's functions, for the HOST link only (the firmware links
+# the real libmantis_rfcore.a).
+"$CXX" -c $FLAGS -w -I "$SHIM" -I "$ROOT/rust/rfcore" "$ROOT/tools/hoststub_rfcore.cpp" -o "$TMP/rfstub.o"
+if out=$("$CXX" "${objs[@]}" "$TMP/hostmain.o" "$TMP/rfstub.o" -o "$TMP/rxlink" 2>&1); then
   echo "  ok   receiver links (no undefined or duplicate symbols)"
 else
   echo "::error::receiver does not link"; echo "$out" | grep -E "undefined|multiple" | head -15; fail=1

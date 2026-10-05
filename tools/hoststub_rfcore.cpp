@@ -1,5 +1,6 @@
-// Weak fallback for local Arduino builds when the Xtensa Rust toolchain is
-// unavailable. CI links the real Rust staticlib and its strong symbols win.
+// HOST PRE-FLIGHT ONLY.  Never part of the firmware: weak definitions of
+// the Rust core's functions satisfy the linker and stop it from pulling
+// libmantis_rfcore.a in at all.  The anchor always links the real Rust core.
 #include "rfcore.h"
 #include <string.h>
 extern "C" {

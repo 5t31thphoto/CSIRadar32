@@ -17,3 +17,4 @@ docs/bins/csi-beacon-s3-id*-merged.bin
 cardputer/cardputer_mp3.h
 cardputer/cardputer_audio.h
 cardputer/cardputer_imu.h
+rust_rf_fallback.cpp
